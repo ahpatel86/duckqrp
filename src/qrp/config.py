@@ -1,0 +1,1290 @@
+"""
+Typed configuration for the QRP Type 2 pipeline.
+
+Design note
+-----------
+The SAS package carries study parameters as macro variables, and the
+PySpark port carried them as strings that look like macro variables
+(`sex = '"F" "M" "U" "A"'`, `agestrat = "00-01 02-04 65+"`), re-parsed
+at every use, with data probes (`df.limit(1).count() > 0`) deciding
+which branch to take *per cohort iteration*.
+
+Here the input JSON is parsed exactly once, at startup, into frozen
+dataclasses. Two consequences:
+
+1. Every "should this branch run?" question is answered in Python
+   against config, before any SQL executes. No query is ever run to
+   decide whether to run a query.
+2. The resolved config is then registered *as DuckDB tables* (see
+   `register()`), so the SQL joins to it instead of being built by
+   string interpolation. That is what lets all cohorts run in one
+   pass rather than in a Python loop.
+"""
+
+from __future__ import annotations
+
+import re as _re
+
+from dataclasses import dataclass, field, replace
+from datetime import date
+from pathlib import Path
+from typing import Any, Sequence, overload
+
+# --------------------------------------------------------------------
+# Age strata
+# --------------------------------------------------------------------
+
+_UNIT_SUFFIX = {"y": "years", "m": "months", "d": "days", "w": "weeks"}
+
+
+@dataclass(frozen=True)
+class AgeStratum:
+    ordinal: int
+    label: str
+    lo: int
+    hi: int          # 99999 for an open-ended final stratum ("75+")
+    unit: str        # years | months | days | weeks
+
+
+@dataclass(frozen=True)
+class AgeStrata:
+    strata: tuple[AgeStratum, ...]
+
+    @classmethod
+    def parse(cls, spec: str | None) -> "AgeStrata":
+        """Parse the SAS agestrat string. Done once, here, not per row.
+
+        Accepts tokens like '00-01', '65+', '18-44y', '06-11m'.
+        """
+        spec = (spec or "").strip() or (
+            "00-01 02-04 05-09 10-14 15-18 19-21 22-44 45-64 65-74 75+"
+        )
+        out: list[AgeStratum] = []
+        for i, tok in enumerate(spec.split(), start=1):
+            raw = tok.strip()
+            unit = "years"
+            if raw and raw[-1].lower() in _UNIT_SUFFIX:
+                unit = _UNIT_SUFFIX[raw[-1].lower()]
+                raw = raw[:-1]
+            if raw.endswith("+"):
+                lo, hi = int(raw[:-1]), 99999
+            elif "-" in raw:
+                a, b = raw.split("-", 1)
+                lo, hi = int(a), int(b)
+            else:
+                lo = hi = int(raw)
+            out.append(AgeStratum(i, tok, lo, hi, unit))
+        if not out:
+            raise ValueError(f"could not parse agestrat spec: {spec!r}")
+        return cls(tuple(out))
+
+
+# --------------------------------------------------------------------
+# Per-cohort study parameters
+# --------------------------------------------------------------------
+
+
+# Care setting / principal-diagnosis restriction on a code.
+#
+# `caresettingprincipal` packs one or more 3-character tokens into a
+# single string: two characters of EncType plus one of PDX. SAS expands
+# it in ms_caresettingprincipal.sas and then matches with
+#     (EncType = '**' OR EncType = claim.enctype)
+# AND (Pdx     = '*'  OR Pdx     = claim.pdx)
+#
+# Encoding, from the macro:
+#   '*' is the wildcard, written 'A' after SAS's translate()
+#   '.' means missing, written '_'
+#   'AAA' (i.e. '***') or an empty value means "all care settings"
+CARE_SETTING_ALL = ("**", "*")
+
+
+def parse_care_setting(value: Any) -> tuple[tuple[str, str], ...]:
+    """Expand a caresettingprincipal string into (enctype, pdx) pairs.
+
+    Returns (('**', '*'),) — match anything — for an empty value or an
+    explicit '***', which is what SAS does.
+    """
+    raw = str(value or "").strip().upper()
+    # SAS: translate(var, 'A', '*', '_', '.') — '*'->'A' and '.'->'_'
+    raw = raw.replace("*", "A").replace(".", "_")
+    if not raw or "AAA" in raw.split():
+        return (CARE_SETTING_ALL,)
+
+    pairs: list[tuple[str, str]] = []
+    for token in raw.split():
+        # tokens are fixed 3-character groups, possibly concatenated
+        for i in range(0, len(token) - 2, 3):
+            chunk = token[i:i + 3]
+            if len(chunk) < 3:
+                continue
+            enctype = chunk[:2]
+            pdx = chunk[2]
+            if enctype == "AA":
+                enctype = "**"       # wildcard care setting
+            if pdx == "_":
+                pdx = ""             # missing PDX
+            elif pdx == "A":
+                pdx = "*"            # wildcard PDX
+            pairs.append((enctype, pdx))
+    return tuple(pairs) or (CARE_SETTING_ALL,)
+
+
+def parse_lab_result(spec: Any) -> tuple[str | None, float | None, float | None]:
+    """Parse a LABRESULT criterion string into (operator, lo, hi).
+
+    ms_extractlabs.sas:133-172 accepts '<=', '<', '>=', '>', '~=' and a
+    range written with ':' — deliberately not '-', because SAS notes a
+    hyphen is ambiguous with a negative lower bound.
+
+    Order matters: '<=' must be tested before '<', or '<=7' parses as
+    '<' with a bound of '=7'.
+    """
+    raw = str(spec or "").strip()
+    if not raw:
+        return (None, None, None)
+    if ":" in raw:
+        lo, _, hi = raw.partition(":")
+        try:
+            return (":", float(lo.strip()), float(hi.strip()))
+        except ValueError:
+            return (None, None, None)
+    for op in ("<=", ">=", "~=", "<", ">", "="):   # two-char first
+        if raw.startswith(op):
+            try:
+                return (op, float(raw[len(op):].strip()), None)
+            except ValueError:
+                return (None, None, None)
+    try:
+        return ("=", float(raw), None)
+    except ValueError:
+        return (None, None, None)
+
+
+# Combo covariates (codecat='CC') are BOOLEAN EXPRESSIONS over other
+# covariate numbers, not code lists. From a real input file:
+#
+#   covar 12: 3 or 4 or 5 or 6
+#   covar 14: 2 and (3 or 4 or 5 or 6)
+#   covar 49: not (1 or 48)
+#
+# The grammar is small and closed: integers, `and`, `or`, `not`, and
+# parentheses. It is parsed here rather than evaluated as SQL text so
+# that a malformed expression fails at load with a message, and so no
+# study-supplied string is ever concatenated into a query.
+_COMBO_TOKEN = _re.compile(r"\s*(\(|\)|and\b|or\b|not\b|\d+)", _re.I)
+
+
+def parse_combo(expr: Any) -> tuple[str, tuple[int, ...]]:
+    """Parse a combo expression into (SQL template, referenced covarnums).
+
+    The template uses `{N}` placeholders for each referenced covariate,
+    which the SQL stage substitutes with a has-covariate test. Raises
+    ValueError on anything outside the grammar.
+    """
+    raw = str(expr or "").strip()
+    if not raw:
+        raise ValueError("empty combo expression")
+
+    out: list[str] = []
+    refs: list[int] = []
+    pos = 0
+    depth = 0
+    while pos < len(raw):
+        m = _COMBO_TOKEN.match(raw, pos)
+        if not m:
+            raise ValueError(
+                f"combo expression {raw!r}: cannot parse at {raw[pos:][:20]!r}"
+            )
+        tok = m.group(1)
+        low = tok.lower()
+        if low == "(":
+            depth += 1
+            out.append("(")
+        elif low == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError(f"combo expression {raw!r}: unbalanced ')'")
+            out.append(")")
+        elif low in ("and", "or", "not"):
+            out.append(f" {low.upper()} ")
+        else:
+            n = int(tok)
+            refs.append(n)
+            # named, not positional: `{3}` is a POSITIONAL placeholder
+            # to str.format and raises IndexError.
+            out.append("{c%d}" % n)
+        pos = m.end()
+    if depth:
+        raise ValueError(f"combo expression {raw!r}: unbalanced '('")
+    if not refs:
+        raise ValueError(f"combo expression {raw!r}: references no covariate")
+    return "".join(out), tuple(dict.fromkeys(refs))
+
+
+def _codes(value: Any, default: Sequence[str]) -> tuple[str, ...]:
+    """Normalise a demographic code list.
+
+    Accepts a real list, or the SAS-style space-delimited quoted string
+    the PySpark port passed around. Empty means 'all', i.e. the default.
+    """
+    if value is None:
+        return tuple(default)
+    if isinstance(value, (list, tuple)):
+        vals = [str(v).strip().upper() for v in value if str(v).strip()]
+    else:
+        vals = [v.strip().strip('"').upper() for v in str(value).split()]
+        vals = [v for v in vals if v]
+    return tuple(vals) if vals else tuple(default)
+
+
+@dataclass(frozen=True)
+class CohortConfig:
+    """Everything needed to evaluate one cohort group.
+
+    All validation happens in `validate()` at load time, so an invalid
+    study fails in milliseconds instead of after a partial run.
+    """
+
+    cohortgrp: str
+
+    # --- enrollment -------------------------------------------------
+    enrollment_num: int = 1
+    coverage: str = "MD"
+    enrol_gap: int = 0
+    chart_required: bool = False
+    enr_days: int = 183
+
+    # --- demographics ----------------------------------------------
+    sex: tuple[str, ...] = ("F", "M", "U", "A")
+    race: tuple[str, ...] = ("0", "1", "2", "3", "4", "5", "M")
+    hispanic: tuple[str, ...] = ("Y", "N", "U")
+    age_strata: AgeStrata = field(default_factory=lambda: AgeStrata.parse(None))
+
+    # --- exposure / index -------------------------------------------
+    wash_per: int | None = 183
+    point: bool = False
+    episode_gap: int | None = 0
+    episode_gap_type: str = "F"        # F = fixed days, P = % of prior supply
+    exp_ext_per: int = 0
+    min_epis_dur: int = 1
+    max_epis_dur: int = 0              # 0 = unbounded
+    min_days_supp: int = 0
+    at_risk_start: int = 0
+    blackout_per: int = 0
+
+    # --- follow-up ---------------------------------------------------
+    # None means "never had an event" — the STRICTEST setting, not the
+    # loosest. ms_createpov56.sas:78 is explicit: "If FupWashPer=. then
+    # patients need to never have had an Event (hence 99999)". Parsing a
+    # missing value as 0 meant no washout at all, keeping patients SAS
+    # would drop.
+    #
+    # Represented as None rather than SAS's 99999 sentinel because the
+    # `fup_wash_per > enr_days` validation applies to the value the study
+    # SUPPLIED; a sentinel would fail that check spuriously.
+    fup_wash_per: int | None = 0
+    event_count: int = 0               # 0 none, 1 dedup by code, 2 first per day
+    req_days_aft_ind: int = 0
+    req_days_aft_epi: int = 0
+    censor_death: bool = True
+
+    # --- dose --------------------------------------------------------
+    min_cum_dose: float | None = None
+    max_cum_dose: float | None = None
+    cum_dose_per: int | None = None
+    min_cfdd: float | None = None
+    max_cfdd: float | None = None
+
+    # --- codes --------------------------------------------------------
+    code_supply: int | None = None
+    exposure_codes: tuple[str, ...] = ()
+    event_codes: tuple[str, ...] = ()
+    # fupcriteria='IOC' codes: the follow-up washout is evaluated
+    # against these as well as against the event codes
+    # (ms_createmicohorts.sas:1685 -> _FUPWash, consumed by
+    # _WashEventsInFupWash in ms_createpov56.sas).
+    ioc_codes: tuple[str, ...] = ()
+    # (code, stockgroup) for DEF codes. SAS stockpiles WITHIN a
+    # stockgroup (ms_stockpiling.sas passes GROUPING=StockGroup ...), so
+    # two drugs in one cohort are pushed forward independently. Absent a
+    # stockgroup, every code shares one, which reproduces the previous
+    # behaviour for single-drug cohorts.
+    exposure_stockgroups: tuple[tuple[str, str], ...] = ()
+    # (code, enctype, pdx) for EVENT codes carrying a care-setting
+    # restriction. Parsed but silently dropped before — a study could
+    # specify it, get no warning, and receive a broader cohort than SAS.
+    event_care_settings: tuple[tuple[str, str, str], ...] = ()
+
+    # ---------------- derived flags (no data probe needed) -----------
+
+    @property
+    def needs_dose(self) -> bool:
+        """Whether the dose restriction path runs at all.
+
+        In the PySpark version this was six `.limit(1).count()` probes
+        per cohort iteration against small config tables. It is a pure
+        function of config.
+        """
+        return (
+            self.min_cum_dose is not None
+            or (self.max_cum_dose is not None and self.cum_dose_per is not None)
+            or self.min_cfdd is not None
+            or self.max_cfdd is not None
+        )
+
+    def validate(self) -> None:
+        """SAS cross-parameter rules, enforced up front."""
+        errs: list[str] = []
+        if self.wash_per is not None and self.wash_per > self.enr_days:
+            errs.append(f"wash_per ({self.wash_per}) > enr_days ({self.enr_days})")
+        if self.fup_wash_per is not None and self.fup_wash_per > self.enr_days:
+            errs.append(
+                f"fup_wash_per ({self.fup_wash_per}) > enr_days ({self.enr_days})"
+            )
+        if self.max_epis_dur and self.at_risk_start > self.max_epis_dur:
+            errs.append("at_risk_start cannot exceed max_epis_dur")
+        if self.blackout_per and self.at_risk_start:
+            errs.append("blackout_per and at_risk_start are mutually exclusive")
+        if self.point:
+            conflicting = {
+                "episode_gap": self.episode_gap,
+                "exp_ext_per": self.exp_ext_per,
+                "min_epis_dur": self.min_epis_dur if self.min_epis_dur != 1 else None,
+                "min_days_supp": self.min_days_supp,
+                "blackout_per": self.blackout_per,
+                "req_days_aft_epi": self.req_days_aft_epi,
+                "code_supply": self.code_supply,
+            }
+            bad = [k for k, v in conflicting.items() if v]
+            if bad:
+                errs.append(f"point=Y forbids: {', '.join(sorted(bad))}")
+        # A minimum PRIOR cumulative dose is unsatisfiable when the
+        # lookback sits inside the washout: washout guarantees there are
+        # no qualifying claims in that window, so prior dose is always 0
+        # and every index date is excluded. Caught here because the
+        # symptom — an empty cohort several stages later — is a miserable
+        # thing to debug. Found by running a study that did exactly this.
+        if (
+            self.min_cum_dose is not None
+            and self.cum_dose_per is not None
+            and self.wash_per is not None
+            and self.cum_dose_per <= self.wash_per
+        ):
+            errs.append(
+                f"min_cum_dose with cum_dose_per ({self.cum_dose_per}) "
+                f"<= wash_per ({self.wash_per}) excludes every index date: "
+                f"washout guarantees no prior claims in that window"
+            )
+        if self.code_supply is not None and (
+            self.min_cfdd is not None or self.max_cfdd is not None
+        ):
+            errs.append("code_supply must be unset when CFDD limits are used")
+        if self.coverage.upper() not in {"MD", "M", "D"}:
+            errs.append(f"coverage must be MD, M or D (got {self.coverage!r})")
+        if errs:
+            raise ValueError(
+                f"cohort {self.cohortgrp!r} has invalid configuration:\n  - "
+                + "\n  - ".join(errs)
+            )
+
+
+@dataclass(frozen=True)
+class Covariate:
+    """One baseline covariate definition.
+
+    covfrom / covto are day offsets from the index date. A NULL bound in
+    the source means unbounded; it is resolved to a sentinel HERE rather
+    than with a COALESCE inside the join predicate, which is what keeps
+    the predicate simple enough for DuckDB to push down.
+    """
+
+    covarnum: int
+    covarname: str
+    codecat: str                 # DX | RX
+    covfrom: int = -365
+    covto: int = -1
+    # Each end of the window anchors independently, exactly as for
+    # inclusion rules (ms_cidacov.sas:47-54). Blank means INDEXDT.
+    #   INDEXDT       the index date
+    #   EPISODEENDDT  the episode end — a forward-looking window
+    #   INDEXDT_EXP   the exposed index date (comparator designs)
+    covfromanchor: str = "INDEXDT"
+    covtoanchor: str = "INDEXDT"
+    dateonly: bool = False
+    # Combo covariates (codecat='CC'): a boolean expression over other
+    # covariate numbers, parsed at load. `combo_sql` is a template with
+    # {N} placeholders; `combo_refs` are the covarnums it needs.
+    combo_sql: str = ""
+    combo_refs: tuple[int, ...] = ()
+    codes: tuple[str, ...] = ()
+
+    UNBOUNDED_BEFORE = -999999
+    UNBOUNDED_AFTER = 999999
+
+
+@dataclass(frozen=True)
+class InclusionRule:
+    """One row of the INCLUSIONCODES file.
+
+    THREE levels of nesting, not two.
+
+    `ms_processinputfiles.sas:715-740` derives two numeric variables from
+    the character columns in the input file:
+
+        cond     renumbered per distinct CONDLEVEL
+        subcond  renumbered per distinct SUBCONDLEVEL *within* a condlevel
+
+    and `ms_createpov3.sas:22-38` gives the combining rules:
+
+        codes within a subcondition   OR   (any one satisfies it)
+        subconditions within a cond   AND  ("If all subconditions are
+                                             satisfied, then condition is
+                                             satisfied")
+        conditions                    AND  (every condition must pass)
+
+    `subcondinclusion` inverts a subcondition: "If the subcondition is
+    met but it is a subexclusion, then means that condition not
+    satisfied."
+
+    Note `cond` and `subcond` are DERIVED, not input columns — the file
+    carries `condlevel` and `subcondlevel` as character values. Reading
+    a `cond` column that does not exist gives every rule cond=1, which
+    collapses every condition into one and ORs what should be ANDed.
+
+    Other fields:
+      indexcriteria INC / EXC (index-anchored), IEV / EEV (event-anchored)
+      condfrom/to   day offsets from the anchor
+      codedays      minimum number of DISTINCT days carrying the code
+      minrxdays     RX only: minimum total DAYS OF SUPPLY in the window
+      codecat       DX | RX | PX
+    """
+
+    cohortgrp: str
+    cond: int
+    # Defaults so a rule can be built directly in a test without
+    # restating the derivation; load_study_dict always supplies them.
+    # 'INC' is SAS's default when indexcriteria is absent.
+    criteria: str = "INC"        # INC | EXC | IEV | EEV
+    subcond: int = 1
+    condlevel: int = 1
+    codecat: str = "DX"
+    condfrom: int = -365
+    condto: int = -1
+    # Each END of the window anchors independently
+    # (ms_createpov3.sas:139-175). Blank means INDEXDT.
+    #   INDEXDT       the index date
+    #   EPISODEENDDT  the episode end — a forward-looking window
+    #   INDEXDT_EXP   the exposed index date (comparator designs)
+    condfromanchor: str = "INDEXDT"
+    condtoanchor: str = "INDEXDT"
+    codedays: int = 1
+    # RX only: total DAYS OF SUPPLY in the window must reach this, not
+    # the number of claims (ms_createpov3.sas:26 — "total days in window
+    # >= minrxdays"). Defaults to 1, which any dispensing satisfies.
+    minrxdays: int = 1
+    # Per-SUBCONDITION dose thresholds (ms_createpov3.sas:333-353).
+    # SAS aggregates them across the rows of a subcondition with
+    # max(mincumdose), min(minafdd), max(maxafdd) — strictest lower
+    # bound, widest upper bound.
+    #   mincumdose  total cumdose in the window >= this
+    #   minafdd/maxafdd  average filled daily dose, computed as
+    #       round(sum(cfdd) / sum(numdispensing), 1)   (line 452)
+    mincumdose: float | None = None
+    minafdd: float | None = None
+    maxafdd: float | None = None
+    subcondlevel: str = ""
+    # A sub-EXCLUSION: meeting it makes the condition fail.
+    subcond_inclusion: bool = True
+    codes: tuple[str, ...] = ()
+
+    @property
+    def is_exclusion(self) -> bool:
+        return self.criteria in ("EXC", "EEV")
+
+    @property
+    def is_event_anchored(self) -> bool:
+        return self.criteria in ("IEV", "EEV")
+
+
+@dataclass(frozen=True)
+class RiskScoreCode:
+    """One row of the RISKSCORECODES lookup.
+
+    A risk score is a weighted sum over CONDITIONS, not over claims:
+    `ms_computeriskscores.sas:369` takes `max(weight)` per
+    `(patient, indexdt, condidnum)` before summing, so meeting a
+    condition ten times scores it once.
+
+    `condid = 'IN'` is the intercept — a constant added to every score,
+    and the value used for patients who match nothing.
+
+    codecat: DX | PX | RX | DM (demographic: sex or age group) | IN
+    """
+
+    riskscore: str
+    condid: str
+    codecat: str
+    code: str = ""
+    weight: float = 0.0
+    riskfrom: int = -365
+    riskto: int = -1
+    # Each end anchors independently, the same mechanism the inclusion
+    # rules and covariate windows use (ms_computeriskscores.sas:107-117).
+    # SAS defaults a blank to "indexdt" explicitly.
+    riskfromanchor: str = "INDEXDT"
+    risktoanchor: str = "INDEXDT"
+    enctype: str = "**"
+    pdx: str = "*"
+
+    @property
+    def is_intercept(self) -> bool:
+        return self.condid.upper() == "IN" or self.codecat.upper() == "IN"
+
+
+@dataclass(frozen=True)
+class StratumLevel:
+    """One output stratification level, from the USERSTRATA input file.
+
+    `ms_processinputfiles.sas:1843` lowercases `levelvars`, converts `*`
+    to a space (so `agegroup*sex` and `agegroup sex` are the same), and
+    appends `agegroupnum` wherever `agegroup` appears so the output can
+    be ordered numerically.
+
+    An empty `levelvars` is the overall level — no stratification.
+    """
+
+    table_id: str            # t2cida, t2its, ...
+    level_id: str            # the label written to the Level column
+    levelvars: tuple[str, ...] = ()
+
+    @classmethod
+    def parse(cls, row: dict[str, Any]) -> "StratumLevel":
+        raw = str(row.get("levelvars") or "").replace("*", " ").lower()
+        cols = tuple(v for v in raw.split() if v)
+        if "agegroup" in cols and "agegroupnum" not in cols:
+            # SAS: tranwrd(levelvars, "agegroup", "agegroup agegroupnum")
+            cols = tuple(
+                x for c in cols
+                for x in (("agegroup", "agegroupnum") if c == "agegroup"
+                          else (c,))
+            )
+        return cls(
+            table_id=str(row.get("tableid") or row.get("tableID") or "").lower(),
+            level_id=str(row.get("levelid") or row.get("level") or "").strip(),
+            levelvars=cols,
+        )
+
+
+@dataclass(frozen=True)
+class StudyConfig:
+    """Study-level parameters plus every cohort."""
+
+    study_type: int
+    start_date: date
+    end_date: date
+    cohorts: tuple[CohortConfig, ...]
+    censor_date: date | None = None
+    run_id: str = "qrp"
+    covariates: tuple[Covariate, ...] = ()
+    code_strength: tuple[tuple[str, float], ...] = ()
+    inclusions: tuple[InclusionRule, ...] = ()
+    strata: tuple[StratumLevel, ...] = ()
+    risk_scores: tuple[RiskScoreCode, ...] = ()
+    # ZIP lookup rows: (zip, statecode, hhs_region, cb_region, sdi).
+    # Every field but the zip itself is optional — an incomplete lookup
+    # is normal, and the Unknown rules in 47_geography.sql handle it.
+    zipfile: tuple[
+        tuple[str, str | None, str | None, str | None, float | None], ...
+    ] = ()
+    # UTILFILE rows: (cohortgrp, utiltype MED|DRUG, utilfrom, utilto)
+    utilization: tuple[tuple[str, str, int, int], ...] = ()
+    # NDC -> class lookup, for the distinct-class utilization count
+    drug_classes: tuple[tuple[str, str], ...] = ()
+    # (cohortgrp, code, labdatetype, op, lo, hi)
+    lab_codes: tuple[tuple, ...] = ()
+    # (cohortgrp, analysisnum, codecat, countmethod, topxx, from, to)
+    mfu: tuple[tuple, ...] = ()
+
+    def validate(self) -> None:
+        if self.study_type != 2:
+            raise NotImplementedError(
+                f"this implementation covers Type 2 only (got type={self.study_type})"
+            )
+        if self.start_date > self.end_date:
+            raise ValueError("start_date is after end_date")
+        seen: set[str] = set()
+        for c in self.cohorts:
+            if c.cohortgrp in seen:
+                raise ValueError(f"duplicate cohortgrp {c.cohortgrp!r}")
+            seen.add(c.cohortgrp)
+            c.validate()
+        if not self.cohorts:
+            raise ValueError("study defines no cohorts")
+        if self.any_dose:
+            known = {c for c, _ in self.code_strength}
+            missing = {
+                code
+                for c in self.cohorts
+                if c.needs_dose
+                for code in c.exposure_codes
+                if code not in known
+            }
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} exposure code(s) have a dose restriction "
+                    f"but no strength in code_strength, e.g. "
+                    f"{sorted(missing)[:5]}"
+                )
+        # SAS keys the enrollment build on ENROLLMENTNUM (`enr_&num.`),
+        # while this implementation keys it on the parameters themselves
+        # (coverage, gap, chart), which lets cohorts with identical
+        # settings share one build.
+        #
+        # Those agree except in one case: if two cohorts declare the SAME
+        # enrollmentnum but DIFFERENT parameters, SAS uses one build and
+        # this would use two. That input file is self-contradictory, but
+        # it would produce a silent parity difference rather than an
+        # error, so say so.
+        by_num: dict[int, tuple] = {}
+        for c in self.cohorts:
+            key = (c.coverage, c.enrol_gap, c.chart_required)
+            prev = by_num.get(c.enrollment_num)
+            if prev is not None and prev != key:
+                errs_global = (
+                    f"cohorts share enrollmentnum={c.enrollment_num} but "
+                    f"declare different enrollment parameters "
+                    f"{prev} vs {key}. SAS would build one enrollment set "
+                    f"from the number; this builds one per parameter set, "
+                    f"so results would differ. Fix the cohortfile."
+                )
+                raise ValueError(errs_global)
+            by_num[c.enrollment_num] = key
+
+        # SAS validates the inclusion file and WARNS rather than failing
+        # (ms_processinputfiles.sas:645-705). Reproduced as warnings for
+        # the same reason: a malformed file should not stop a run, but a
+        # silently-different answer is worse than a noisy one.
+        import warnings as _warnings
+
+        # Grouped on the DERIVED condition key, matching SAS's
+        # `by group conduse condlevel subcondlevel`. Using the raw
+        # condlevel here mixed types once cond became an integer and
+        # condlevel stayed a character value.
+        by_sub: dict[tuple[str, str, int, int], dict[str, set]] = {}
+        for r in self.inclusions:
+            sub_key = (r.cohortgrp, r.criteria, r.cond, r.subcond)
+            acc = by_sub.setdefault(sub_key, {"minrxdays": set(),
+                                              "codedays": set()})
+            acc["minrxdays"].add(r.minrxdays)
+            acc["codedays"].add(r.codedays)
+            if r.minrxdays > 1 and r.codecat != "RX":
+                _warnings.warn(
+                    f"minrxdays > 1 on a {r.codecat} code "
+                    f"({r.cohortgrp} cond {r.cond}) — SAS only applies it "
+                    f"to RX codes and resets it to 1",
+                    stacklevel=2,
+                )
+        for sub_key, acc in by_sub.items():
+            for field, values in acc.items():
+                if len(values) > 1:
+                    _warnings.warn(
+                        f"different {field} values within one subcondlevel "
+                        f"{sub_key}: {sorted(values)} — SAS expects "
+                        f"exactly one",
+                        stacklevel=2,
+                    )
+
+        seen_cov: set[int] = set()
+        for cov in self.covariates:
+            if cov.covarnum in seen_cov:
+                raise ValueError(f"duplicate covarnum {cov.covarnum}")
+            seen_cov.add(cov.covarnum)
+            if cov.covfrom > cov.covto:
+                raise ValueError(
+                    f"covariate {cov.covarnum}: covfrom ({cov.covfrom}) "
+                    f"is after covto ({cov.covto})"
+                )
+            # PX is a mainstream domain in real input files. CC (combo
+            # covariates) is genuinely not implemented and must be
+            # rejected rather than silently treated as DX.
+            if cov.codecat == "CC":
+                # a combo covariate must reference covariates that exist
+                known_nums = {c.covarnum for c in self.covariates}
+                absent = [n for n in cov.combo_refs if n not in known_nums]
+                if absent:
+                    raise ValueError(
+                        f"combo covariate {cov.covarnum} references "
+                        f"unknown covariate(s) {absent}"
+                    )
+                continue
+            if cov.codecat not in {"DX", "RX", "PX"}:
+                raise ValueError(
+                    f"covariate {cov.covarnum}: codecat must be "
+                    f"DX, RX or PX (got {cov.codecat!r}); CC (combo "
+                    f"covariates) is not implemented"
+                )
+
+    # -- flags that gate whole stages, resolved once ------------------
+
+    @property
+    def any_dose_censoring(self) -> bool:
+        """maxcumdose + cumdoseper censors the episode (ms_createpov4).
+
+        SAS's own gate is `&maxcumdose. ne . and &cumdoseper. ne .`.
+        Distinct from `any_dose`, which covers the index-date exclusions
+        in ms_pov1dose.
+        """
+        return any(c.max_cum_dose is not None and c.cum_dose_per is not None
+                   for c in self.cohorts)
+
+    @property
+    def any_dose(self) -> bool:
+        return any(c.needs_dose for c in self.cohorts)
+
+    @property
+    def any_combo_covariates(self) -> bool:
+        return any(c.codecat == "CC" for c in self.covariates)
+
+    @property
+    def any_covariates(self) -> bool:
+        return bool(self.covariates)
+
+    def cida_levels(self) -> tuple[StratumLevel, ...]:
+        """USERSTRATA rows for the t2cida output table."""
+        return tuple(s for s in self.strata if s.table_id == "t2cida")
+
+    @property
+    def any_ioc(self) -> bool:
+        return any(c.ioc_codes for c in self.cohorts)
+
+    @property
+    def any_mfu(self) -> bool:
+        return bool(self.mfu)
+
+    @property
+    def any_labs(self) -> bool:
+        return bool(self.lab_codes)
+
+    @property
+    def any_utilization(self) -> bool:
+        return bool(self.utilization)
+
+    @property
+    def any_code_distribution(self) -> bool:
+        """SAS skips this table when index is defined by labs, death or a
+        date rather than by codes (ms_codedistribution.sas:7). Here the
+        equivalent condition is simply whether any DEF codes exist."""
+        return any(c.exposure_codes for c in self.cohorts)
+
+    @property
+    def any_geography(self) -> bool:
+        return bool(self.zipfile)
+
+    @property
+    def any_risk_scores(self) -> bool:
+        return bool(self.risk_scores)
+
+    def risk_score_names(self) -> tuple[str, ...]:
+        seen: list[str] = []
+        for r in self.risk_scores:
+            if r.riskscore not in seen:
+                seen.append(r.riskscore)
+        return tuple(seen)
+
+    @property
+    def any_cida_tables(self) -> bool:
+        return bool(self.cida_levels())
+
+    @property
+    def any_inclusion_dose(self) -> bool:
+        """Any inclusion rule carrying a dose threshold."""
+        return any(r.mincumdose is not None or r.minafdd is not None
+                   or r.maxafdd is not None for r in self.inclusions)
+
+    @property
+    def any_inclusions(self) -> bool:
+        return bool(self.inclusions)
+
+    @property
+    def unsupported_inclusions(self) -> tuple[str, ...]:
+        """Inclusion features present in the study but not implemented."""
+        out: list[str] = []
+        # INDEXDT_EXP anchors on the exposed index date, which only
+        # exists in comparator designs. Not modelled here.
+        anchors = {r.condfromanchor for r in self.inclusions} | {
+            r.condtoanchor for r in self.inclusions}
+        # INDEXDT and EPISODEENDDT are both applied. INDEXDT_EXP
+        # anchors on the exposed index date, which only exists in
+        # comparator designs and is not modelled.
+        unknown = anchors - {"INDEXDT", "EPISODEENDDT"}
+        if unknown:
+            out.append(
+                f"condition anchors {sorted(unknown)} — not applied, so "
+                f"those windows fall back to the index date"
+            )
+        cov_anchors = {c.covfromanchor for c in self.covariates} | {
+            c.covtoanchor for c in self.covariates}
+        cov_unknown = cov_anchors - {"INDEXDT", "EPISODEENDDT"}
+        if cov_unknown:
+            out.append(
+                f"covariate anchors {sorted(cov_unknown)} — not applied, "
+                f"so those windows fall back to the index date"
+            )
+        risk_anchors = {r.riskfromanchor for r in self.risk_scores} | {
+            r.risktoanchor for r in self.risk_scores}
+        risk_unknown = risk_anchors - {"INDEXDT", "EPISODEENDDT"}
+        if risk_unknown:
+            out.append(
+                f"risk-score anchors {sorted(risk_unknown)} — not "
+                f"applied, so those windows fall back to the index date"
+            )
+        return tuple(out)
+
+    @property
+    def effective_censor_date(self) -> date:
+        return self.censor_date or self.end_date
+
+
+# --------------------------------------------------------------------
+# Loading
+# --------------------------------------------------------------------
+
+
+def _as_date(v: Any) -> date | None:
+    """SAS date integer, ISO string, or date. See qrp.inputfile.sas_date."""
+    from .inputfile import sas_date
+
+    return sas_date(v)
+
+
+@overload
+def _int(v: Any, default: int) -> int: ...
+
+
+@overload
+def _int(v: Any, default: None) -> int | None: ...
+
+
+def _int(v: Any, default: int | None = 0) -> int | None:
+    """Parse an integer, falling back to `default` when absent.
+
+    Overloaded so the return type follows the default: passing an int
+    default yields an int, passing None yields `int | None`. Without
+    this the single signature is `int | None`, and ~20 call sites that
+    genuinely cannot produce None have to be either cast or ignored.
+    """
+    if v is None or v == "":
+        return default
+    return int(v)
+
+
+def _float(v: Any) -> float | None:
+    if v is None or v == "":
+        return None
+    return float(v)
+
+
+def _bool_yn(v: Any, default: bool = False) -> bool:
+    if v is None or v == "":
+        return default
+    return str(v).strip().upper() in {"Y", "YES", "TRUE", "1"}
+
+
+def load_study(path: str | Path, lookup: str | Path | None = None) -> StudyConfig:
+    """Load and validate a study definition from a QRP input file.
+
+    Handles both shapes:
+      * real `create_json.sas` output, where top-level keys are SAS
+        DATASET names and `QRP_PARAMETERS` maps logical -> actual, and
+      * hand-written files using literal keys (the demo studies).
+
+    See `qrp.inputfile` for the indirection; `qrp inspect --study <f>`
+    prints what resolved before you commit to a run.
+    """
+    from . import inputfile as _inputfile
+
+    inp = _inputfile.load(path, lookup)
+    if inp.unresolved:
+        import warnings
+        warnings.warn(
+            "input file names tables that are absent from the JSON: "
+            + "; ".join(inp.unresolved),
+            stacklevel=2,
+        )
+    present_unimpl = [
+        t for t in _inputfile.UNIMPLEMENTED_TABLES if inp.tables.get(t)
+    ]
+    if present_unimpl:
+        import warnings
+        warnings.warn(
+            f"study supplies {', '.join(present_unimpl)}, which this "
+            f"implementation does not yet apply — results will be broader "
+            f"than the SAS run",
+            stacklevel=2,
+        )
+    study = load_study_dict(
+        {**inp.tables, "qrp_parameters_scalars": inp.scalars}
+    )
+    # Inclusion rules are applied, but not every variant of them. Warn
+    # about the ones parsed and ignored, since those make the cohort
+    # broader than SAS's — the dangerous direction.
+    if study.unsupported_inclusions:
+        import warnings
+
+        warnings.warn(
+            "inclusioncodes uses features this implementation does not "
+            "apply: " + ", ".join(study.unsupported_inclusions)
+            + " — those rules are ignored, so the cohort will be broader "
+              "than the SAS run",
+            stacklevel=2,
+        )
+    return study
+
+
+def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
+    def rows(name: str) -> list[dict[str, Any]]:
+        return [
+            {str(k).lower(): v for k, v in r.items()}
+            for r in (raw.get(name) or raw.get(name.upper()) or [])
+        ]
+
+    # Scalars arrive either pre-resolved from qrp.inputfile, or as a
+    # single-row dict in a hand-written demo file.
+    params: dict[str, Any] = dict(raw.get("qrp_parameters_scalars") or {})
+    if not params and raw.get("qrp_parameters"):
+        first = (raw["qrp_parameters"] or [{}])[0]
+        params = {str(k).lower(): v for k, v in first.items()}
+    params.update({str(k).lower(): v for k, v in (raw.get("study") or {}).items()})
+
+    cohortfile = {r["cohortgrp"]: r for r in rows("cohortfile")}
+    type2file = {r.get("group", r.get("cohortgrp")): r for r in rows("type2file")}
+
+    codes_by_group: dict[str, dict[str, list[str]]] = {}
+    stock_by_group: dict[str, dict[str, str]] = {}
+    care_by_group: dict[str, list[tuple[str, str, str]]] = {}
+    for r in rows("cohortcodes"):
+        g = r.get("group") or r.get("cohortgrp")
+        if not g:
+            continue
+        bucket = codes_by_group.setdefault(
+            str(g), {"DEF": [], "EVENT": [], "IOC": []})
+        crit = str(r.get("indexcriteria") or "").upper()
+        fup = str(r.get("fupcriteria") or "").upper()
+        # fupcriteria='IOC' marks a washout-only code: it never defines
+        # an index or an outcome, only disqualifies an episode whose
+        # washout window contains it.
+        if fup == "IOC":
+            key = "IOC"
+        else:
+            key = "DEF" if crit == "DEF" else "EVENT"
+        if r.get("code"):
+            bucket[key].append(str(r["code"]))
+            if key == "DEF":
+                stock_by_group.setdefault(str(g), {})[str(r["code"])] = (
+                    str(r.get("stockgroup") or "").strip() or "_default"
+                )
+            else:
+                for enctype, pdx in parse_care_setting(
+                    r.get("caresettingprincipal")
+                ):
+                    care_by_group.setdefault(str(g), []).append(
+                        (str(r["code"]), enctype, pdx)
+                    )
+
+    cohorts: list[CohortConfig] = []
+    for grp, cf in cohortfile.items():
+        t2 = type2file.get(grp, {})
+        codes = codes_by_group.get(grp, {})
+        supply_rows = [
+            _int(r.get("codesupply"), None)
+            for r in rows("cohortcodes")
+            if (r.get("group") or r.get("cohortgrp")) == grp
+            and str(r.get("indexcriteria") or "").upper() == "DEF"
+            and r.get("codesupply") not in (None, "")
+        ]
+        cohorts.append(
+            CohortConfig(
+                cohortgrp=str(grp),
+                enrollment_num=_int(cf.get("enrollmentnum"), 1),
+                coverage=str(cf.get("coverage") or "MD").upper(),
+                enrol_gap=_int(cf.get("enrolgap"), 0),
+                chart_required=_bool_yn(cf.get("chartres")),
+                enr_days=_int(cf.get("enrdays"), 183),
+                sex=_codes(cf.get("sex"), ("F", "M", "U", "A")),
+                race=_codes(cf.get("race"), ("0", "1", "2", "3", "4", "5", "M")),
+                hispanic=_codes(cf.get("hispanic"), ("Y", "N", "U")),
+                age_strata=AgeStrata.parse(cf.get("agestrat")),
+                wash_per=_int(t2.get("t2washper"), None),
+                point=_bool_yn(t2.get("point")),
+                episode_gap=_int(t2.get("episodegap"), 0),
+                episode_gap_type=str(t2.get("episodegaptype") or "F").upper()[:1] or "F",
+                exp_ext_per=_int(t2.get("expextper"), 0),
+                min_epis_dur=_int(t2.get("minepisdur"), 1) or 1,
+                max_epis_dur=_int(t2.get("maxepisdur"), 0),
+                min_days_supp=_int(t2.get("mindaysupp"), 0),
+                at_risk_start=_int(t2.get("t2atriskstart"), 0),
+                blackout_per=_int(t2.get("blackoutper"), 0),
+                # absent -> None ("never had an event"), per SAS.
+                fup_wash_per=_int(t2.get("t2fupwashper"), None),
+                event_count=_int(t2.get("eventcount"), 0),
+                req_days_aft_ind=_int(cf.get("reqdaysaftind"), 0),
+                req_days_aft_epi=_int(t2.get("reqdaysaftepi"), 0),
+                censor_death=_bool_yn(t2.get("censor_dth"), default=True),
+                min_cum_dose=_float(t2.get("mincumdose")),
+                max_cum_dose=_float(t2.get("maxcumdose")),
+                cum_dose_per=_int(t2.get("t2cumdoseper"), None),
+                min_cfdd=_float(t2.get("mincfdd")),
+                max_cfdd=_float(t2.get("maxcfdd")),
+                code_supply=supply_rows[0] if supply_rows else None,
+                exposure_codes=tuple(codes.get("DEF", ())),
+                exposure_stockgroups=tuple(
+                    sorted(stock_by_group.get(str(grp), {}).items())
+                ),
+                event_care_settings=tuple(care_by_group.get(str(grp), ())),
+                event_codes=tuple(codes.get("EVENT", ())),
+                ioc_codes=tuple(codes.get("IOC", ())),
+            )
+        )
+
+    strata = tuple(StratumLevel.parse(r) for r in rows("userstrata"))
+
+    mfu = tuple(
+        (
+            str(r.get("group") or r.get("cohortgrp") or ""),
+            _int(r.get("analysisnum"), 1),
+            str(r.get("codecat") or "DX").upper(),
+            # codecount ranks by claims, patcount by distinct patients.
+            # They give different orderings; SAS defaults to codecount.
+            str(r.get("countmethod") or "CODECOUNT").upper(),
+            _int(r.get("topxx"), 20),
+            _int(r.get("mfufrom"), -365),
+            _int(r.get("mfuto"), -1),
+        )
+        for r in rows("mfufile")
+        if (r.get("group") or r.get("cohortgrp"))
+    )
+
+    lab_codes = tuple(
+        (
+            str(r.get("group") or r.get("cohortgrp") or ""),
+            str(r.get("code") or ""),
+            (str(r.get("labdatetype") or "LRO").upper() + "   ")[:3],
+            # codetype dispatches the extraction path
+            # (ms_extractlabs.sas:201, 301):
+            #   substr(codetype,1,2) = '01' -> lookup, '02' -> LOINC,
+            #                          other -> PX
+            #   substr(codetype,3,1) = the RESULT TYPE (N numeric,
+            #                          C character)
+            (str(r.get("codetype") or "01N").upper() + "   ")[:2],
+            (str(r.get("codetype") or "01N").upper() + "   ")[2:3] or "N",
+            # LAB01 combination, upcased and trimmed as SAS does
+            *(str(r.get(f) or "").strip().upper() for f in (
+                "ms_test_name", "ms_test_sub_category", "specimen_source",
+                "ms_result_unit", "result_type", "fast_ind", "pt_loc")),
+            *parse_lab_result(r.get("labresult")),
+        )
+        # SAS names this LABCODESMAP; some studies use LABCODES.
+        for r in (rows("labcodes") or rows("labcodesmap"))
+        if r.get("code")
+    )
+
+    utilization = tuple(
+        (
+            str(r.get("group") or r.get("cohortgrp") or ""),
+            str(r.get("utiltype") or r.get("type") or "MED").upper(),
+            _int(r.get("utilfrom"), -365),
+            _int(r.get("utilto"), -1),
+        )
+        for r in rows("utilfile")
+        if (r.get("group") or r.get("cohortgrp"))
+    )
+
+    drug_classes = tuple(
+        (str(r["code"]), str(r.get("classname") or r.get("class") or ""))
+        for r in rows("drugclassfile")
+        if r.get("code")
+    )
+
+    zipfile = tuple(
+        (
+            str(r.get("zip") or "").strip(),
+            str(r.get("statecode") or "").strip() or None,
+            str(r.get("hhs_region") or r.get("hhs_reg") or "").strip() or None,
+            str(r.get("cb_region") or r.get("cb_reg") or "").strip() or None,
+            _float(r.get("sdi")),
+        )
+        for r in rows("zipfile")
+        if str(r.get("zip") or "").strip()
+    )
+
+    risk_scores = tuple(
+        RiskScoreCode(
+            riskscore=str(r.get("riskscore") or "").strip().upper(),
+            condid=str(r.get("condid") or "").strip().upper(),
+            codecat=str(r.get("codecat") or "DX").strip().upper(),
+            code=str(r.get("code") or "").strip(),
+            weight=_float(r.get("weight")) or 0.0,
+            riskfrom=_int(r.get("riskfrom"), -365),
+            riskto=_int(r.get("riskto"), -1),
+            riskfromanchor=(str(r.get("riskfromanchor") or "").strip().upper()
+                            or "INDEXDT"),
+            risktoanchor=(str(r.get("risktoanchor") or "").strip().upper()
+                          or "INDEXDT"),
+            # riskscorecodes carries its own care-setting restriction
+            **(lambda pairs: {"enctype": pairs[0][0], "pdx": pairs[0][1]})(
+                parse_care_setting(r.get("caresettingprincipal"))
+            ),
+        )
+        for r in rows("riskscorecodes")
+        if str(r.get("riskscore") or "").strip()
+    )
+
+    # Derive `cond` and `subcond` the way SAS does
+    # (ms_processinputfiles.sas:715-740): renumber the CHARACTER
+    # condlevel/subcondlevel columns, per cohort and criteria, in file
+    # order. Reading a numeric `cond` column straight from the input is
+    # wrong — it does not exist there, so every rule would land in
+    # condition 1 and be ORed instead of ANDed.
+    _incl_rows = rows("inclusioncodes")
+    _cond_no: dict[tuple, int] = {}
+    _sub_no: dict[tuple, int] = {}
+    inclusions_list: list[InclusionRule] = []
+    for r in _incl_rows:
+        grp = str(r.get("group") or r.get("cohortgrp") or "")
+        crit = str(r.get("indexcriteria") or "INC").upper()
+        clvl = str(r.get("condlevel") or "1").upper()
+        slvl = str(r.get("subcondlevel") or "1").upper()
+
+        ckey = (grp, crit, clvl)
+        if ckey not in _cond_no:
+            _cond_no[ckey] = 1 + len({k for k in _cond_no if k[:2] == (grp, crit)})
+        cond = _cond_no[ckey]
+
+        skey = (grp, crit, clvl, slvl)
+        if skey not in _sub_no:
+            _sub_no[skey] = 1 + len({k for k in _sub_no if k[:3] == ckey})
+        subcond = _sub_no[skey]
+
+        inclusions_list.append(InclusionRule(
+            cohortgrp=grp,
+            cond=cond,
+            subcond=subcond,
+            condlevel=_int(r.get("condlevel"), 1) if str(
+                r.get("condlevel") or "").isdigit() else cond,
+            criteria=crit,
+            codecat=str(r.get("codecat") or "DX").upper(),
+            condfrom=_int(r.get("condfrom"), -365),
+            condto=_int(r.get("condto"), -1),
+            condfromanchor=(str(r.get("condfromanchor") or "").strip().upper()
+                            or "INDEXDT"),
+            condtoanchor=(str(r.get("condtoanchor") or "").strip().upper()
+                          or "INDEXDT"),
+            codedays=max(1, _int(r.get("codedays"), 1) or 1),
+            minrxdays=max(1, _int(r.get("minrxdays"), 1) or 1),
+            mincumdose=_float(r.get("mincumdose")),
+            minafdd=_float(r.get("minafdd")),
+            maxafdd=_float(r.get("maxafdd")),
+            subcondlevel=slvl,
+            # `or "1"` would be wrong here: an integer 0 is falsy, so
+            # `0 or "1"` yields "1" and a sub-EXCLUSION silently becomes
+            # a sub-inclusion. Check for absence explicitly.
+            subcond_inclusion=(
+                str(r["subcondinclusion"]).strip().upper()
+                not in ("0", "N", "NO", "FALSE")
+                if r.get("subcondinclusion") is not None
+                and str(r.get("subcondinclusion")).strip() != ""
+                else True
+            ),
+            codes=tuple(str(c) for c in (r.get("codes") or []))
+                  or ((str(r["code"]),) if r.get("code") else ()),
+        ))
+    inclusions = tuple(inclusions_list)
+
+    # COVARIATECODES carries ONE ROW PER CODE with covarnum repeated —
+    # verified against a real input file (4,385 rows, 49 covariates, up
+    # to 1,432 codes for one of them). The earlier parser expected one
+    # row per covariate with a `codes` list, which is a shape my own
+    # fixtures invented; on a real file every row became a separate
+    # covariate and validation rejected the duplicate covarnums.
+    #
+    # The window and anchor attributes are taken from the first row of
+    # each covarnum: SAS validates that they are constant within a
+    # covariate (ms_processinputfiles.sas), so any row will do.
+    _cov_rows: dict[int, dict[str, Any]] = {}
+    _cov_codes: dict[int, list[str]] = {}
+    for r in rows("covariatecodes"):
+        num = _int(r.get("covarnum"), 0)
+        _cov_rows.setdefault(num, r)
+        code = str(r.get("code") or "").strip()
+        if code:
+            _cov_codes.setdefault(num, []).append(code)
+
+    covariates = tuple(
+        Covariate(
+            covarnum=num,
+            # Real files have no `covarname`; SAS derives a label from
+            # the code grouping. `stockgroup` carries it in practice.
+            covarname=str(
+                r.get("covarname") or r.get("stockgroup") or f"covar{num}"
+            ),
+            codecat=str(r.get("codecat") or "DX").upper(),
+            covfrom=_int(r.get("covfrom"), Covariate.UNBOUNDED_BEFORE),
+            covto=_int(r.get("covto"), Covariate.UNBOUNDED_AFTER),
+            covfromanchor=(str(r.get("covfromanchor") or "").strip().upper()
+                           or "INDEXDT"),
+            covtoanchor=(str(r.get("covtoanchor") or "").strip().upper()
+                         or "INDEXDT"),
+            dateonly=_bool_yn(r.get("dateonly")),
+            # A supplied `codes` list still works, for hand-written
+            # studies and the test fixtures.
+            codes=tuple(str(c) for c in (r.get("codes") or []))
+                  or tuple(_cov_codes.get(num, ())),
+            combo_sql=(parse_combo(r.get("code"))[0]
+                       if str(r.get("codecat") or "").upper() == "CC"
+                       else ""),
+            combo_refs=(parse_combo(r.get("code"))[1]
+                        if str(r.get("codecat") or "").upper() == "CC"
+                        else ()),
+        )
+        for num, r in sorted(_cov_rows.items())
+    )
+
+    code_strength = tuple(
+        (str(r["code"]), float(r["strength"]))
+        for r in rows("codestrength")
+        if r.get("code") and r.get("strength") not in (None, "")
+    )
+
+    study = StudyConfig(
+        study_type=_int(params.get("type"), 2),
+        covariates=covariates,
+        inclusions=inclusions,
+        strata=strata,
+        risk_scores=risk_scores,
+        zipfile=zipfile,
+        utilization=utilization,
+        drug_classes=drug_classes,
+        lab_codes=lab_codes,
+        mfu=mfu,
+        code_strength=code_strength,
+        start_date=_as_date(params.get("startdate")) or date(2010, 1, 1),
+        end_date=_as_date(params.get("enddate")) or date(2015, 12, 31),
+        censor_date=_as_date(params.get("censordate")),
+        run_id=str(params.get("runid") or "qrp"),
+        cohorts=tuple(cohorts),
+    )
+    study.validate()
+    return study
+
+
+__all__ = [
+    "AgeStrata",
+    "AgeStratum",
+    "CohortConfig",
+    "Covariate",
+    "StudyConfig",
+    "load_study",
+    "load_study_dict",
+    "replace",
+]
