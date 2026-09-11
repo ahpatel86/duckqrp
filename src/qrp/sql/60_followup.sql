@@ -126,7 +126,19 @@ WITH hits AS (
         max(r.mincumdose)       AS need_cumdose,
         min(r.minafdd)          AS need_afdd_lo,
         max(r.maxafdd)          AS need_afdd_hi
-    FROM _event_candidates ec
+    -- DISTINCT (patid, eventdt): SAS says so explicitly —
+    -- "Keep only one event per patid/eventdt for inclusions/exclusions
+    -- processing" (ms_createpov56.sas:186).
+    --
+    -- Without it, an episode with two qualifying claims on one day
+    -- enters this join twice and every sum() aggregate below is
+    -- doubled — supply_days and cumdose in particular, so a dose
+    -- threshold passes on half the real evidence. count(DISTINCT adate)
+    -- hides it, which is why it survived. Same shape as the condition
+    -- -key duplication fixed on the index-anchored side. Reported in
+    -- review.
+    FROM (SELECT DISTINCT cohortgrp, patid, indexdt, eventdt
+          FROM _event_candidates) ec
     JOIN (SELECT DISTINCT cohortgrp, cond, subcond, subcond_inclusion,
                  criteria, codecat, condfrom, condto, codedays, minrxdays,
                  mincumdose, minafdd, maxafdd
@@ -173,7 +185,8 @@ per_subcond AS (
              THEN any_value(r.subcond_inclusion)
              ELSE NOT any_value(r.subcond_inclusion)
         END AS satisfied
-    FROM _event_candidates ec
+    FROM (SELECT DISTINCT cohortgrp, patid, indexdt, eventdt
+          FROM _event_candidates) ec
     JOIN (SELECT DISTINCT cohortgrp, criteria, cond, subcond,
                  subcond_inclusion
           FROM cfg_inclusion WHERE criteria IN ('IEV', 'EEV')) r
@@ -223,6 +236,13 @@ SELECT
     m.*,
     fe.eventdt,
     (fe.eventdt IS NOT NULL)::INTEGER AS has_event,
+    -- SAS reports BOTH sum(NumEvents)=All_Events and
+    -- sum(HadEvent)=Eps_wEvents (ms_cidatables.sas:128-130). They are
+    -- different measures: how many events occurred, versus how many
+    -- episodes had at least one. Using has_event for both made
+    -- all_events identical to eps_wevents by construction, so a cohort
+    -- with recurrent events under-reported them. Reported in review.
+    coalesce(fe.numevents, 0)         AS numevents,
     -- person-time runs to the event, or to the end of the episode
     span_days(m.atriskindexdt, least(COALESCE(fe.eventdt, m.episodeenddt),
                                      m.episodeenddt)) AS person_days,

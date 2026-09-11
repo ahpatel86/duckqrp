@@ -32,6 +32,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+import shutil as _shutil
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -437,6 +438,17 @@ class Engine:
         path.parent.mkdir(parents=True, exist_ok=True)
         opts = "FORMAT PARQUET, COMPRESSION ZSTD"
         if partition_by:
+            # Remove the target tree first. Neither OVERWRITE_OR_IGNORE
+            # nor OVERWRITE deletes partition directories that the new
+            # data does not produce — verified on DuckDB 1.5.5, where
+            # rewriting a single-cohort table with a DIFFERENT cohort
+            # left both partitions in place. So rerunning a study with
+            # fewer cohorts, or a renamed one, left the old cohort's
+            # partition sitting in the output with nothing marking it
+            # stale. Reported in review; the reported cause was right
+            # and the obvious one-word fix was not sufficient.
+            if path.exists():
+                _shutil.rmtree(path)
             opts += f", PARTITION_BY ({partition_by}), OVERWRITE_OR_IGNORE"
         self.con.execute(f"COPY {table} TO '{path}' ({opts})")
 

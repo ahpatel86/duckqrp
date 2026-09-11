@@ -1491,7 +1491,7 @@ def _study_with_stockgroups(groups: dict[str, str]):
     codes = []
     for row in base["cohortcodes"]:
         row = dict(row)
-        if row["indexcriteria"] == "DEF":
+        if groups is not None and row["indexcriteria"] == "DEF":
             row["stockgroup"] = groups.get(row["code"], "_default")
         codes.append(row)
     return load_study_dict({
@@ -1552,7 +1552,12 @@ def test_stockgroup_absent_reproduces_single_drug_behaviour(study):
     a = Engine(verbose=False)
     b = Engine(verbose=False)
     try:
-        run(study, DATA, engine=a, verbose=False)
+        # Both sides built the same way, so the only difference is the
+        # stockgroup mapping. Comparing against the `study` fixture
+        # compared unlike things: it carries covariatecodes and this one
+        # does not, and the claims scan window is derived from the
+        # study's widest lookback.
+        run(_study_with_stockgroups(None), DATA, engine=a, verbose=False)
         run(_study_with_stockgroups({}), DATA, engine=b, verbose=False)
         assert a.count("stockpiled") == b.count("stockpiled")
     finally:
@@ -1880,15 +1885,23 @@ def test_care_setting_restricts_event_claims(study):
     assert counts["all"] > counts["ip"] > counts["ip_principal"], counts
 
 
-def test_unrestricted_care_setting_changes_nothing(study):
+def test_unrestricted_care_setting_changes_nothing():
     """Every EVENT code expands to ('**','*') when unspecified, so the
-    join is uniform and results are unchanged."""
+    join is uniform and results are unchanged.
+
+    Both sides are built by _care_setting_study so the two studies are
+    otherwise identical. Comparing against the `study` fixture instead
+    compared unlike things: that fixture carries covariatecodes and this
+    one does not, and since the claims scan window is now derived from
+    the study's widest lookback, the two legitimately read different
+    amounts of history.
+    """
     from qrp import Engine
 
     a = Engine(verbose=False)
     b = Engine(verbose=False)
     try:
-        run(study, DATA, engine=a, verbose=False)
+        run(_care_setting_study(""), DATA, engine=a, verbose=False)
         run(_care_setting_study("***"), DATA, engine=b, verbose=False)
         assert a.count("event_claims") == b.count("event_claims")
         assert a.count("cohort_final") == b.count("cohort_final")
@@ -3019,9 +3032,14 @@ def test_ioc_codes_are_a_separate_role():
     """
     s = _ioc_study(["X00001", "X00002"])
     c = s.cohorts[0]
-    assert c.ioc_codes == ("X00001", "X00002")
-    assert not set(c.ioc_codes) & set(c.event_codes)
-    assert not set(c.ioc_codes) & set(c.exposure_codes)
+    # (code, codecat) pairs — codecat decides which claim domain each
+    # code is read from, so a study can define exposure across RX, PX
+    # and DX at once.
+    assert {code for code, _ in c.ioc_codes} == {"X00001", "X00002"}
+    assert not ({code for code, _ in c.ioc_codes}
+                & {code for code, _ in c.event_codes})
+    assert not ({code for code, _ in c.ioc_codes}
+                & {code for code, _ in c.exposure_codes})
     assert s.any_ioc
 
 
@@ -3956,3 +3974,55 @@ def test_px_is_a_supported_codecat():
 
     assert "'PX' AS codecat" in COVAR_SOURCE_VIEW
     assert "cdm_procedure" in COVAR_SOURCE_VIEW
+
+
+# ---------------------------------------------------------------------
+# Disclosure and path safety (review findings)
+# ---------------------------------------------------------------------
+
+
+def test_database_errors_do_not_leak_cell_values():
+    """DuckDB quotes the OFFENDING VALUE in conversion and cast errors —
+    "Could not convert string 'X' to INT32" — and X is a cell from the
+    claims data. The run log is not a patient-level artefact and is not
+    protected as one, so those values must not reach it.
+    """
+    import duckdb
+
+    from qrp.errors import explain
+
+    con = duckdb.connect()
+    for sql in ("SELECT CAST('PT_99123456' AS INTEGER)",
+                "SELECT 'PT_99123456'::DATE",
+                "SELECT CAST('PT_99123456' AS DOUBLE)"):
+        try:
+            con.execute(sql)
+        except Exception as exc:            # noqa: BLE001 - that's the point
+            message = explain(exc)
+            assert "PT_99123456" not in message, (
+                f"cell value leaked into an error message:\n{message}"
+            )
+    con.close()
+
+
+def test_run_id_cannot_escape_the_output_directory():
+    """`run_id` is interpolated into output filenames and the run-log
+    name. A traversal value resolves outside the output tree entirely —
+    and past the dplocal/msoc split, which is the disclosure boundary.
+    """
+    from pathlib import Path
+
+    from qrp.config import safe_run_id
+
+    for hostile in ("../../../tmp/escaped", "a/b", "..", "", None,
+                    "  ..  ", r"C:\win", "./../x"):
+        cleaned = safe_run_id(hostile)
+        assert "/" not in cleaned and "\\" not in cleaned
+        assert ".." not in cleaned
+        # and the resulting path must stay inside its directory
+        out = (Path("/safe/out/dplocal") / f"{cleaned}_mstr.parquet").resolve()
+        assert str(out).startswith("/safe/out/dplocal/"), out
+
+    # legitimate ids must survive untouched
+    assert safe_run_id("wp322_run1") == "wp322_run1"
+    assert safe_run_id("PT001-01") == "PT001-01"

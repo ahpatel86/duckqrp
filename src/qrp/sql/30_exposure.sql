@@ -33,6 +33,15 @@
 
 -- Dispensings matching a cohort's exposure definition.
 -- One row per (cohort, dispensing).
+-- Exposure is extracted from the domain each code names, not from
+-- dispensing alone. A real study defines exposure across RX, PX and DX
+-- simultaneously — 960 / 150 / 14 codes in the file seen — and two of
+-- its cohorts are defined purely by HCPCS procedure codes. Extracting
+-- only from dispensing left those cohorts EMPTY, with no error.
+--
+-- PX and DX claims carry no supply: rxsup is 1 (a point event, so the
+-- episode is one day) and rxamt is NULL. That is what SAS gets too,
+-- since those columns do not exist on those tables.
 CREATE OR REPLACE TABLE exposure_claims AS
 SELECT
     k.cohortgrp,
@@ -44,9 +53,36 @@ SELECT
     d.rxamt
 FROM cdm_dispensing d
 JOIN cfg_codes k
-  ON k.code = d.code
- AND k.role = 'DEF'
-WHERE d.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}';
+  ON k.code    = d.code
+ AND k.role    = 'DEF'
+ AND k.codecat = 'RX'
+WHERE d.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+
+UNION ALL
+
+SELECT
+    k.cohortgrp, k.stockgroup, x.patid, x.adate, x.code,
+    1                AS rxsup,
+    NULL::DOUBLE     AS rxamt
+FROM cdm_procedure x
+JOIN cfg_codes k
+  ON k.code    = x.code
+ AND k.role    = 'DEF'
+ AND k.codecat = 'PX'
+WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+
+UNION ALL
+
+SELECT
+    k.cohortgrp, k.stockgroup, x.patid, x.adate, x.code,
+    1                AS rxsup,
+    NULL::DOUBLE     AS rxamt
+FROM cdm_diagnosis x
+JOIN cfg_codes k
+  ON k.code    = x.code
+ AND k.role    = 'DEF'
+ AND k.codecat = 'DX'
+WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}';
 
 -- Closed-form stockpiling.
 --

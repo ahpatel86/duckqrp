@@ -41,14 +41,11 @@
 -- Measured at 2m patients: the covariates stage went 65.1s -> 8.8s
 -- (7.4x), total runtime 153.7s -> 94.7s, database file 1103MB -> 423MB.
 -- Output verified byte-identical.
-CREATE OR REPLACE VIEW covar_source AS
-SELECT patid, adate, adate AS expiredt, code, 'DX' AS codecat
-FROM cdm_diagnosis
-UNION ALL
-SELECT patid, adate,
-       adate + CAST(rxsup - 1 AS INTEGER) AS expiredt,
-       code, 'RX' AS codecat
-FROM cdm_dispensing;
+-- covar_source is defined ONCE, in pipeline.py, immediately after
+-- normalize. This file used to redefine it here — a stale copy that
+-- silently overrode the real one and dropped both the PX arm and the
+-- rxsup/rxamt columns, so PX covariates matched nothing at all.
+-- Reported in review; the duplicate is the bug, not the definition.
 
 -- Detection: one row per (cohort, patient, index, covarnum) where at
 -- least one qualifying claim falls in the covariate's anchor window.

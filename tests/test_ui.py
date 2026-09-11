@@ -567,7 +567,13 @@ def test_statement_level_detail_is_reported(study):
             >= by_target["pov1"].rows), "POV1 funnel is not narrowing"
     # tables report rows and columns; views report columns only
     assert by_target["pov1"].rows > 0 and by_target["pov1"].columns > 10
-    assert by_target["covar_source"].rows == -1, "views must not be counted"
+    # A VIEW reports columns but no row count. `enrollment_spans` is
+    # built inside a stage; covar_source used to be too, but is now
+    # created once in pipeline.py right after normalize — it had been
+    # redefined in 80_covariates.sql as well, and the stale copy
+    # silently overrode the real one and dropped the PX arm.
+    views = [d for d in stmts if d.rows == -1]
+    assert views, "no view was reported; views must not be row-counted"
 
 
 def test_statement_detail_can_be_disabled(study):

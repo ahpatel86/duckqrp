@@ -16,6 +16,7 @@ That single change removes, at a stroke:
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,7 +64,13 @@ SAS_NAMES: dict[str, str] = {
     "ptsmasterlist":        "mstr",
     "cohort_final":         "mstr_final",
     "covariates_long":      "covariates",
-    "denominators":         "denomcounts",
+    # NOT "denomcounts". SAS has exactly one &RUNID._denomcounts and it
+    # is ms_cidadenom's output, which this package emits as the
+    # `denomcounts` table. `denominators` is a separate per-stratum
+    # aggregate from 70_outputs.sql; mapping both to the same SAS name
+    # meant the second write silently overwrote the first and one of the
+    # two outputs simply vanished. Reported in review.
+    "denominators":         "denomstrata",
     "covariate_prevalence": "baseline",
     "inclusion_excluded":   "inclexcl",
     "attrition":            "attrition",
@@ -130,7 +137,7 @@ def _run_metadata(eng: Engine, study: StudyConfig, seconds: float) -> None:
     """
     import platform
     import sys
-    from datetime import datetime
+    from datetime import date, datetime
 
     import duckdb as _ddb
 
@@ -686,15 +693,21 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         "cfg_codes",
         [
             {"cohortgrp": c.cohortgrp, "role": role, "code": code,
+             # codecat decides which claim domain the code is extracted
+             # from. A study can define exposure across RX, PX and DX at
+             # once; two cohorts in the real file seen are defined purely
+             # by HCPCS procedure codes.
+             "codecat": codecat,
              "stockgroup": dict(c.exposure_stockgroups).get(code, "_default")
                            if role == "DEF" else "_default"}
             for c in cohorts
             for role, codes in (("DEF", c.exposure_codes),
                                 ("EVENT", c.event_codes),
                                 ("IOC", c.ioc_codes))
-            for code in codes
+            for code, codecat in codes
         ],
-        "cohortgrp VARCHAR, role VARCHAR, code VARCHAR, stockgroup VARCHAR",
+        """cohortgrp VARCHAR, role VARCHAR, code VARCHAR,
+           codecat VARCHAR, stockgroup VARCHAR""",
     )
 
 
@@ -816,10 +829,25 @@ def run(
         "censor_date": study.effective_censor_date.isoformat(),
         # Claims outside the widest possible lookback can never matter.
         # Bounding the scan here is the one place a date filter is
-        # applied, and DuckDB pushes it into the parquet reader.
-        "claims_from": study.start_date.replace(
-            year=study.start_date.year - 2
-        ).isoformat(),
+        # applied, and DuckDB pushes it into the parquet reader — which
+        # is exactly why getting it wrong is invisible: the rows never
+        # enter the pipeline, so no downstream stage can notice they are
+        # missing.
+        #
+        # Computed from the study rather than hardcoded. A two-year
+        # constant silently truncated any washout over 730 days and any
+        # unbounded covariate lookback. `widest_lookback_days` returns
+        # None when some rule is unbounded, in which case no lower bound
+        # is applied at all.
+        #
+        # timedelta, not date.replace(year=...): replace() raises
+        # ValueError on 29 February. Both reported in review.
+        "claims_from": (
+            (study.start_date - timedelta(days=study.widest_lookback_days))
+            .isoformat()
+            if study.widest_lookback_days is not None
+            else date.min.isoformat()
+        ),
         "claims_to": study.effective_censor_date.isoformat(),
     }
 
@@ -909,6 +937,13 @@ def run(
         # integer covarnums reach the SQL, never study-supplied text.
         if study.any_combo_covariates:
             eng.con.execute(_combo_sql(study))
+            # Rebuild prevalence: it is computed inside the covariates
+            # stage, which runs BEFORE the combos are inserted, so it
+            # would otherwise omit every combo covariate — 17 of 49 in
+            # the real study seen. Reported in review.
+            eng.con.execute(
+                (Path(__file__).parent / "sql"
+                 / "_covariate_prevalence.sql").read_text().format(**fmt))
 
     # The study output table. Only built when USERSTRATA defines t2cida
     # levels, which is SAS's own gate (`where lowcase(tableID)='t2cida'`

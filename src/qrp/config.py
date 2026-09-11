@@ -24,6 +24,7 @@ dataclasses. Two consequences:
 from __future__ import annotations
 
 import re as _re
+from math import isfinite as _isfinite
 
 from dataclasses import dataclass, field, replace
 from datetime import date
@@ -143,22 +144,49 @@ def parse_lab_result(spec: Any) -> tuple[str | None, float | None, float | None]
     raw = str(spec or "").strip()
     if not raw:
         return (None, None, None)
+
+    def _bad(why: str) -> tuple[None, None, None]:
+        # A criterion that cannot be parsed is DROPPED, which makes the
+        # extraction broader than intended — the dangerous direction,
+        # and the same reason unsupported inclusion rules warn. Silence
+        # here meant a typo in a lab threshold quietly removed the
+        # threshold. Reported in review.
+        import warnings as _w
+        _w.warn(
+            f"labresult {raw!r} {why}; the criterion is IGNORED, so this "
+            f"lab code extracts more records than the study intends",
+            stacklevel=3,
+        )
+        return (None, None, None)
+
     if ":" in raw:
-        lo, _, hi = raw.partition(":")
+        lo_s, _, hi_s = raw.partition(":")
         try:
-            return (":", float(lo.strip()), float(hi.strip()))
+            lo, hi = float(lo_s.strip()), float(hi_s.strip())
         except ValueError:
-            return (None, None, None)
+            return _bad("is not a numeric range")
+        if not (_isfinite(lo) and _isfinite(hi)):
+            return _bad("has a non-finite bound")
+        if lo > hi:
+            # matches nothing at all, silently
+            return _bad(f"is an inverted range ({lo} > {hi})")
+        return (":", lo, hi)
     for op in ("<=", ">=", "~=", "<", ">", "="):   # two-char first
         if raw.startswith(op):
             try:
-                return (op, float(raw[len(op):].strip()), None)
+                bound = float(raw[len(op):].strip())
             except ValueError:
-                return (None, None, None)
+                return _bad(f"has no numeric bound after {op!r}")
+            if not _isfinite(bound):
+                return _bad("has a non-finite bound")
+            return (op, bound, None)
     try:
-        return ("=", float(raw), None)
+        bound = float(raw)
     except ValueError:
-        return (None, None, None)
+        return _bad("is not a recognised comparison")
+    if not _isfinite(bound):
+        return _bad("has a non-finite bound")
+    return ("=", bound, None)
 
 
 # Combo covariates (codecat='CC') are BOOLEAN EXPRESSIONS over other
@@ -173,6 +201,27 @@ def parse_lab_result(spec: Any) -> tuple[str | None, float | None, float | None]
 # that a malformed expression fails at load with a message, and so no
 # study-supplied string is ever concatenated into a query.
 _COMBO_TOKEN = _re.compile(r"\s*(\(|\)|and\b|or\b|not\b|\d+)", _re.I)
+
+
+_SAFE_RUNID = _re.compile(r"[^A-Za-z0-9_-]")
+
+
+def safe_run_id(value: Any) -> str:
+    """Reduce a run id to characters that cannot alter a path.
+
+    `run_id` is interpolated straight into output filenames and into the
+    run-log filename. A value like `../../../tmp/escaped` resolves
+    outside the output directory entirely — and past the dplocal/msoc
+    split, which is the disclosure boundary, not a naming convention.
+    So patient-level output could be written somewhere it was never
+    meant to go, by a study parameter. Reported in review.
+
+    Anything outside `[A-Za-z0-9_-]` becomes an underscore. Empty or
+    all-separator values fall back to "qrp" rather than producing a
+    filename that starts with the table name.
+    """
+    cleaned = _SAFE_RUNID.sub("_", str(value or "")).strip("_-")
+    return cleaned or "qrp"
 
 
 def parse_combo(expr: Any) -> tuple[str, tuple[int, ...]]:
@@ -298,13 +347,15 @@ class CohortConfig:
 
     # --- codes --------------------------------------------------------
     code_supply: int | None = None
-    exposure_codes: tuple[str, ...] = ()
-    event_codes: tuple[str, ...] = ()
+    # (code, codecat) pairs. codecat is one of RX / PX / DX and decides
+    # which claim domain the code is extracted from.
+    exposure_codes: tuple[tuple[str, str], ...] = ()
+    event_codes: tuple[tuple[str, str], ...] = ()
     # fupcriteria='IOC' codes: the follow-up washout is evaluated
     # against these as well as against the event codes
     # (ms_createmicohorts.sas:1685 -> _FUPWash, consumed by
     # _WashEventsInFupWash in ms_createpov56.sas).
-    ioc_codes: tuple[str, ...] = ()
+    ioc_codes: tuple[tuple[str, str], ...] = ()
     # (code, stockgroup) for DEF codes. SAS stockpiles WITHIN a
     # stockgroup (ms_stockpiling.sas passes GROUPING=StockGroup ...), so
     # two drugs in one cohort are pushed forward independently. Absent a
@@ -627,8 +678,10 @@ class StudyConfig:
                 code
                 for c in self.cohorts
                 if c.needs_dose
-                for code in c.exposure_codes
-                if code not in known
+                # exposure_codes is (code, codecat) pairs; dose applies
+                # to dispensings, so only RX codes need a strength.
+                for code, codecat in c.exposure_codes
+                if codecat == "RX" and code not in known
             }
             if missing:
                 raise ValueError(
@@ -741,6 +794,50 @@ class StudyConfig:
     @property
     def any_dose(self) -> bool:
         return any(c.needs_dose for c in self.cohorts)
+
+    @property
+    def widest_lookback_days(self) -> int | None:
+        """Largest number of days before an index date any rule can reach.
+
+        `None` means UNBOUNDED — some rule looks back to the start of
+        available history, so no lower bound may be applied to the scan.
+
+        This replaces a hardcoded two-year cutoff. A study with a washout
+        over 730 days, or any covariate with an unbounded lookback,
+        silently lost claims: the filter is applied in the parquet
+        reader, so the rows never enter the pipeline and nothing
+        downstream can notice. Reported in review.
+        """
+        spans: list[int] = []
+        for c in self.cohorts:
+            # wash_per is int | None: a missing FupWashPer means "never
+            # had an event", which is the strictest setting, not zero —
+            # but for the SCAN bound it contributes nothing extra.
+            spans.append(c.wash_per or 0)
+            spans.append(c.fup_wash_per or 0)
+            spans.append(c.cum_dose_per or 0)
+        for cov in self.covariates:
+            # Combo covariates are derived from other covariates and
+            # scan no claims of their own, so they contribute no
+            # lookback. Real files leave their covfrom blank, which
+            # would otherwise read as unbounded and force a full-history
+            # scan — 2.6x slower for no change in output.
+            if cov.codecat == "CC":
+                continue
+            if cov.covfrom <= Covariate.UNBOUNDED_BEFORE:
+                return None
+            spans.append(-cov.covfrom)
+        for incl in self.inclusions:
+            spans.append(-incl.condfrom)
+        for rs in self.risk_scores:
+            spans.append(-rs.riskfrom)
+        for _, _, util_from, _ in self.utilization:
+            spans.append(-util_from)
+        for row in self.mfu:
+            spans.append(-int(row[5]))
+        if self.lab_codes:
+            spans.append(365)          # 76_labs.sql covariate window
+        return max([s for s in spans if s is not None] or [0])
 
     @property
     def any_combo_covariates(self) -> bool:
@@ -960,15 +1057,24 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     cohortfile = {r["cohortgrp"]: r for r in rows("cohortfile")}
     type2file = {r.get("group", r.get("cohortgrp")): r for r in rows("type2file")}
 
-    codes_by_group: dict[str, dict[str, list[str]]] = {}
+    # (code, codecat) pairs per role — codecat decides which claim
+    # domain each code is extracted from.
+    codes_by_group: dict[str, dict[str, list[tuple[str, str]]]] = {}
     stock_by_group: dict[str, dict[str, str]] = {}
     care_by_group: dict[str, list[tuple[str, str, str]]] = {}
     for r in rows("cohortcodes"):
         g = r.get("group") or r.get("cohortgrp")
         if not g:
             continue
+        # (code, codecat) — NOT code alone. A real study defines
+        # exposure across RX, PX and DX simultaneously (960/150/14 in the
+        # file seen), and two of its cohorts are defined purely by HCPCS
+        # procedure codes. Dropping codecat made those cohorts extract
+        # from dispensing only, so they came out EMPTY. Reported in
+        # review.
         bucket = codes_by_group.setdefault(
             str(g), {"DEF": [], "EVENT": [], "IOC": []})
+        codecat = str(r.get("codecat") or "RX").upper()
         crit = str(r.get("indexcriteria") or "").upper()
         fup = str(r.get("fupcriteria") or "").upper()
         # fupcriteria='IOC' marks a washout-only code: it never defines
@@ -979,7 +1085,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         else:
             key = "DEF" if crit == "DEF" else "EVENT"
         if r.get("code"):
-            bucket[key].append(str(r["code"]))
+            bucket[key].append((str(r["code"]), codecat))
             if key == "DEF":
                 stock_by_group.setdefault(str(g), {})[str(r["code"])] = (
                     str(r.get("stockgroup") or "").strip() or "_default"
@@ -1271,7 +1377,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         start_date=_as_date(params.get("startdate")) or date(2010, 1, 1),
         end_date=_as_date(params.get("enddate")) or date(2015, 12, 31),
         censor_date=_as_date(params.get("censordate")),
-        run_id=str(params.get("runid") or "qrp"),
+        run_id=safe_run_id(params.get("runid")),
         cohorts=tuple(cohorts),
     )
     study.validate()

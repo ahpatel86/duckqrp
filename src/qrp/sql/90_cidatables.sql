@@ -42,7 +42,7 @@ WITH base AS (
         1                                             AS adjusteddisp,
         c.episode_rxsup                               AS totrxsup,
         c.rxamt                                       AS totrxamt,
-        c.has_event                                   AS numevents,
+        c.numevents                                   AS numevents,
         c.has_event                                   AS hadevent,
         c.person_days                                 AS followuptime,
         -- time from index to the end of available data, which is what
