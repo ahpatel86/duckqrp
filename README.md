@@ -24,7 +24,7 @@ python -m qrp run --study study/demo_type2.json \
 python -m qrp show --out results/                 # list result tables
 python -m qrp show --out results/ attrition       # read one
 
-pytest                       # 75 tests
+pytest                       # 196 tests
 
 # A virtual environment is required, not optional: modern Linux and
 # Homebrew mark the system Python "externally managed" (PEP 668) and a
@@ -41,39 +41,71 @@ dates, POV1, episode construction, censoring, patient master list,
 follow-up washout, event attribution, baseline covariate detection,
 attrition and stratified denominators.
 
-**Isn't:** risk scores, utilization, code distribution, combo covariates
-(`codecat='CC'`), lab result extras, or the Type 1/3/4/5/6 branches.
-Those are additive — they attach to `cohort_final` or `covariates_long` —
-but they aren't here.
+Also implemented: risk scores, healthcare utilization, most-frequent-use,
+code distribution, geography, lab extraction, combo covariates
+(`codecat='CC'`), and the CIDA output tables.
 
-The point is to make the architecture concrete and measurable, not to
-retire the PySpark package on the strength of one file.
+**Isn't:** the Type 1/3/4/5/6 branches, propensity scores, secondary
+episodes, `INDEXDT_EXP` anchors (comparator designs), and the LAB01
+lookup's full attribute mapping. Each of these **warns at load** rather
+than failing silently, because ignoring a rule makes a cohort *broader*
+than SAS's — the dangerous direction.
 
 ## Measured
 
-Synthetic CDM, 2 cohorts, on **1 CPU core / 3 GB RAM**.
+On **1 CPU core / 3 GB RAM**.
 
-`demo_type2.json` — spine only:
+Measured on a **real SCDM extract** — 174,064 patients, 35.2M rows,
+175 MB of parquet — and on a 4× replica (~140M rows). Best of three,
+single core.
 
-| patients | input | wall clock | throughput | final episodes |
-|---|---|---|---|---|
-| 100k | 15.9 MB | 2.40 s | 6.6 MB/s | 70,383 |
-| 500k | 79.1 MB | 12.51 s | 6.3 MB/s | 349,878 |
-| 2m | 316.0 MB | 56.20 s | 5.6 MB/s | 1,402,970 |
+| study | dataset | wall clock | rows/s | episodes |
+|---|---|--:|--:|--:|
+| simple | 1× | 3.08 s | 11.4M | 63,943 |
+| simple | 4× | 12.32 s | 11.4M | 255,772 |
+| production | 1× | 4.77 s | 7.4M | 1,085 |
+| production | 4× | 13.27 s | 10.6M | 4,340 |
 
-`demo_full.json` — adds dose restrictions and 12 baseline covariates:
+The *production* study is a real input file: 14 cohorts, 1,124 cohort
+codes, 4,385 covariate rows across 49 covariates, 250 inclusion rows.
 
-| patients | input | wall clock | throughput | final episodes |
-|---|---|---|---|---|
-| 100k | 16.3 MB | 4.24 s | 3.8 MB/s | 68,845 |
-| 500k | 79.1 MB | 21.59 s | 3.7 MB/s | 349,878 |
-| 2m | 316.0 MB | 120.63 s | 2.6 MB/s | 1,402,970 |
+**Throughput is quoted in rows/s, not MB/s.** Earlier versions of this
+table divided by *compressed* parquet size, which flatters the engine —
+the same data at a different compression level would have "changed"
+throughput without anything running faster.
 
-The spine scales linearly across a 20× range. The full study is mildly
-superlinear (3.8 → 2.6 MB/s), and the cause is visible in the stage
-table: covariate detection is ~45% of runtime and is a range join whose
-cost grows with both episodes and covariate count. That is the stage to
-watch as covariate counts rise toward the realistic few hundred.
+### The covariate stage, and closing a loop
+
+An earlier edition of this section said covariate detection was ~45% of
+runtime and "the stage to watch as covariate counts rise toward the
+realistic few hundred." That turned out to be exactly right. On the real
+production study it grew **15.5× for 4× the data** while every other
+stage scaled ~3.8×, because the join had *both* the episode side and the
+claim side growing with the extract: 28.6M × 1,085 at 1× became
+114M × 4,340 at 4×.
+
+The fix builds `cohort_claims` once — the claims restricted to cohort
+members — and shares it across the covariate, inclusion, risk-score and
+event-anchored stages. 4× went from 49.50 s to 13.27 s, and the stage
+itself is now 0.04 s and no longer measurable.
+
+Two details worth carrying:
+
+* **Filtering inline and materialising a filtered table are not the
+  same optimisation.** A `WHERE EXISTS` subquery was tried first; it
+  blocks predicate pushdown into the parquet reader and made 1× *worse*
+  (2.14 s → 3.31 s).
+* **The copy has to earn itself.** It is only materialised when the
+  study actually reads it heavily *and* the cohort is a minority of the
+  extract. Gating on cohort share alone regressed a study with no
+  covariates from 3.05 s to 6.02 s — it was paying for a copy nothing
+  read.
+
+`tools/scale_profile.py` runs a study at two data sizes and flags any
+stage growing faster than the data. It is how this was found, and the
+only method that would have: every test passes at fixture scale, where
+15×-versus-4× is under a second. A full sweep after the fix shows **no
+stage meaningfully superlinear**.
 
 The constraint worth noting: this ran on **one core**. DuckDB parallelises
 hash joins, aggregation and sorts, so these are a floor rather than a
@@ -270,7 +302,14 @@ Measured on the 2m-patient study (316 MB input, 10 stages):
 | `--db file --memory-limit 1GB` | 151 s | 1183 MB |
 | `--db file --memory-limit 512MB` | 157 s | **687 MB** |
 
-A 5.5× memory reduction for a 33% time cost. The memory floor is **flat
+A 5.5× memory reduction for a 33% time cost.
+
+*(This table and the memory floor below were measured on synthetic data
+at 100k/500k/2m patients, before the real extract was available. The
+shape of the result — spilling rather than failing — has held on real
+data, but the absolute numbers have not been re-measured.)*
+
+The memory floor is **flat
 across scale** — 100k, 500k and 2m patients all complete at 160 MB,
 because the floor is set by per-operator working sets rather than data
 volume. Disk, not RAM, is the binding constraint at scale: at the floor
@@ -335,12 +374,24 @@ src/qrp/
     40_index.sql       findgap washout
     42_dose.sql        cumulative dose + CFDD (RANGE-framed windows)
     45_pov1.sql        demographics, age strata, enrollment
+    47_geography.sql   zip -> state / region / SDI
     50_episodes.sql    claim episodes + master list + censoring
+    55_dose_censor.sql maxcumdose episode censoring
     60_followup.sql    follow-up washout + events (ASOF)
     70_outputs.sql     attrition + denominators (GROUPING SETS)
+    52_inclusion.sql   INCLUSIONCODES: cond/subcond, dose, anchors
+    72_codedistribution.sql  code distribution / distindex
+    74_utilization.sql encounter + drug utilization
+    76_labs.sql        lab extraction (3 paths by codetype)
+    78_mfu.sql         most frequent use
     80_covariates.sql  covariate detection (long), prevalence
+    85_riskscores.sql  weighted comorbidity scores
+    90_cidatables.sql  T2_CIDA numerators
+    92_cidadenom.sql   enrolled member-days
 tools/
   gen_synthetic.py, bench.py, compare_runs.py, find_memory_floor.py
+  scale_profile.py   per-stage scaling: flags work growing faster
+                     than the data
 tests/
   test_rewrites.py     proves the two closed-form rewrites
   test_determinism.py  tie-breaking on constructed ties
@@ -348,7 +399,8 @@ tests/
   test_ui.py           event stream, cancellation, headless TUI
 ```
 
-Roughly 1,700 lines total (900 Python, 500 SQL, 300 tests), against
+Roughly 14,500 lines total (6,650 Python, 2,730 SQL, 5,090 tests),
+against
 ~40,000 in the PySpark package —
 though that ratio is unfair in both directions, since the port covers
 more stages and this covers them more narrowly.
@@ -406,19 +458,27 @@ upstream rather than from the clause, so the SQL says so in a comment.
 
 ## Honest caveats
 
-- **Semantics need verification against SAS.** The algorithms were read
-  off the PySpark port and reasoned about, not validated against SAS
-  output. The parity harness is how they become trustworthy; treat every
-  stage as unverified until it passes.
-- **Not every Type 2 option is wired.** `at_risk_start` and
-  `episode_gap_type='P'` are represented in config and SQL but not
-  covered by tests. Combo covariates, lab result extras, the
-  `min_rx_days > 1` path and surveillance-mode carry-forward are absent.
-- **Covariate detection is the scaling risk.** At 12 covariates it is
-  45% of runtime. Realistic studies use far more, and the range join
-  grows with both episode count and covariate count. If the real
-  benchmark disappoints anywhere, expect it here first.
-- **Synthetic benchmark data.** Real claims are skewed in ways this
-  generator is not — patients with hundreds of dispensings stress window
-  functions differently. Benchmark on real data before believing any
-  number here.
+- **Not verified against SAS OUTPUT.** `docs/SAS_PARITY.md` records a
+  clause-by-clause audit against the SAS macro library — deliberately
+  the macros, not the PySpark port, so a defect in the port would not be
+  inherited silently. It found eight divergences, all fixed. But reading
+  has limits: two further divergences were found only when a reviewer
+  pointed at a column I had dismissed, and four more only when real lab
+  data and a real input file arrived. **One comparison against SAS
+  output for a real study would test every stage at once**, including
+  the ones read confidently and got wrong.
+- **Covariate detection WAS the scaling risk, and it was real.** An
+  earlier edition of this file predicted it; on a production study it
+  grew 15.5× for 4× the data. Fixed (see the benchmark section), and a
+  full sweep now shows no stage meaningfully superlinear. The prediction
+  was right, which is a reason to take the remaining caveats seriously
+  rather than a reason to relax.
+- **The 4× dataset is replicated, not independent.** It is the real 1×
+  extract with offset patient ids, so patient count grows while
+  per-patient claim density stays identical. A real 4× extract would
+  have a different distribution, and the covariate join's behaviour
+  depends on exactly that. The 1× numbers are real throughout.
+- **A single timing is not a measurement.** Run-to-run variance on a
+  shared box is around 10%. One reading during this work put a stage at
+  5.67× — a genuine-looking problem that did not reproduce across three
+  clean runs (4.06×, 4.22×, 4.45×).

@@ -1,0 +1,130 @@
+-- =====================================================================
+-- 90_cidatables.sql — the T2_CIDA output table (ms_cidatables.sas).
+--
+-- This is the study deliverable: one row per (cohort, level, stratum)
+-- with cohort metrics. SAS stacks one block per USERSTRATA level, each
+-- labelled with its `Level`, which is what `cfg_strata` reproduces here.
+--
+-- The two-stage aggregation matters
+-- --------------------------------
+-- SAS computes numerators in two passes (ms_cidatables.sas:115-140):
+--
+--   pass 1: class group PatId <levelvars>   -> max(Patient)=Npts,
+--                                              sum(...)=everything else
+--   pass 2: class group <levelvars>         -> sum= over pass 1
+--
+-- `max(Patient)` per patient followed by `sum` is how SAS counts
+-- DISTINCT patients without a distinct operator. `count(DISTINCT patid)`
+-- is the same thing, so this is written as one pass — but the two-stage
+-- shape is why every other metric is a plain sum: they are summed within
+-- a patient first, then across patients, which for a sum is associative.
+--
+-- Metric names are SAS's, because this table leaves the site and is read
+-- against SAS documentation.
+-- =====================================================================
+
+CREATE OR REPLACE TABLE _t2_num AS
+WITH base AS (
+    SELECT
+        c.cohortgrp                                   AS "group",
+        c.patid,
+        c.agegroup,
+        c.agegroupnum,
+        c.sex,
+        c.race,
+        c.hispanic,
+        year(c.indexdt)::VARCHAR                      AS index_year,
+        1                                             AS patient,
+        -- numdispensing is the count of same-day-collapsed claims that
+        -- formed the index dispensing; SAS's RawDisp is the raw claim
+        -- count and AdjustedDisp the post-stockpiling count.
+        c.numdispensing                               AS rawdisp,
+        1                                             AS adjusteddisp,
+        c.episode_rxsup                               AS totrxsup,
+        c.rxamt                                       AS totrxamt,
+        c.numevents                                   AS numevents,
+        c.has_event                                   AS hadevent,
+        c.person_days                                 AS followuptime,
+        -- time from index to the end of available data, which is what
+        -- SAS calls timetocensor
+        span_days(c.indexdt, c.dataavail_dt)          AS timetocensor
+    FROM cohort_final c
+)
+SELECT
+    lv.level_id                                        AS level,
+    b."group",
+    -- Stratum values are NULL for a level that does not stratify on
+    -- them, which is what GROUPING SETS produces and what the SAS shell
+    -- leaves blank.
+    CASE WHEN lv.has_agegroup THEN b.agegroup    END   AS agegroup,
+    CASE WHEN lv.has_agegroup THEN b.agegroupnum END   AS agegroupnum,
+    CASE WHEN lv.has_sex      THEN b.sex         END   AS sex,
+    CASE WHEN lv.has_race     THEN b.race        END   AS race,
+    CASE WHEN lv.has_hispanic THEN b.hispanic    END   AS hispanic,
+    CASE WHEN lv.has_year     THEN b.index_year  END   AS index_year,
+    count(DISTINCT b.patid)                            AS npts,
+    sum(b.patient)                                     AS episodes,
+    sum(b.adjusteddisp)                                AS adjustedcodecount,
+    sum(b.rawdisp)                                     AS rawcodecount,
+    sum(b.totrxsup)                                    AS daysupp,
+    sum(b.totrxamt)                                    AS amtsupp,
+    sum(b.numevents)                                   AS all_events,
+    sum(b.hadevent)                                    AS eps_wevents,
+    sum(b.followuptime)                                AS followuptime,
+    sum(b.timetocensor)                                AS timetocensor
+FROM base b
+CROSS JOIN cfg_strata lv
+GROUP BY
+    lv.level_id, b."group",
+    CASE WHEN lv.has_agegroup THEN b.agegroup    END,
+    CASE WHEN lv.has_agegroup THEN b.agegroupnum END,
+    CASE WHEN lv.has_sex      THEN b.sex         END,
+    CASE WHEN lv.has_race     THEN b.race        END,
+    CASE WHEN lv.has_hispanic THEN b.hispanic    END,
+    CASE WHEN lv.has_year     THEN b.index_year  END
+;
+
+-- Merge numerators with denominators.
+--
+-- SAS: "The table to be generated in msoc will be the result of a merge
+-- between numerators and denominators" (ms_cidatables.sas:16), joined on
+-- the common level values. A FULL join, not a left one: a stratum can
+-- have eligible members but no exposed episodes, and reporting that as
+-- absent rather than as a zero numerator would understate the
+-- denominator.
+CREATE OR REPLACE TABLE t2_cida AS
+SELECT
+    coalesce(n.level, d.level)             AS level,
+    coalesce(n."group", d."group")         AS "group",
+    coalesce(n.agegroup, d.agegroup)       AS agegroup,
+    coalesce(n.agegroupnum, d.agegroupnum) AS agegroupnum,
+    coalesce(n.sex, d.sex)                 AS sex,
+    coalesce(n.race, d.race)               AS race,
+    coalesce(n.hispanic, d.hispanic)       AS hispanic,
+    coalesce(n.index_year, d.index_year)   AS index_year,
+    -- numerator metrics; zero where the stratum has no episodes
+    coalesce(n.npts, 0)              AS npts,
+    coalesce(n.episodes, 0)          AS episodes,
+    coalesce(n.adjustedcodecount, 0) AS adjustedcodecount,
+    coalesce(n.rawcodecount, 0)      AS rawcodecount,
+    coalesce(n.daysupp, 0)           AS daysupp,
+    coalesce(n.amtsupp, 0)           AS amtsupp,
+    coalesce(n.all_events, 0)        AS all_events,
+    coalesce(n.eps_wevents, 0)       AS eps_wevents,
+    coalesce(n.followuptime, 0)      AS followuptime,
+    coalesce(n.timetocensor, 0)      AS timetocensor,
+    -- denominator metrics
+    coalesce(d.eligible_members, 0)  AS eligible_members,
+    coalesce(d.memberdays, 0)        AS memberdays
+FROM _t2_num n
+FULL JOIN denomcounts d
+  ON  d.level      = n.level
+ AND  d."group"    = n."group"
+ AND  d.agegroup    IS NOT DISTINCT FROM n.agegroup
+ AND  d.sex         IS NOT DISTINCT FROM n.sex
+ AND  d.race        IS NOT DISTINCT FROM n.race
+ AND  d.hispanic    IS NOT DISTINCT FROM n.hispanic
+ AND  d.index_year  IS NOT DISTINCT FROM n.index_year
+ORDER BY level, "group", agegroupnum, sex, race, hispanic, index_year;
+
+DROP TABLE _t2_num;
