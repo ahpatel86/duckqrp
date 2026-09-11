@@ -147,15 +147,22 @@ def _run_metadata(eng: Engine, study: StudyConfig, seconds: float) -> None:
             start_date DATE, end_date DATE, censor_date DATE,
             n_cohorts INTEGER, n_covariates INTEGER, n_inclusion_rules INTEGER,
             engine VARCHAR, engine_version VARCHAR,
-            python_version VARCHAR, platform VARCHAR, wall_seconds DOUBLE
+            python_version VARCHAR, platform VARCHAR, wall_seconds DOUBLE,
+            -- The EFFECTIVE limit and thread count, not what was asked
+            -- for. Omitting memory_limit means DuckDB's own default of
+            -- 80% of physical RAM: 3.1 GiB on a 4 GB box, ~102 GB on a
+            -- 128 GB server. A run record that does not say which is
+            -- not a record of what the job took.
+            memory_limit VARCHAR, threads INTEGER
         )""")
     eng.con.execute(
-        "INSERT INTO signature VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO signature VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [study.run_id, study.study_type, datetime.now(),
          study.start_date, study.end_date, study.effective_censor_date,
          len(study.cohorts), len(study.covariates), len(study.inclusions),
          "duckdb", _ddb.__version__, sys.version.split()[0],
-         platform.platform(), round(seconds, 3)],
+         platform.platform(), round(seconds, 3),
+         eng.effective_memory_limit, eng.effective_threads],
     )
 
     eng.con.execute("""
@@ -748,7 +755,10 @@ def run(
         stages=tuple(stages),
         indata=str(indata),
         threads=threads if engine is None else eng.threads,
-        memory_limit=memory_limit if engine is None else eng.memory_limit,
+        # The EFFECTIVE limit, not the requested one. `None` means
+        # DuckDB's default of 80% of physical RAM, which on a large
+        # shared server is a lot to take without recording it.
+        memory_limit=eng.effective_memory_limit,
     ))
 
     register_config(eng, study)

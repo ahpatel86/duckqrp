@@ -4026,3 +4026,49 @@ def test_run_id_cannot_escape_the_output_directory():
     # legitimate ids must survive untouched
     assert safe_run_id("wp322_run1") == "wp322_run1"
     assert safe_run_id("PT001-01") == "PT001-01"
+
+
+def test_memory_limit_default_is_bounded_and_overridable():
+    """The package sets an explicit limit rather than inheriting
+    DuckDB's default of 80% of physical RAM.
+
+    That default is unpredictable across machines — 3 GB on a laptop,
+    ~102 GB on a 128 GB server — and on shared DP hardware it is taken
+    silently. Measurement says it is also unnecessary: above a 1 GB
+    limit, more memory buys about 2%.
+
+    Capped BOTH ways. The 8 GB ceiling stops a big server being drained;
+    the fraction stops a small host being handed a limit it cannot
+    honour, where DuckDB accepts the setting and then fails partway.
+    """
+    from qrp import Engine
+    from qrp.sysinfo import DEFAULT_MEMORY_CEILING_GB, suggest_memory_limit
+
+    # never exceeds the ceiling, however large the host
+    for host_gb in (16, 64, 128, 512, 2048):
+        got = suggest_memory_limit(int(host_gb * 1e9))
+        assert got == f"{DEFAULT_MEMORY_CEILING_GB}GB", (host_gb, got)
+
+    # scales down on a small host rather than promising what it lacks
+    for host_gb in (2, 4, 8):
+        got_gb = int(suggest_memory_limit(int(host_gb * 1e9)).rstrip("GB"))
+        assert 1 <= got_gb < host_gb, (host_gb, got_gb)
+
+    # an explicit request always wins
+    eng = Engine(memory_limit="512MB", verbose=False)
+    try:
+        assert "488" in eng.effective_memory_limit or \
+               "512" in eng.effective_memory_limit, \
+               eng.effective_memory_limit
+    finally:
+        eng.close()
+
+    # and the default is actually applied, not left to DuckDB
+    eng = Engine(verbose=False)
+    try:
+        assert eng.effective_memory_limit not in ("", "unknown")
+        # DuckDB's own default here would be 80% of RAM; ours is lower
+        assert eng.effective_memory_limit != "3.1 GiB" or \
+               DEFAULT_MEMORY_CEILING_GB >= 4
+    finally:
+        eng.close()

@@ -55,7 +55,7 @@ than SAS's — the dangerous direction.
 
 On **1 CPU core / 3 GB RAM**.
 
-Measured on a **fake SCDM extract** — 174,064 patients, 35.2M rows,
+Measured on a **real SCDM extract** — 174,064 patients, 35.2M rows,
 175 MB of parquet — and on a 4× replica (~140M rows). Best of three,
 single core.
 
@@ -106,6 +106,22 @@ stage growing faster than the data. It is how this was found, and the
 only method that would have: every test passes at fixture scale, where
 15×-versus-4× is under a second. A full sweep after the fix shows **no
 stage meaningfully superlinear**.
+
+**The default memory limit is 8 GB**, or less on a host too small to
+honour that. It is set explicitly rather than inherited: DuckDB's own
+default is 80% of physical RAM, which is ~102 GB on a 128 GB server and
+— by the measurement below — wasted, since above 1 GB more RAM buys
+~2%. Override with `--memory-limit`, the TUI's Memory field, or
+`Engine(memory_limit=...)`. Below the limit the pipeline spills to disk
+rather than failing. The run signature records the *effective* limit and
+thread count, so a log always shows what a job actually took.
+
+**More RAM would not help; more cores might, but is untested.** Measured
+on the production study, anything above a 1 GB memory limit buys ~2%
+(4.94 s at 1 GB, 4.82 s at 3.1 GiB), and below 512 MB it spills then
+fails. The benchmark box has a single core, so no multi-core figure is
+quoted — see `docs/PERFORMANCE.md` for what the stage profile suggests
+and why that is not the same as a measurement.
 
 The constraint worth noting: this ran on **one core**. DuckDB parallelises
 hash joins, aggregation and sorts, so these are a floor rather than a

@@ -60,20 +60,31 @@ def human(n: int) -> str:
     return f"{n}B"
 
 
-def suggest_memory_limit(total: int | None = None) -> str:
-    """A default that leaves room for the OS and the Python process.
+# Ceiling on the default. Measured on a real extract (174k patients,
+# 35.2M rows): above a 1 GB limit, more memory buys about 2% — 4.94 s at
+# 1 GB against 4.82 s at 3.1 GiB. 8 GB is generous headroom for a study
+# several times larger, and still a number a DP can reason about.
+#
+# The point is predictability. DuckDB's own default is 80% of physical
+# RAM, so the same package takes 3 GB on a laptop and ~102 GB on a
+# 128 GB server — silently, and on shared hardware.
+DEFAULT_MEMORY_CEILING_GB = 8
 
-    DuckDB's own default is ~80% of RAM. That is fine when DuckDB is the
-    only thing running and uncomfortable when it is not, so this is
-    slightly more conservative and always an explicit number the user
-    can see and override.
+
+def suggest_memory_limit(total: int | None = None) -> str:
+    """The default memory limit: 8 GB, or less on a smaller host.
+
+    Capped BOTH ways. The ceiling keeps a big shared server from having
+    80% of its RAM taken by a job that does not need it; the fraction
+    keeps a small host from being handed a limit it cannot honour, where
+    DuckDB would accept the setting and then fail partway through.
     """
     total = total if total is not None else total_memory_bytes()
     if total <= 0:
         return "auto"
     gb = total / 1000**3
     frac = 0.60 if gb <= 8 else 0.70 if gb <= 32 else 0.75
-    return f"{max(1, int(gb * frac))}GB"
+    return f"{max(1, min(DEFAULT_MEMORY_CEILING_GB, int(gb * frac)))}GB"
 
 
 def memory_choices(total: int | None = None) -> list[str]:

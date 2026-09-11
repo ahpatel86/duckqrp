@@ -47,7 +47,14 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--indata", required=True, help="CDM parquet root")
     r.add_argument("--out", help="write output tables here")
     r.add_argument("--threads", type=int)
-    r.add_argument("--memory-limit", help="e.g. 8GB")
+    r.add_argument(
+        "--memory-limit",
+        help=("DuckDB memory ceiling, e.g. 8GB. Defaults to 8GB, or less "
+              "on a smaller host. Leaving DuckDB to its own default would "
+              "take 80%% of physical RAM — ~102GB on a 128GB server — "
+              "which measurement shows is unnecessary: above 1GB, more "
+              "memory buys about 2%%. Below the limit the pipeline spills "
+              "to disk rather than failing."))
     r.add_argument("--db", default=":memory:",
                    help="persist to a .duckdb file; keeps intermediates "
                         "buffer-managed on disk instead of in RAM")

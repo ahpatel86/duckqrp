@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 import shutil as _shutil
 from pathlib import Path
+
+from .sysinfo import suggest_memory_limit as _suggest_memory_limit
 from typing import Any, Mapping, Sequence
 
 import duckdb
@@ -111,8 +113,13 @@ class Engine:
         self.con = duckdb.connect(self.database)
         if self.threads:
             self.con.execute(f"SET threads = {int(self.threads)}")
-        if self.memory_limit:
-            self.con.execute(f"SET memory_limit = '{self.memory_limit}'")
+        # Always set an explicit limit. Leaving it unset means DuckDB's
+        # default of 80% of physical RAM, which is unpredictable across
+        # machines and antisocial on shared hardware. `memory_limit=None`
+        # therefore means "the package default", not "no limit".
+        limit = self.memory_limit or _suggest_memory_limit()
+        if limit and limit != "auto":
+            self.con.execute(f"SET memory_limit = '{limit}'")
         if self.temp_directory:
             Path(self.temp_directory).mkdir(parents=True, exist_ok=True)
             self.con.execute(f"SET temp_directory = '{self.temp_directory}'")
@@ -154,6 +161,34 @@ class Engine:
                 pass
         self._limit_bytes = self._parse_limit()
         self.execute_script("00_macros.sql")
+
+    @property
+    def effective_memory_limit(self) -> str:
+        """What DuckDB is ACTUALLY allowed to use, as a human string.
+
+        `memory_limit=None` does not mean "unlimited" or "modest" — it
+        means DuckDB's own default, which is **80% of physical RAM**. On
+        the 4 GB benchmark box that is 3.1 GiB; on a 128 GB DP server it
+        is ~102 GB. A run log that records the REQUESTED value shows
+        "None" in both cases, which tells an operator nothing about what
+        the job actually took on a shared machine.
+        """
+        try:
+            row = self.con.execute(
+                "SELECT current_setting('memory_limit')").fetchone()
+            return str(row[0]).strip() if row else "unknown"
+        except Exception:
+            return "unknown"
+
+    @property
+    def effective_threads(self) -> int:
+        """Threads DuckDB will actually use (defaults to core count)."""
+        try:
+            row = self.con.execute(
+                "SELECT current_setting('threads')").fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
 
     def _parse_limit(self) -> int:
         """Resolve the effective memory limit to bytes."""

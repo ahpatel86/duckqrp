@@ -162,3 +162,115 @@ Two honesty notes on this table:
 `tools/scale_profile.py` is the durable output here. Every test passes
 at fixture scale, where a 15x-vs-4x difference is under a second; only a
 scaling comparison makes this class of defect visible.
+
+
+---
+
+## Would more cores and more RAM help?
+
+### What it grabs by default — now 8 GB, capped both ways
+
+The package sets an **explicit** limit rather than inheriting DuckDB's,
+because DuckDB's default is 80% of physical RAM:
+
+| host | package default | DuckDB's default would be |
+|---|--:|--:|
+| 2 GB | 1 GB | 1.6 GB |
+| 4 GB | 2 GB | 3.1 GiB |
+| 8 GB | 4 GB | 6.4 GB |
+| 16 GB | **8 GB** | 13 GB |
+| 64 GB | **8 GB** | 51 GB |
+| 128 GB | **8 GB** | ~102 GB |
+| 512 GB | **8 GB** | ~410 GB |
+
+Capped **both** ways, and both caps matter:
+
+* The **8 GB ceiling** stops a shared server being drained by a job that
+  does not need it. Above a 1 GB limit, more memory buys ~2%.
+* The **fraction on small hosts** stops a machine being handed a limit
+  it cannot honour — DuckDB accepts the setting and then fails partway
+  through, which is worse than spilling.
+
+Override anywhere:
+
+```bash
+qrp run --memory-limit 16GB ...          # CLI
+```
+
+The TUI's Memory field is prefilled with the same default and accepts
+any value. `Engine(memory_limit="16GB")` for library use.
+
+Below the limit the pipeline **spills to disk rather than failing**, so
+a lower value costs time, not correctness — 512 MB completes at a 12%
+penalty on the production study.
+
+**Historical note:** this used to leave the limit unset.
+
+| server | default grab |
+|---|--:|
+| 4 GB (this box) | 3.1 GiB |
+| 16 GB | ~13 GB |
+| 64 GB | ~51 GB |
+| 128 GB | ~102 GB |
+
+On a shared DP server that is a lot to take silently, and by the
+measurement below it is **wasted** — above 1 GB it buys about 2%.
+
+`--memory-limit 1GB` is a reasonable default for a study of this size.
+Set it explicitly rather than relying on the default, and raise it only
+if a larger extract proves it necessary.
+
+The run signature now records the **effective** limit and thread count
+rather than what was requested, so `memory_limit=None` shows as
+`3.1 GiB` and not as `None`. A run record that does not say what the job
+took is not a record of what the job took.
+
+### RAM: no — measured
+
+The benchmark box has 1 core and 4 GB. Varying the memory limit on the
+production study against the real extract:
+
+| memory_limit | best of 3 | vs 1 GB |
+|---|--:|--:|
+| 256 MB | **fails** — out of memory | — |
+| 512 MB | 5.55 s | 1.12x |
+| 1 GB | 4.94 s | 1.00x |
+| 2 GB | 4.86 s | 0.98x |
+| 3 GB | 4.83 s | 0.98x |
+| default (3.1 GiB) | 4.82 s | 0.98x |
+
+**Above 1 GB, more RAM buys about 2%.** The simple study is flatter
+still — 3.76 s at 1 GB against 3.84 s at 3 GB, which is inside run-to-run
+noise.
+
+So the working set fits comfortably in 1 GB at this scale. Giving the
+process 16 GB would not make it meaningfully faster. Below 512 MB it
+starts spilling and then fails, so 1 GB is the sweet spot rather than a
+number to raise.
+
+### Cores: cannot be measured here
+
+`nproc` reports **1**, and DuckDB's default `threads` is therefore 1.
+There is no second core on this machine to test with, so any figure for
+multi-core speed-up would be extrapolation, not measurement. It is not
+quoted.
+
+What can be said from the stage profile, without claiming a number:
+
+* DuckDB parallelises parquet scans, hash joins, aggregation and sorts
+  across threads. Nearly all of this pipeline's time is in exactly those
+  operators — `cida denominators` (a large join then a GROUPING SETS
+  aggregation) is ~60% of runtime, and `normalize` and
+  `enrollment_spans` are scans.
+* The window functions in stockpiling and washout parallelise by
+  partition, and the partition key is `patid`, so parallelism is limited
+  by patient count rather than by anything structural. At 174k patients
+  that is not a constraint.
+* Nothing in the pipeline is serialised behind a Python loop over data.
+  Config is registered once and every stage is a single SQL statement,
+  so there is no per-cohort or per-patient round trip to block scaling.
+
+That is a reason to expect the workload to parallelise reasonably, not
+evidence that it does. **Benchmark it on the target hardware before
+planning around any speed-up.** The 1-core numbers in this document are
+a floor and should be treated as one.
