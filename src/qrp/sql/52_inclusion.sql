@@ -108,7 +108,7 @@ WITH hits AS (
      AND k.criteria  = r.criteria
      AND k.cond      = r.cond
      AND k.subcond   = r.subcond
-    JOIN covar_source s
+    JOIN cohort_claims s
       ON s.patid   = p.patid
      AND s.code    = k.code
      AND s.codecat = r.codecat

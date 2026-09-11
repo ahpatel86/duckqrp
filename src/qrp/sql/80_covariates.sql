@@ -89,7 +89,7 @@ JOIN cfg_covariates d
   ON d.cohortgrp = m.cohortgrp
 JOIN cfg_covariate_codes k
   ON k.covarnum = d.covarnum
-JOIN covar_source s
+JOIN cohort_claims s
   ON s.patid   = m.patid
  AND s.code    = k.code
  AND s.codecat = d.codecat

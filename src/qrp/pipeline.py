@@ -894,6 +894,64 @@ def run(
 
     eng.script_stage("episodes + masterlist", "50_episodes.sql", **fmt)
 
+    # Narrow the claim scan to cohort members, ONCE.
+    #
+    # covar_source spans every patient in the extract. Four stages read
+    # it — covariates, inclusion, risk scores, event-anchored rules —
+    # and each join has the episode side and the claim side BOTH growing
+    # with the extract, so the work is proportional to their product:
+    # doubling the extract quadruples the cost even though the answer
+    # scales linearly. Measured at 4x on a production study, the
+    # covariates stage went 2.1s -> 33.1s (15.5x) while every other
+    # stage scaled ~3.8x.
+    #
+    # Materialised as a TABLE rather than filtered inline. An inline
+    # `WHERE EXISTS` subquery was tried first and was WORSE — it blocks
+    # predicate pushdown into the parquet reader, and 1x regressed from
+    # 2.14s to 3.31s. Paying one explicit scan and reusing the result is
+    # the shape that works.
+    #
+    # `cohort_claims` is ALWAYS defined — 60_followup.sql reads it
+    # unconditionally — but it is only MATERIALISED when the copy can
+    # repay itself. Two conditions, both necessary:
+    #
+    #   1. Something reads it heavily. A study with no covariates, no
+    #      inclusion rules and no risk scores touches it once, so the
+    #      copy is pure cost. Measured: gating on the share alone made
+    #      such a study 3.05s -> 6.02s at 1x and 11.74s -> 26.91s at 4x.
+    #   2. The cohort is a minority of the extract. Above that, the copy
+    #      is nearly the whole table and saves nothing.
+    #
+    # Otherwise it is a VIEW, which costs nothing to define.
+    heavy_readers = (len(study.covariates) + len(study.inclusions)
+                     + len(study.risk_scores))
+    materialise = False
+    if heavy_readers:
+        eng.con.execute("""
+            CREATE OR REPLACE TABLE _cohort_patids AS
+            SELECT DISTINCT patid FROM ptsmasterlist
+        """)
+        row = eng.con.execute("""
+            SELECT (SELECT count(*) FROM _cohort_patids)::DOUBLE
+                 / nullif((SELECT count(DISTINCT patid) FROM demographics), 0)
+        """).fetchone()
+        # fetchone() is Optional; treat "cannot tell" as "do not copy",
+        # since the copy is the expensive choice.
+        share = (row[0] if row and row[0] is not None else 1.0)
+        materialise = share < 0.5
+
+    if materialise:
+        eng.con.execute("""
+            CREATE OR REPLACE TABLE cohort_claims AS
+            SELECT s.* FROM covar_source s
+            SEMI JOIN _cohort_patids c ON c.patid = s.patid
+        """)
+    else:
+        eng.con.execute(
+            "CREATE OR REPLACE VIEW cohort_claims AS SELECT * FROM covar_source")
+    if heavy_readers:
+        eng.con.execute("DROP TABLE _cohort_patids")
+
     # Inclusion/exclusion criteria, evaluated against the master list —
     # which is where SAS evaluates them (ms_createpov3 is called with
     # _PtsMasterList). The master list carries episodeenddt, so

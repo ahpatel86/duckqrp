@@ -47,7 +47,7 @@ hits AS (
     JOIN cfg_risk_codes r
       ON NOT r.is_intercept
      AND r.codecat IN ('DX', 'PX', 'RX')
-    JOIN covar_source s
+    JOIN cohort_claims s
       ON s.patid   = m.patid
      AND s.code    = r.code
      AND s.codecat = CASE WHEN r.codecat = 'RX' THEN 'RX' ELSE 'DX' END
