@@ -55,7 +55,7 @@ than SAS's — the dangerous direction.
 
 On **1 CPU core / 3 GB RAM**.
 
-Measured on a **real SCDM extract** — 174,064 patients, 35.2M rows,
+Measured on a **fake SCDM extract** — 174,064 patients, 35.2M rows,
 175 MB of parquet — and on a 4× replica (~140M rows). Best of three,
 single core.
 
