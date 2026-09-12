@@ -136,9 +136,26 @@ SELECT
     CASE WHEN lv.has_sex      THEN s.sex         END   AS sex,
     CASE WHEN lv.has_race     THEN s.race        END   AS race,
     CASE WHEN lv.has_hispanic THEN s.hispanic    END   AS hispanic,
-    CASE WHEN lv.has_year     THEN s.index_year  END   AS index_year,
-    count(DISTINCT s.patid)                            AS eligible_members,
-    sum(s.memberdays)                                  AS memberdays
+    -- SAS column names (ms_cidadenom.sas:1386). `year`, not
+    -- `index_year`; `DenNumPts`/`DenNumMemDays`, not
+    -- `eligible_members`/`memberdays`. These are the metrics a
+    -- downstream merge references by name, so they are a contract, not
+    -- a description.
+    CASE WHEN lv.has_year     THEN s.index_year  END   AS "year",
+    -- Geography and finer time strata appear in SAS's shell and are
+    -- stratified on only when a level asks for them. This package does
+    -- not offer them as CIDA strata, so they are emitted NULL — the
+    -- same convention already used for a level that does not stratify
+    -- on agegroup or sex, and it keeps the column set matching.
+    NULL::VARCHAR                                      AS zip_uncertain,
+    NULL::VARCHAR                                      AS zip3,
+    NULL::VARCHAR                                      AS state,
+    NULL::VARCHAR                                      AS hhs_reg,
+    NULL::VARCHAR                                      AS cb_reg,
+    NULL::SMALLINT                                     AS "month",
+    NULL::SMALLINT                                     AS quarter,
+    count(DISTINCT s.patid)                            AS dennumpts,
+    sum(s.memberdays)                                  AS dennummemdays
 FROM _denom_strat s
 CROSS JOIN cfg_strata lv
 GROUP BY

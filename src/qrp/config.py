@@ -459,7 +459,7 @@ class Covariate:
     # inclusion rules (ms_cidacov.sas:47-54). Blank means INDEXDT.
     #   INDEXDT       the index date
     #   EPISODEENDDT  the episode end — a forward-looking window
-    #   INDEXDT_EXP   the exposed index date (comparator designs)
+    #   INDEXDT_EXP   indexdt_exp — when exposure began in a pregnancy exposure window (Type 4)
     covfromanchor: str = "INDEXDT"
     covtoanchor: str = "INDEXDT"
     dateonly: bool = False
@@ -526,7 +526,7 @@ class InclusionRule:
     # (ms_createpov3.sas:139-175). Blank means INDEXDT.
     #   INDEXDT       the index date
     #   EPISODEENDDT  the episode end — a forward-looking window
-    #   INDEXDT_EXP   the exposed index date (comparator designs)
+    #   INDEXDT_EXP   indexdt_exp — when exposure began in a pregnancy exposure window (Type 4)
     condfromanchor: str = "INDEXDT"
     condtoanchor: str = "INDEXDT"
     codedays: int = 1
@@ -847,9 +847,37 @@ class StudyConfig:
     def any_covariates(self) -> bool:
         return bool(self.covariates)
 
+    # USERSTRATA tableids this package produces. A study can request
+    # others; SAS dispatches on this value (ms_cidanum.sas:2820-2831).
+    IMPLEMENTED_TABLE_IDS = frozenset({"t2cida", "t2followuptime"})
+
     def cida_levels(self) -> tuple[StratumLevel, ...]:
         """USERSTRATA rows for the t2cida output table."""
         return tuple(s for s in self.strata if s.table_id == "t2cida")
+
+    def followuptime_levels(self) -> tuple[StratumLevel, ...]:
+        """USERSTRATA rows for the t2followuptime output table."""
+        return tuple(s for s in self.strata
+                     if s.table_id == "t2followuptime")
+
+    @property
+    def any_followuptime(self) -> bool:
+        return bool(self.followuptime_levels())
+
+    @property
+    def unsupported_table_ids(self) -> tuple[str, ...]:
+        """USERSTRATA tableids requested but not produced.
+
+        Silently dropping one means the study asks for an output and
+        receives nothing, with no error and no empty file to notice —
+        the same failure shape as ignoring an inclusion rule. The one
+        that prompted this was `t2followuptime`
+        (`msoc.&RUNID._followuptime_cida`).
+        """
+        return tuple(sorted(
+            {s.table_id for s in self.strata
+             if s.table_id and s.table_id not in self.IMPLEMENTED_TABLE_IDS}
+        ))
 
     @property
     def any_ioc(self) -> bool:
@@ -907,13 +935,18 @@ class StudyConfig:
     def unsupported_inclusions(self) -> tuple[str, ...]:
         """Inclusion features present in the study but not implemented."""
         out: list[str] = []
-        # INDEXDT_EXP anchors on the exposed index date, which only
-        # exists in comparator designs. Not modelled here.
+        # INDEXDT and EPISODEENDDT are both applied.
+        #
+        # INDEXDT_EXP anchors on `indexdt_exp`: the date exposure
+        # actually BEGAN inside a pregnancy's exposure window, clamped
+        # to the start of that window (ms_createmicohorts.sas:764). It
+        # is distinct from `indexdt`, which for a pregnancy cohort is
+        # usually the pregnancy start date. Every use in the macros is
+        # gated on `type = 4`, so it is not reachable from Type 2 — but
+        # a study file can still carry the value, so it warns rather
+        # than being silently treated as an index-date anchor.
         anchors = {r.condfromanchor for r in self.inclusions} | {
             r.condtoanchor for r in self.inclusions}
-        # INDEXDT and EPISODEENDDT are both applied. INDEXDT_EXP
-        # anchors on the exposed index date, which only exists in
-        # comparator designs and is not modelled.
         unknown = anchors - {"INDEXDT", "EPISODEENDDT"}
         if unknown:
             out.append(
@@ -988,6 +1021,25 @@ def _bool_yn(v: Any, default: bool = False) -> bool:
     return str(v).strip().upper() in {"Y", "YES", "TRUE", "1"}
 
 
+def _warn_unsupported_tables(study: StudyConfig) -> None:
+    """A requested output table this package does not produce is ABSENT,
+    not empty — a downstream step expecting it finds nothing at all.
+
+    Lives here rather than in load_study() so BOTH entry points warn:
+    studies built from a dict were previously silent.
+    """
+    import warnings
+
+    if study.unsupported_table_ids:
+        warnings.warn(
+            "userstrata requests output table(s) this implementation does "
+            "not produce: " + ", ".join(study.unsupported_table_ids)
+            + " — those tables will be ABSENT from the output, not empty, "
+              "so a downstream step expecting them will find nothing",
+            stacklevel=3,
+        )
+
+
 def load_study(path: str | Path, lookup: str | Path | None = None) -> StudyConfig:
     """Load and validate a study definition from a QRP input file.
 
@@ -1026,9 +1078,9 @@ def load_study(path: str | Path, lookup: str | Path | None = None) -> StudyConfi
     # Inclusion rules are applied, but not every variant of them. Warn
     # about the ones parsed and ignored, since those make the cohort
     # broader than SAS's — the dangerous direction.
-    if study.unsupported_inclusions:
-        import warnings
+    import warnings
 
+    if study.unsupported_inclusions:
         warnings.warn(
             "inclusioncodes uses features this implementation does not "
             "apply: " + ", ".join(study.unsupported_inclusions)
@@ -1381,6 +1433,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         cohorts=tuple(cohorts),
     )
     study.validate()
+    _warn_unsupported_tables(study)
     return study
 
 

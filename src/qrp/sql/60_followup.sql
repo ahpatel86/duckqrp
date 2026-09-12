@@ -234,6 +234,43 @@ DROP TABLE _event_candidates;
 CREATE OR REPLACE TABLE cohort_final AS
 SELECT
     m.*,
+    -- SAS column names, added alongside this package's own. These are
+    -- the names downstream SAS steps read off mstr
+    -- (ms_finalizeptsmasterlist.sas), and mstr is the primary
+    -- patient-level deliverable — a step selecting FEventDt or
+    -- followuptime by name would have found nothing.
+    --
+    -- Added rather than renamed: the internal names are used across
+    -- every other stage in this package, and a rename would be churn
+    -- for no gain. The contract is that the SAS names EXIST and are
+    -- correct, not that they are the only ones.
+    m.cohortgrp                       AS "group",
+    fe.eventdt                        AS feventdt,
+    (fe.eventdt IS NOT NULL)::INTEGER AS "event",
+    CASE WHEN fe.eventdt IS NOT NULL THEN 'Y' ELSE 'N' END AS event_flag,
+    -- episodelength = Min(EpisodeEndDt, Enr_End) - IndexDt + 1
+    -- (ms_finalizeptsmasterlist.sas:305)
+    date_diff('day', m.indexdt, least(m.episodeenddt, m.enr_end)) + 1
+                                      AS episodelength,
+    -- EpisodeEndDt_Censor for the CENSOR table ignores the event and
+    -- uses the query/DP end (line 308). The followuptime variant, which
+    -- does count the event, is `followuptime` below.
+    least(m.enr_end,
+          coalesce(m.deathdt, DATE '9999-12-31'),
+          DATE '{end_date}',
+          DATE '{censor_date}')       AS episodeenddt_censor,
+    date_diff('day', m.indexdt,
+              least(m.enr_end,
+                    coalesce(m.deathdt, DATE '9999-12-31'),
+                    DATE '{end_date}',
+                    DATE '{censor_date}')) + 1  AS timetocensor,
+    -- followuptime = Max(0, Min(EpisodeEndDt, Enr_End, FEventDt)
+    --                       - IndexDt - BLACKOUTPER - ATRISKSTART + 1)
+    greatest(0,
+        date_diff('day', m.indexdt,
+                  least(m.episodeenddt, m.enr_end,
+                        coalesce(fe.eventdt, DATE '9999-12-31')))
+        - c.blackout_per - c.at_risk_start + 1)  AS followuptime,
     fe.eventdt,
     (fe.eventdt IS NOT NULL)::INTEGER AS has_event,
     -- SAS reports BOTH sum(NumEvents)=All_Events and

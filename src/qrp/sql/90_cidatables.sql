@@ -101,7 +101,7 @@ SELECT
     coalesce(n.sex, d.sex)                 AS sex,
     coalesce(n.race, d.race)               AS race,
     coalesce(n.hispanic, d.hispanic)       AS hispanic,
-    coalesce(n.index_year, d.index_year)   AS index_year,
+    coalesce(n.index_year, d."year")       AS index_year,
     -- numerator metrics; zero where the stratum has no episodes
     coalesce(n.npts, 0)              AS npts,
     coalesce(n.episodes, 0)          AS episodes,
@@ -113,9 +113,12 @@ SELECT
     coalesce(n.eps_wevents, 0)       AS eps_wevents,
     coalesce(n.followuptime, 0)      AS followuptime,
     coalesce(n.timetocensor, 0)      AS timetocensor,
-    -- denominator metrics
-    coalesce(d.eligible_members, 0)  AS eligible_members,
-    coalesce(d.memberdays, 0)        AS memberdays
+    -- Denominator metrics. SAS calls these DenNumPts / DenNumMemDays
+    -- in BOTH t2_cida and denomcounts (ms_cidatables.sas uses them 9
+    -- times each). They were `eligible_members`/`memberdays` here —
+    -- descriptive, but not what a downstream merge references.
+    coalesce(d.dennumpts, 0)         AS dennumpts,
+    coalesce(d.dennummemdays, 0)     AS dennummemdays
 FROM _t2_num n
 FULL JOIN denomcounts d
   ON  d.level      = n.level
@@ -124,7 +127,15 @@ FULL JOIN denomcounts d
  AND  d.sex         IS NOT DISTINCT FROM n.sex
  AND  d.race        IS NOT DISTINCT FROM n.race
  AND  d.hispanic    IS NOT DISTINCT FROM n.hispanic
- AND  d.index_year  IS NOT DISTINCT FROM n.index_year
+ AND  d."year"      IS NOT DISTINCT FROM n.index_year
 ORDER BY level, "group", agegroupnum, sex, race, hispanic, index_year;
+
+-- dplocal.<runid>_numcounts — the numerator detail behind t2_cida.
+-- SAS writes it alongside the msoc table (ms_cidatables.sas:418), and
+-- it was being computed here and then thrown away: a DP had the CIDA
+-- numerators only in their merged form, with no way to check them
+-- against the denominators separately.
+CREATE OR REPLACE TABLE numcounts AS
+SELECT * FROM _t2_num;
 
 DROP TABLE _t2_num;

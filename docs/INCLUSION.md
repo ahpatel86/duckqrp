@@ -188,14 +188,14 @@ independently** (`ms_createpov3.sas:139-175`), giving six combinations:
 |---|---|
 | blank / `INDEXDT` | the index date |
 | `EPISODEENDDT` | the episode end — a **forward-looking** window |
-| `INDEXDT_EXP` | the exposed index date (comparator designs) |
+| `INDEXDT_EXP` | `indexdt_exp` — when exposure began inside a pregnancy exposure window (Type 4) |
 
 `INDEXDT` and `EPISODEENDDT` are both applied, now that the stage runs
 after the master list. Verified that the two produce different windows
 on the same codes — if the anchor were ignored they would agree.
 
-`INDEXDT_EXP` anchors on the exposed index date, which only exists in
-comparator designs, and **warns at load** rather than silently falling
+`INDEXDT_EXP` anchors on the date exposure began within a pregnancy exposure
+window (Type 4), and **warns at load** rather than silently falling
 back to the index date — a silent fallback makes the window wrong
 rather than missing.
 

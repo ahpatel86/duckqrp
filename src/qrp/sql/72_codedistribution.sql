@@ -24,13 +24,34 @@
 
 -- Stable numeric IDs for the index-defining codes, assigned in code
 -- order so a rerun on the same study produces the same map.
+-- SAS keeps: group distindextype stockgroup codecat codetype enctype
+-- pdx code distindexid (ms_codedistribution.sas:433-435). This emitted
+-- only four of the nine. The missing ones are not decoration —
+-- stockgroup and codecat identify WHICH code list a code came from, so
+-- a code appearing in two of them was indistinguishable.
 CREATE OR REPLACE TABLE distindexmap AS
 SELECT
-    cohortgrp                                   AS "group",
+    k.cohortgrp                                 AS "group",
     'EXP'                                       AS distindextype,
-    code,
-    dense_rank() OVER (PARTITION BY cohortgrp ORDER BY code) AS distindexid
-FROM (SELECT DISTINCT cohortgrp, code FROM cfg_codes WHERE role = 'DEF');
+    k.stockgroup,
+    k.codecat,
+    -- codetype/enctype/pdx describe the care setting a code was
+    -- restricted to. cfg_care_setting holds them per code; '**'/'*'
+    -- mean unrestricted, which is what an absent restriction expands to
+    -- (see ms_caresettingprincipal). codetype is not modelled
+    -- separately here — the CDM column is carried on the claim, not on
+    -- the code definition — so it is emitted NULL rather than guessed.
+    NULL::VARCHAR                               AS codetype,
+    cs.enctype,
+    cs.pdx,
+    k.code,
+    dense_rank() OVER (PARTITION BY k.cohortgrp ORDER BY k.code)
+                                                AS distindexid
+FROM (SELECT DISTINCT cohortgrp, code, codecat, stockgroup
+      FROM cfg_codes WHERE role = 'DEF') k
+LEFT JOIN (SELECT DISTINCT cohortgrp, code, enctype, pdx
+           FROM cfg_care_setting) cs
+       ON cs.cohortgrp = k.cohortgrp AND cs.code = k.code;
 
 -- Which codes actually defined each index date, and the canonical list.
 CREATE OR REPLACE TABLE distindex AS

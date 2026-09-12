@@ -274,3 +274,43 @@ That is a reason to expect the workload to parallelise reasonably, not
 evidence that it does. **Benchmark it on the target hardware before
 planning around any speed-up.** The 1-core numbers in this document are
 a floor and should be treated as one.
+
+
+---
+
+## Final benchmark (all output corrections applied)
+
+Real SCDM: 174,064 patients, 35.2M rows, 175 MB parquet. Best of two,
+single core, 1 GB effective memory limit.
+
+| study | dataset | patients | rows | best | rows/s |
+|---|---|--:|--:|--:|--:|
+| production | 1x | 174,064 | 35.2M | **4.60 s** | 7.6M |
+| production | 4x | 696,256 | 140.6M | **15.75 s** | 8.9M |
+| simple | 1x | 174,064 | 35.2M | 3.51 s | 10.0M |
+| simple | 4x | 696,256 | 140.6M | 13.32 s | 10.6M |
+
+Scaling: production 3.42x and simple 3.79x for 4x the data. Both
+sub-linear, because fixed per-run costs amortise.
+
+The production study is a real input file — 14 cohorts, 1,124 cohort
+codes, 4,385 covariate rows across 49 covariates, 250 inclusion rows,
+and now the full output set including `baseline`, `numcounts` and
+`followuptime_cida`.
+
+### One stage sits on the threshold
+
+`cida denominators` measured **4.75x, 4.89x and 5.43x** across three
+runs for 4x the data, against a flag threshold of 5.0. The 5.43 was
+taken while the 4x dataset was still being written, so the machine was
+contended; the settled figures are 4.75-4.89.
+
+Earlier measurements of the same stage gave 4.06-4.45. The stages added
+since (`baseline`, `numcounts`, `followuptime`) plausibly account for
+the shift.
+
+**Reported as borderline rather than clean.** It is roughly 65% of total
+runtime, so a constant-factor improvement there is worth more than a
+scaling fix anywhere else, and the flag firing inconsistently across
+runs is itself the finding — a single measurement would have called it
+either linear or superlinear depending on when it was taken.

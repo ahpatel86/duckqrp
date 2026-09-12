@@ -177,11 +177,50 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
     """)
 
     size = sum(f.stat().st_size for f in out.rglob("*.parquet"))
+    # procedure and lab_result. Both are mainstream in real studies —
+    # PX is 150 of 1,124 cohort codes in the production input file seen,
+    # and the lab schema was verified against a real 1.4M-row extract —
+    # so a fixture without them silently skips those code paths, and the
+    # table-resolution tests fall back to column fingerprinting.
+    (out / "procedure").mkdir(exist_ok=True)
+    con.execute(f"""COPY (
+      SELECT d.patid,
+             DATE '2010-01-01' + CAST(random()*2000 AS INTEGER) AS adate,
+             'P' || lpad((CAST(random()*19 AS INTEGER)+1)::VARCHAR, 5, '0') AS px,
+             'C4' AS px_codetype,
+             ['IP','AV','ED'][1 + CAST(random()*2 AS INTEGER)] AS enctype,
+             CAST(d.patid*13 % 99999 AS BIGINT) AS encounterid,
+             CAST(d.patid*7 % 9999 AS BIGINT) AS providerid,
+             NULL AS origpx
+      FROM read_parquet('{out / "demographic"}/**/*.parquet') d, range(1,4)
+    ) TO '{out / "procedure" / "data.parquet"}' (FORMAT PARQUET)""")
+
+    # Real SCDM lab: NO lab_code column — LAB01 matches a seven-attribute
+    # combination. result_dt/order_dt are NULL, as in the real extract,
+    # so the LABDATETYPE fall-through is exercised.
+    (out / "lab_result").mkdir(exist_ok=True)
+    con.execute(f"""COPY (
+      SELECT d.patid,
+             DATE '2010-01-01' + CAST(random()*2000 AS INTEGER) AS lab_dt,
+             NULL::DOUBLE AS result_dt, NULL::DOUBLE AS order_dt,
+             round(random()*200, 2) AS ms_result_n, '' AS ms_result_c,
+             ['N','U','C'][1 + CAST(random()*2 AS INTEGER)] AS result_type,
+             ['2160-0','3094-0','2823-3'][1 + CAST(random()*2 AS INTEGER)] AS loinc,
+             ['PX1','PX2','PX3'][1 + CAST(random()*2 AS INTEGER)] AS px,
+             ['CREATININE','SODIUM','GLUCOSE'][1 + CAST(random()*2 AS INTEGER)] AS ms_test_name,
+             '' AS ms_test_sub_category, 'SR_PLS' AS specimen_source,
+             ['MG/DL','MMOL/L'][1 + CAST(random()*1 AS INTEGER)] AS ms_result_unit,
+             ['X','R','F'][1 + CAST(random()*2 AS INTEGER)] AS fast_ind,
+             'O' AS pt_loc
+      FROM read_parquet('{out / "demographic"}/**/*.parquet') d, range(1,4)
+    ) TO '{out / "lab_result" / "data.parquet"}' (FORMAT PARQUET)""")
+
     counts = {
         t: con.execute(
             f"SELECT count(*) FROM read_parquet('{out / t}/**/*.parquet')"
         ).fetchone()[0]
-        for t in ("demographic", "enrollment", "dispensing", "diagnosis", "death")
+        for t in ("demographic", "enrollment", "dispensing", "diagnosis",
+                  "death", "procedure", "lab_result")
     }
     print(f"generated {n_patients:,} patients -> {out}  ({size / 1e6:.1f} MB)")
     for t, n in counts.items():

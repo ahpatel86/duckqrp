@@ -60,7 +60,8 @@ from .events import EmptyResult, MemoryStatus
 from .runlog import RunLog
 from .runner import RunHandle
 from .scdm import format_report, probe
-from .sysinfo import HostInfo, human, suggest_memory_limit
+from .sysinfo import (HostInfo, cpu_count, human,
+                       suggest_memory_limit)
 
 CSS = """
 Screen { layout: vertical; }
@@ -324,8 +325,13 @@ class QRPApp(App):
         if logdir:
             try:
                 self._runlog = RunLog(logdir, run_id=self.study.run_id)
+                # Resolve what will ACTUALLY apply. The Memory field is
+                # prefilled, but a user who clears it still gets the
+                # package default (8GB, less on a small host), and a log
+                # reading "auto" cannot explain what a job consumed.
                 self._runlog.header(self.study, indata, {
-                    "threads": threads, "memory_limit": mem,
+                    "threads": threads or f"{cpu_count()} (auto)",
+                    "memory_limit": mem or f"{suggest_memory_limit()} (default)",
                     "temp_dir": tempdir, "database": database,
                     "output_dir": self._field("output") or None,
                 })

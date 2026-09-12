@@ -196,13 +196,6 @@ def main(argv: list[str] | None = None) -> int:
         study = load_study(a.study)
         if runlog is not None:
             runlog.run_id = study.run_id
-            runlog.header(study, a.indata, {
-                "threads": a.threads,
-                "memory_limit": a.memory_limit,
-                "temp_dir": getattr(a, "temp_dir", None),
-                "database": a.db,
-                "output_dir": a.out,
-            })
 
         eng = Engine(
             database=a.db, threads=a.threads,
@@ -214,6 +207,20 @@ def main(argv: list[str] | None = None) -> int:
                 runlog.sink() if runlog else None,
             ),
         )
+
+        # Header AFTER the engine exists, so it records the EFFECTIVE
+        # settings rather than what was asked for. `memory_limit=None`
+        # printed as "auto", which told an operator nothing — the
+        # package default is 8GB (less on a small host) and a log that
+        # says "auto" cannot be used to explain what a job consumed.
+        if runlog is not None:
+            runlog.header(study, a.indata, {
+                "threads": eng.effective_threads,
+                "memory_limit": eng.effective_memory_limit,
+                "temp_dir": getattr(a, "temp_dir", None) or "auto",
+                "database": a.db,
+                "output_dir": a.out,
+            })
         run(study, a.indata, engine=eng, output_dir=a.out,
             csv=a.csv, layout=a.layout, names=a.names,
             table_map=_parse_table_map(a.table_map),

@@ -42,7 +42,35 @@ WITH steps AS (
     FROM cohort_final GROUP BY 1
 )
 SELECT
-    cohortgrp, step_no, step, records, patients,
+    -- SAS column names and order: group, level, descr, claim_level,
+    -- remaining, excluded (ms_attrition_cidacompute.sas:104-115). This
+    -- is an msoc output, so those names are a contract — a reader
+    -- matching on `level` should not have to know it was called
+    -- `step_no` here.
+    --
+    -- `claim_level` is "Member" or "Episode" and says which unit
+    -- remaining/excluded are counted in. SAS carries ONE pair plus that
+    -- label; this keeps both units as extra columns after the contract
+    -- ones, since the information is already computed and losing it to
+    -- match a shape would be a worse trade than carrying it.
+    cohortgrp                       AS "group",
+    step_no                         AS level,
+    step                            AS descr,
+    -- Steps 1-3 narrow CLAIMS; 4 onward narrow EPISODES. SAS declares
+    -- the unit per step and computes the counts inside the macro, so it
+    -- never subtracts across the boundary.
+    CASE WHEN step_no <= 3 THEN 'Claim' ELSE 'Episode' END AS claim_level,
+    CASE WHEN step_no <= 3 THEN records ELSE records END   AS remaining,
+    -- NULL at the unit change, not a number. Differencing a claim count
+    -- against an episode count produces a plausible-looking value that
+    -- means nothing — the first version of this reported 66,921
+    -- "excluded" against 53,107 remaining. A missing value is honest;
+    -- a wrong one is not.
+    CASE WHEN step_no = 4 THEN NULL
+         ELSE lag(records) OVER w - records END            AS excluded,
+    -- Beyond the contract: both units side by side.
+    records,
+    patients,
     lag(records)  OVER w - records  AS records_dropped,
     lag(patients) OVER w - patients AS patients_dropped
 FROM steps
@@ -76,14 +104,80 @@ GROUP BY GROUPING SETS (
 ORDER BY cohortgrp, agegroup, sex, index_year;
 
 -- Exit-reason distribution: why follow-up ended.
+-- msoc.<runid>_censor_cida
+--
+-- Shape follows ms_createcensortable.sas:246-250:
+--     group level <censorstrat> episodes <msocflaglist>
+-- with censorstrat carrying `censdays_value_cat` and msocflaglist being
+-- cens_elig / cens_dth / cens_qryend / cens_dpend.
+--
+-- This used to be a per-exit_reason summary with person_days and
+-- percentages — readable, but not the dataset the Operations Center
+-- expects. It is an msoc output, so the shape is part of the contract,
+-- not a presentation choice.
+--
+-- The censor date here IGNORES the event: min(Enr_End, DeathDt,
+-- QueryEnd, DPEnd) (ms_finalizeptsmasterlist.sas:308). That is the one
+-- substantive difference from followuptime_cida, which does count the
+-- event — see 94_followuptime.sql.
 CREATE OR REPLACE TABLE censoring AS
+WITH censored AS (
+    SELECT
+        c.cohortgrp,
+        c.agegroup,
+        c.sex,
+        c.deathdt,
+        c.enr_end,
+        least(c.enr_end,
+              coalesce(c.deathdt, DATE '9999-12-31'),
+              DATE '{end_date}',
+              DATE '{censor_date}')                   AS censor_dt,
+        -- timetocensor = censor_dt - IndexDt + 1 (line 318)
+        date_diff('day', c.indexdt,
+                  least(c.enr_end,
+                        coalesce(c.deathdt, DATE '9999-12-31'),
+                        DATE '{end_date}',
+                        DATE '{censor_date}')) + 1    AS timetocensor
+    FROM cohort_final c
+),
+flagged AS (
+    SELECT
+        *,
+        -- Censored by disenrollment, unless that coincides with death,
+        -- which is the enrend_death='C' reset (lines 147-151).
+        CASE WHEN censor_dt = enr_end
+              AND NOT (deathdt IS NOT NULL AND censor_dt = deathdt)
+             THEN 1 ELSE 0 END                        AS cens_elig,
+        CASE WHEN deathdt IS NOT NULL AND censor_dt = deathdt
+             THEN 1 ELSE 0 END                        AS cens_dth,
+        CASE WHEN censor_dt = DATE '{end_date}'
+             THEN 1 ELSE 0 END                        AS cens_qryend,
+        CASE WHEN censor_dt = DATE '{censor_date}'
+              AND DATE '{censor_date}' <> DATE '{end_date}'
+             THEN 1 ELSE 0 END                        AS cens_dpend
+    FROM censored
+)
 SELECT
-    cohortgrp,
-    exit_reason,
-    count(*)          AS episodes,
-    sum(person_days)  AS person_days,
-    round(100.0 * count(*)
-          / sum(count(*)) OVER (PARTITION BY cohortgrp), 1) AS pct
-FROM cohort_final
-GROUP BY 1, 2
-ORDER BY 1, 3 DESC;
+    f.cohortgrp              AS "group",
+    lv.level_id              AS level,
+    CAST(f.timetocensor AS VARCHAR) AS censdays_value_cat,
+    CASE WHEN lv.has_agegroup THEN f.agegroup END AS agegroup,
+    CASE WHEN lv.has_sex      THEN f.sex      END AS sex,
+    count(*)                 AS episodes,
+    sum(f.cens_elig)         AS cens_elig,
+    sum(f.cens_dth)          AS cens_dth,
+    sum(f.cens_qryend)       AS cens_qryend,
+    sum(f.cens_dpend)        AS cens_dpend
+FROM flagged f
+-- USERSTRATA is optional; SAS still produces the table, unstratified,
+-- at level 1 (`_censorlevels` always has a row). Without this fallback
+-- the CROSS JOIN yields NOTHING for a study that defines no strata —
+-- an msoc output silently absent rather than unstratified.
+CROSS JOIN (
+    SELECT level_id, has_agegroup, has_sex FROM cfg_strata
+    UNION ALL
+    SELECT '1', FALSE, FALSE
+    WHERE NOT EXISTS (SELECT 1 FROM cfg_strata)
+) lv
+GROUP BY ALL
+ORDER BY 1, 2, 3;

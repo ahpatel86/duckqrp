@@ -25,19 +25,39 @@ from .engine import Engine
 # Stage name -> tables to dump. Mirrors tests/parity/manifest.STAGES so
 # the existing comparison manifest keeps working.
 STAGE_TABLES: dict[str, tuple[str, ...]] = {
+    # Intermediate stages: where a divergence is easiest to localise.
     "STOCKPILING": ("stockpiled",),
     "POV1": ("index_candidates", "pov1"),
     "PTSMASTERLIST": ("ptsmasterlist",),
     "POV56": ("cohort_final",),
+    # Deliverables. These were missing, and they are the tables a
+    # sweep against the SAS macros found to be wrong in EVERY case —
+    # wrong shape, wrong column names, missing columns, and in one case
+    # (mstr) the wrong table entirely. Comparing only the intermediates
+    # would have caught none of it.
     "ATTRITION": ("attrition",),
-    "DENOMCOUNTS": ("denominators", "censoring"),
+    "CENSOR": ("censoring",),
+    "CIDA": ("t2_cida", "numcounts", "denomcounts"),
+    "CODEDIST": ("distindex", "distindexmap"),
+    "FOLLOWUPTIME": ("followuptime",),
 }
 
 # Columns excluded from parity comparison: derived diagnostics that have
 # no SAS counterpart. Declared here rather than discovered at diff time.
 IGNORE_COLUMNS: dict[str, tuple[str, ...]] = {
     "stockpiled": ("orig_adate",),
-    "cohort_final": ("exit_reason",),
+    # cohort_final carries BOTH this package's own column names and the
+    # SAS ones (group/FEventDt/Event/followuptime/...). The internal
+    # names have no SAS counterpart, so comparing them would report a
+    # difference for every row of every run.
+    "cohort_final": ("exit_reason", "cohortgrp", "eventdt", "has_event",
+                     "episode_days", "person_days", "episode",
+                     "episodestartdt", "episode_rxsup", "dataavail_dt",
+                     "atriskindexdt"),
+    # attrition leads with the SAS contract columns and carries this
+    # package's extra counts after them; only the extras are excluded.
+    "attrition": ("records", "patients", "records_dropped",
+                  "patients_dropped"),
 }
 
 

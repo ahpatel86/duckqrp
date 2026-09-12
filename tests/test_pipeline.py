@@ -81,7 +81,7 @@ def study():
         ("index_candidates", "cohortgrp, patid, adate"),
         ("ptsmasterlist", "cohortgrp, patid, indexdt"),
         ("cohort_final", "cohortgrp, patid, indexdt"),
-        ("attrition", "cohortgrp, step_no"),
+        ("attrition", '"group", level'),
     ],
 )
 def test_output_is_thread_count_invariant(study, table, order):
@@ -165,7 +165,7 @@ def test_dose_restriction_actually_excludes(study, baseline):
 def test_attrition_is_monotonic(baseline):
     """Every attrition step must be a subset of the one before it."""
     bad = baseline.con.execute("""
-    SELECT cohortgrp, step_no FROM attrition
+    SELECT "group", level FROM attrition
     WHERE records_dropped < 0 OR patients_dropped < 0
     """).fetchall()
     assert bad == [], f"attrition increased at {bad}"
@@ -588,13 +588,16 @@ def test_show_lists_and_prints_tables(study, tmp_path):
     big = show(tmp_path, "cohort_final", limit=5)
     assert "showing first 5" in big
 
-    filtered = show(tmp_path, "attrition", where="step_no = 1")
+    filtered = show(tmp_path, "attrition", where="level = 1")
     assert "Exposure dispensings" in filtered
 
     csvs = to_csv(tmp_path, tmp_path / "csv")
     assert any(p.name == "attrition.csv" for p in csvs)
+    # attrition leads with the SAS column names (group, level, descr,
+    # claim_level, remaining, excluded) — it is an msoc output and those
+    # names are a contract.
     assert (tmp_path / "csv" / "attrition.csv").read_text().startswith(
-        "cohortgrp"
+        "group,level,descr,claim_level,remaining,excluded"
     )
 
 
@@ -637,7 +640,7 @@ def test_csv_flag_writes_excel_copies(study, tmp_path):
     csv_dir = tmp_path / "csv"
     assert (csv_dir / "attrition.csv").exists()
     header = (csv_dir / "attrition.csv").read_text().splitlines()[0]
-    assert "cohortgrp" in header and "records" in header
+    assert "group" in header and "records" in header
 
 
 # ---------------------------------------------------------------------
@@ -2049,7 +2052,7 @@ def test_denominator_window_matches_sas():
         run(s, DATA, engine=eng, verbose=False)
         # no eligible window may start before enr_start + enr_days
         bad = eng.con.execute("""
-            SELECT count(*) FROM denomcounts WHERE memberdays <= 0
+            SELECT count(*) FROM denomcounts WHERE dennummemdays <= 0
         """).fetchone()[0]
         assert bad == 0, "SAS keeps only positive member days"
         assert eng.count("denomcounts") > 0
@@ -2071,7 +2074,7 @@ def test_denominator_levels_reconcile():
     try:
         run(s, DATA, engine=eng, verbose=False)
         rows = eng.con.execute("""
-            SELECT level, sum(memberdays), sum(episodes)
+            SELECT level, sum(dennummemdays), sum(episodes)
             FROM t2_cida GROUP BY 1 ORDER BY 1
         """).fetchall()
         assert len(rows) == 3
@@ -2102,13 +2105,13 @@ def test_cida_merge_keeps_strata_with_no_episodes():
         # every row must carry a denominator, even where episodes is 0
         orphans = eng.con.execute("""
             SELECT count(*) FROM t2_cida
-            WHERE memberdays = 0 AND eligible_members = 0 AND episodes > 0
+            WHERE dennummemdays = 0 AND dennumpts = 0 AND episodes > 0
         """).fetchone()[0]
         assert orphans == 0, "episodes with no denominator row"
         # and no row may have negative or NULL metrics after the merge
         nulls = eng.con.execute("""
             SELECT count(*) FROM t2_cida
-            WHERE npts IS NULL OR memberdays IS NULL OR episodes IS NULL
+            WHERE npts IS NULL OR dennummemdays IS NULL OR episodes IS NULL
         """).fetchone()[0]
         assert nulls == 0, "merge left NULLs; coalesce is missing"
     finally:
@@ -2126,10 +2129,10 @@ def test_denominator_exceeds_exposed_person_time():
     try:
         run(s, DATA, engine=eng, verbose=False)
         for grp, md, fup in eng.con.execute(
-            'SELECT "group", memberdays, followuptime FROM t2_cida '
+            'SELECT "group", dennummemdays, followuptime FROM t2_cida '
             "WHERE level = '1'"
         ).fetchall():
-            assert md > fup, f"{grp}: memberdays {md} <= followuptime {fup}"
+            assert md > fup, f"{grp}: dennummemdays {md} <= followuptime {fup}"
     finally:
         eng.close()
 
@@ -4070,5 +4073,814 @@ def test_memory_limit_default_is_bounded_and_overridable():
         # DuckDB's own default here would be 80% of RAM; ours is lower
         assert eng.effective_memory_limit != "3.1 GiB" or \
                DEFAULT_MEMORY_CEILING_GB >= 4
+    finally:
+        eng.close()
+
+
+def test_msoc_outputs_use_their_sas_names():
+    """msoc datasets go to the Operations Center, where tooling matches
+    on dataset NAME. A plausible-looking rename is a breakage, not a
+    cosmetic difference.
+
+    `censoring` was one: SAS calls it `censor_cida`
+    (ms_createcensortable.sas:22, 200).
+    """
+    import json
+    import tempfile
+
+    from qrp import run
+
+    out = Path(tempfile.mkdtemp())
+    study = _cida_study([{"tableid": "t2cida", "levelid": "1",
+                          "levelvars": ""}])
+    run(study, DATA, output_dir=str(out), names="sas", verbose=False)
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    msoc = {t: v for t, v in manifest["tables"].items()
+            if v["library"] == "msoc"}
+    assert msoc, "no msoc outputs at all"
+
+    # every msoc output either carries its SAS name or says why not
+    for name, info in msoc.items():
+        assert info["sas_contract"] or "note" in info, (
+            f"{name} is neither SAS-named nor documented as a difference"
+        )
+
+    files = {v["file"] for v in msoc.values()}
+    assert any(f.endswith("_censor_cida") for f in files), files
+    assert not any(f.endswith("_censoring") for f in files), (
+        "censoring must be written as censor_cida", files
+    )
+
+
+def test_run_log_records_effective_engine_settings():
+    """`memory_limit=None` means the package default (8GB, less on a
+    small host), not "unlimited" and not "auto".
+
+    The header used to be written before the Engine existed, so it
+    printed the REQUESTED value — "auto" — which cannot be used to
+    explain what a job consumed on shared hardware.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        limit = eng.effective_memory_limit
+        threads = eng.effective_threads
+    finally:
+        eng.close()
+
+    assert limit not in ("", "auto", "unknown", "None"), limit
+    assert threads >= 1
+    # a real, resolved quantity
+    assert any(u in limit for u in ("GiB", "MiB", "GB", "MB")), limit
+
+
+def test_unproduced_output_tables_warn():
+    """USERSTRATA dispatches on `tableid` (ms_cidanum.sas:2820-2831).
+    This package produces `t2cida`; a study can request others.
+
+    A requested table that is not produced is ABSENT, not empty, so a
+    downstream step expecting it finds nothing at all — the same silent
+    shape as ignoring an inclusion rule.
+
+    `t2followuptime` prompted this and is now implemented, so the test
+    uses `t2its` — a tableid SAS dispatches on and this package does
+    not produce.
+    """
+    import warnings as w
+
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def build(table_ids):
+        return {
+            "qrp_parameters_scalars": {
+                "type": 2, "startdate": "2011-01-01",
+                "enddate": "2015-06-30"},
+            "cohortfile": base["cohortfile"],
+            "type2file": base["type2file"],
+            "cohortcodes": base["cohortcodes"],
+            "codestrength": base["codestrength"],
+            "userstrata": [{"tableid": t, "levelid": "1", "levelvars": ""}
+                           for t in table_ids],
+        }
+
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        s = load_study_dict(build(["t2cida", "t2its"]))
+    assert s.unsupported_table_ids == ("t2its",)
+    assert any("t2its" in str(x.message) for x in caught)
+
+    # the two implemented ids must NOT warn
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        s = load_study_dict(build(["t2cida", "t2followuptime"]))
+    assert s.unsupported_table_ids == ()
+    assert not any("userstrata requests" in str(x.message) for x in caught)
+
+    # the supported one alone must NOT warn
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        s = load_study_dict(build(["t2cida"]))
+    assert s.unsupported_table_ids == ()
+    assert not any("userstrata requests" in str(x.message) for x in caught)
+
+
+# ---------------------------------------------------------------------
+# followuptime_cida (ms_createcensortable.sas, table=followuptime)
+# ---------------------------------------------------------------------
+
+
+def _fup_study(levels):
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    return load_study_dict({
+        "qrp_parameters_scalars": {
+            "type": 2, "runid": "fup",
+            "startdate": "2011-01-01", "enddate": "2015-06-30",
+        },
+        "cohortfile": base["cohortfile"],
+        "type2file": base["type2file"],
+        "cohortcodes": base["cohortcodes"],
+        "codestrength": base["codestrength"],
+        "userstrata": levels,
+    })
+
+
+def test_followuptime_is_opt_in_by_tableid():
+    """USERSTRATA dispatches on tableid (ms_cidanum.sas:2820-2831). A
+    study asking only for t2cida must not get this table, and a study
+    asking only for t2followuptime must not get t2_cida."""
+    only_fup = _fup_study([{"tableid": "t2followuptime", "levelid": "1",
+                            "levelvars": ""}])
+    assert only_fup.any_followuptime
+    assert not only_fup.any_cida_tables
+    assert only_fup.unsupported_table_ids == ()
+
+    only_cida = _fup_study([{"tableid": "t2cida", "levelid": "1",
+                             "levelvars": ""}])
+    assert only_cida.any_cida_tables
+    assert not only_cida.any_followuptime
+
+
+def test_followuptime_levels_reconcile_and_every_episode_is_censored():
+    """Each level is a complete partition of the episodes, and every
+    episode is censored for some reason — the flags are exhaustive, not
+    a sample."""
+    from qrp import Engine
+
+    s = _fup_study([
+        {"tableid": "t2followuptime", "levelid": "1", "levelvars": ""},
+        {"tableid": "t2followuptime", "levelid": "2",
+         "levelvars": "agegroup*sex"},
+    ])
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        total = eng.count("cohort_final")
+        for level in ("1", "2"):
+            got = eng.con.execute(
+                "SELECT sum(episodes) FROM followuptime WHERE level = ?",
+                [level]).fetchone()[0]
+            assert got == total, (level, got, total)
+
+        flags = ("cens_elig + cens_dth + cens_qryend + cens_dpend + "
+                 "cens_episend + cens_spec + cens_event")
+        unexplained = eng.con.execute(
+            f"SELECT sum(episodes) - sum(least(1, {flags}) * episodes) "
+            f"FROM followuptime WHERE level = '1'").fetchone()[0]
+        assert unexplained == 0, f"{unexplained} episodes with no reason"
+    finally:
+        eng.close()
+
+
+def test_followuptime_censor_date_differs_from_censor_cida():
+    """The two tables use DIFFERENT censor dates and are not
+    interchangeable.
+
+    followuptime censors at min(EpisodeEndDt, Enr_End, FEventDt) —
+    the event counts (ms_finalizeptsmasterlist.sas:312). censor_cida
+    ignores the event and uses the query/DP end instead (line 308). A
+    cohort with events must therefore show event-censored episodes here
+    and none in censor_cida.
+    """
+    from qrp import Engine
+
+    s = _fup_study([{"tableid": "t2followuptime", "levelid": "1",
+                     "levelvars": ""}])
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        events = eng.con.execute(
+            "SELECT sum(cens_event) FROM followuptime WHERE level = '1'"
+        ).fetchone()[0]
+        assert events > 0, "no episode censored by its event"
+        # and that matches the episodes that actually have one
+        with_event = eng.con.execute(
+            "SELECT count(*) FROM cohort_final WHERE has_event = 1"
+        ).fetchone()[0]
+        assert events <= with_event, (events, with_event)
+    finally:
+        eng.close()
+
+
+def test_followuptime_is_written_under_its_sas_name():
+    import json as _json
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(_fup_study([{"tableid": "t2followuptime", "levelid": "1",
+                      "levelvars": ""}]),
+         DATA, output_dir=str(out), names="sas", verbose=False)
+    manifest = _json.loads((out / "manifest.json").read_text())
+    info = manifest["tables"]["followuptime"]
+    assert info["library"] == "msoc"
+    assert info["file"].endswith("_followuptime_cida"), info
+    assert info["sas_contract"] is True
+
+
+def test_censor_cida_has_the_sas_shape():
+    """msoc.<runid>_censor_cida is `group level <censorstrat> episodes
+    <msocflaglist>` (ms_createcensortable.sas:246-250).
+
+    This was a per-exit_reason summary with person_days and percentages
+    — readable, but not the dataset the Operations Center expects. For
+    an msoc output the shape is part of the contract, not a
+    presentation choice.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM censoring LIMIT 0").description}
+        for required in ("group", "level", "censdays_value_cat", "episodes",
+                         "cens_elig", "cens_dth", "cens_qryend",
+                         "cens_dpend"):
+            assert required in cols, (required, sorted(cols))
+
+        # a study with no USERSTRATA still gets the table, unstratified
+        assert eng.count("censoring") > 0, (
+            "censor_cida is absent for a study that defines no strata"
+        )
+        total = eng.con.execute(
+            "SELECT sum(episodes) FROM censoring").fetchone()[0]
+        assert total == eng.count("cohort_final")
+    finally:
+        eng.close()
+
+
+def test_censoring_flags_are_independent_not_exclusive():
+    """The flags indicate which dates EQUAL the censor date, so an
+    episode can carry more than one — disenrolling on the query end date
+    sets both cens_elig and cens_qryend.
+
+    Asserting they sum to the episode count would be wrong, and would
+    have looked like a bug when the sum exceeded it.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        episodes, flagged = eng.con.execute("""
+            SELECT sum(episodes),
+                   sum(cens_elig + cens_dth + cens_qryend + cens_dpend)
+            FROM censoring
+        """).fetchone()
+        # every episode has at least one reason ...
+        assert flagged >= episodes, (flagged, episodes)
+        # ... and the excess is exactly the coincident-date episodes
+        coincident = eng.con.execute("""
+            SELECT count(*) FROM cohort_final c
+            JOIN cfg_cohort cfg ON cfg.cohortgrp = c.cohortgrp
+            WHERE c.enr_end = DATE '2015-06-30'
+              AND least(c.enr_end,
+                        coalesce(c.deathdt, DATE '9999-12-31'),
+                        DATE '2015-06-30') = c.enr_end
+        """).fetchone()[0]
+        assert flagged - episodes == coincident, (flagged, episodes,
+                                                  coincident)
+    finally:
+        eng.close()
+
+
+def test_attrition_uses_sas_column_names_and_units():
+    """msoc.<runid>_attrition is `group level descr claim_level
+    remaining excluded` (ms_attrition_cidacompute.sas:104-115).
+
+    `claim_level` says which unit remaining/excluded are counted in.
+    Steps 1-3 narrow CLAIMS; 4 onward narrow EPISODES, and SAS never
+    subtracts across that boundary because each step declares its own
+    unit and computes its own counts.
+
+    An earlier version lagged across the change and reported 66,921
+    excluded against 53,107 remaining — a plausible-looking number that
+    meant nothing. The boundary is NULL instead.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM attrition LIMIT 0").description}
+        for required in ("group", "level", "descr", "claim_level",
+                         "remaining", "excluded"):
+            assert required in cols, (required, sorted(cols))
+
+        rows = eng.con.execute("""
+            SELECT level, claim_level, remaining, excluded
+            FROM attrition
+            WHERE "group" = (SELECT min("group") FROM attrition)
+            ORDER BY level
+        """).fetchall()
+
+        # remaining never increases WITHIN a unit
+        for unit in ("Claim", "Episode"):
+            vals = [r[2] for r in rows if r[1] == unit]
+            assert vals == sorted(vals, reverse=True), (unit, vals)
+
+        # excluded is NULL exactly where the unit changes, and reconciles
+        # with the drop in remaining everywhere else
+        by_level = {r[0]: r for r in rows}
+        for lvl, (_, unit, remaining, excluded) in by_level.items():
+            prev = by_level.get(lvl - 1)
+            if prev is None or prev[1] != unit:
+                assert excluded is None, (lvl, excluded)
+            else:
+                assert excluded == prev[2] - remaining, (lvl, excluded)
+    finally:
+        eng.close()
+
+
+def test_output_column_names_match_the_sas_contract():
+    """A sweep, not a spot check.
+
+    Three outputs in a row turned out to carry the right information
+    under names no downstream reader would match on — `censor_cida`
+    (shape), `attrition` (names and units), `denomcounts` and
+    `distindexmap` (names and missing columns). Getting the FILENAME
+    right says nothing about the columns inside it, so this pins the
+    column sets for every output whose SAS keep-list is known.
+    """
+    from qrp import Engine
+
+    expected = {
+        # ms_codedistribution.sas:433-435 and 444-447
+        "distindexmap": ["group", "distindextype", "stockgroup", "codecat",
+                         "codetype", "enctype", "pdx", "code",
+                         "distindexid"],
+        "distindex": ["group", "distindextype", "distindexlist",
+                      "episodes"],
+        # ms_attrition_cidacompute.sas:104-115
+        "attrition": ["group", "level", "descr", "claim_level",
+                      "remaining", "excluded"],
+        # ms_createcensortable.sas:246-250
+        "censoring": ["group", "level", "censdays_value_cat", "episodes",
+                      "cens_elig", "cens_dth", "cens_qryend",
+                      "cens_dpend"],
+    }
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        for table, required in expected.items():
+            cols = [d[0] for d in eng.con.execute(
+                f"SELECT * FROM {table} LIMIT 0").description]
+            missing = [c for c in required if c not in cols]
+            assert not missing, f"{table} is missing {missing}; has {cols}"
+            # and the contract columns lead, in SAS order
+            lead = [c for c in cols if c in required]
+            assert lead == required, f"{table} order: {lead} != {required}"
+    finally:
+        eng.close()
+
+
+def test_denominator_metrics_use_the_sas_names():
+    """SAS calls these DenNumPts / DenNumMemDays in BOTH denomcounts and
+    t2_cida (9 uses each in ms_cidatables.sas). They were
+    `eligible_members` / `memberdays` — descriptive, but not what a
+    downstream merge references."""
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    s = load_study_dict({
+        "qrp_parameters_scalars": {
+            "type": 2, "runid": "d", "startdate": "2011-01-01",
+            "enddate": "2015-06-30"},
+        "cohortfile": base["cohortfile"],
+        "type2file": base["type2file"],
+        "cohortcodes": base["cohortcodes"],
+        "codestrength": base["codestrength"],
+        "userstrata": [{"tableid": "t2cida", "levelid": "1",
+                        "levelvars": ""}],
+    })
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        for table in ("denomcounts", "t2_cida"):
+            cols = {d[0] for d in eng.con.execute(
+                f"SELECT * FROM {table} LIMIT 0").description}
+            assert "dennumpts" in cols, (table, sorted(cols))
+            assert "dennummemdays" in cols or table == "t2_cida", cols
+
+        # and the two must agree — the merge is by name
+        denom, cida = eng.con.execute("""
+            SELECT (SELECT sum(dennumpts) FROM denomcounts WHERE level='1'),
+                   (SELECT sum(dennumpts) FROM t2_cida     WHERE level='1')
+        """).fetchone()
+        assert denom == cida, (denom, cida)
+    finally:
+        eng.close()
+
+
+def test_geography_columns_live_on_the_master_list():
+    """SAS has NO &RUNID._geography dataset — checked across the whole
+    macro library. It carries zip3/state/hhs_reg/cb_reg/zip_uncertain as
+    COLUMNS ON mstr (ms_geographicvars.sas:158).
+
+    Emitting them only as a separate table meant `mstr` was missing
+    columns a downstream step reads from it by name.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    base["zipfile"] = [
+        {"zip": f"{i:05d}", "statecode": "MA", "hhs_region": "1",
+         "cb_region": "Northeast", "sdi": 40.0}
+        for i in range(300)
+    ]
+    eng = Engine(verbose=False)
+    try:
+        run(load_study_dict(base), DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM ptsmasterlist LIMIT 0").description}
+        for required in ("zip3", "state", "hhs_reg", "cb_reg",
+                         "zip_uncertain"):
+            assert required in cols, (required, sorted(cols))
+
+        # the merge must not drop or duplicate episodes
+        assert eng.count("ptsmasterlist") == eng.count("geography")
+        unmatched = eng.con.execute(
+            "SELECT count(*) FROM ptsmasterlist WHERE zip_uncertain IS NULL"
+        ).fetchone()[0]
+        assert unmatched == 0, f"{unmatched} episodes lost the geography join"
+    finally:
+        eng.close()
+
+
+def test_mstr_is_the_finalised_master_list():
+    """SAS has ONE master list. `DPLocal.&RUNID._mstr` is set from
+    `_PtsMasterList` AFTER ms_finalizeptsmasterlist attaches the event
+    and censoring columns (ms_createmicohorts.sas:2117), so SAS's mstr
+    is the FINALISED list — this package's `cohort_final`.
+
+    There is no `&RUNID._mstr_final` anywhere in the macro library.
+    Mapping the pre-follow-up intermediate to `mstr` meant a DP reading
+    `<runid>_mstr` got 6,687 extra episodes that had never been through
+    the follow-up washout, and no event columns at all.
+    """
+    import json as _json
+    import tempfile
+
+    import duckdb
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(load_study(STUDY), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    manifest = _json.loads((out / "manifest.json").read_text())
+
+    assert manifest["tables"]["cohort_final"]["file"].endswith("_mstr")
+    assert manifest["tables"]["cohort_final"]["sas_contract"] is True
+    # the intermediate must NOT claim a SAS name
+    inter = manifest["tables"]["ptsmasterlist"]
+    assert not inter["file"].endswith("_mstr"), inter
+    assert inter["sas_contract"] is False
+    assert "note" in inter
+
+    # and the file called _mstr must actually be the finalised one
+    con = duckdb.connect()
+    try:
+        path = out / manifest["tables"]["cohort_final"]["library"] / \
+            manifest["tables"]["cohort_final"]["file"]
+        cols = {d[0] for d in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{path}/**/*.parquet')"
+        ).fetchall()}
+        for required in ("eventdt", "has_event", "numevents"):
+            assert required in cols, (required, sorted(cols))
+    finally:
+        con.close()
+
+
+def test_every_sas_contract_output_really_exists_in_sas():
+    """Guard against the error this whole sweep was made of.
+
+    `SAS_CONTRACT` was populated from what this package produced and
+    then labelled with SAS names that seemed to fit. Two of those names
+    — `mstr_final` and `geography` — do not exist in the SAS macro
+    library at all, and one (`mstr`) named the wrong table.
+
+    The names below were each verified against the macros. Anything not
+    on this list must be flagged as an addition, with a note.
+    """
+    from qrp.pipeline import SAS_CONTRACT, SAS_NAMES, SAS_NAME_NOTES
+
+    # Dataset names confirmed present in the SAS macro library.
+    real_sas_datasets = {
+        "mstr", "denomcounts", "numcounts",          # dplocal
+        "attrition", "censor_cida", "followuptime_cida",
+        "distindex", "distindexmap", "runtimes", "signature",
+        "t2_cida",                                   # msoc
+    }
+
+    for table in SAS_CONTRACT:
+        emitted = SAS_NAMES.get(table, table)
+        assert emitted in real_sas_datasets, (
+            f"{table} is flagged as a SAS contract output but SAS has no "
+            f"dataset called {emitted!r}"
+        )
+
+    # and every non-contract output must explain itself
+    for table, name in SAS_NAMES.items():
+        if table not in SAS_CONTRACT:
+            assert table in SAS_NAME_NOTES, (
+                f"{table} -> {name} is neither a verified SAS name nor "
+                f"documented as an addition"
+            )
+
+
+def test_mstr_carries_the_sas_column_names():
+    """`mstr` is the primary patient-level deliverable, and downstream
+    SAS steps read columns off it BY NAME
+    (ms_finalizeptsmasterlist.sas).
+
+    Seven were missing or differently named — `FEventDt`, `Event`,
+    `Event_flag`, `followuptime`, `timetocensor`, `EpisodeEndDt_Censor`,
+    `episodelength`, `group`. A step selecting any of them would have
+    found nothing. Getting the FILE right is not the same as getting the
+    columns right, which is the lesson of this whole sweep.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM cohort_final LIMIT 0").description}
+        for required in ("group", "patid", "indexdt", "episodeenddt",
+                         "origepisenddt", "enr_start", "enr_end",
+                         "feventdt", "event", "event_flag", "numevents",
+                         "followuptime", "timetocensor",
+                         "episodeenddt_censor", "episodelength"):
+            assert required in cols, (required, sorted(cols))
+
+        # the SAS-named columns must agree with this package's own
+        bad = eng.con.execute("""
+            SELECT count(*) FROM cohort_final
+            WHERE (event = 1) <> (has_event = 1)
+               OR feventdt IS DISTINCT FROM eventdt
+               OR (event_flag = 'Y') <> (has_event = 1)
+               OR followuptime < 0
+               OR timetocensor < 0
+        """).fetchone()[0]
+        assert bad == 0, f"{bad} rows where the SAS names disagree"
+    finally:
+        eng.close()
+
+
+def test_followuptime_agrees_between_mstr_and_the_cida_table():
+    """`followuptime` is computed twice — once onto mstr, once in
+    94_followuptime.sql. Two independent expressions of the same SAS
+    formula must agree, or one of them is wrong."""
+    from qrp import Engine
+
+    s = _fup_study([{"tableid": "t2followuptime", "levelid": "1",
+                     "levelvars": ""}])
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        on_mstr, in_table = eng.con.execute("""
+            SELECT (SELECT sum(followuptime) FROM cohort_final),
+                   (SELECT sum(CAST(fupdays_value_cat AS BIGINT) * episodes)
+                    FROM followuptime WHERE level = '1')
+        """).fetchone()
+        assert on_mstr == in_table, (on_mstr, in_table)
+    finally:
+        eng.close()
+
+
+# ---------------------------------------------------------------------
+# Parity comparison tool
+# ---------------------------------------------------------------------
+
+
+def test_parity_compare_detects_each_defect_class():
+    """The comparator must catch the defect classes this package has
+    actually shipped.
+
+    A sweep of the outputs found EVERY table wrong in some way —
+    missing columns, wrong row populations, wrong values. A harness
+    that only compares row counts would have caught none of the column
+    defects, which were the commonest.
+    """
+    import csv
+    import subprocess
+    import sys
+    import tempfile
+
+    root = Path(__file__).resolve().parents[1]
+    tool = root / "tools" / "parity_compare.py"
+
+    base = Path(tempfile.mkdtemp())
+    a = base / "sas" / "t" / "table"
+    b = base / "duck" / "t" / "table"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+
+    rows = [{"group": "g", "level": str(i), "remaining": str(100 - i),
+             "excluded": str(i)} for i in range(1, 5)]
+
+    def write(path, data, cols=None):
+        cols = cols or list(data[0])
+        with (path / "attrition.csv").open("w", newline="") as fh:
+            w = csv.DictWriter(fh, cols, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(data)
+
+    write(a, rows)
+    # one value changed, one row dropped, one column dropped
+    perturbed = [dict(r) for r in rows[1:]]
+    perturbed[0]["remaining"] = "999"
+    write(b, perturbed, cols=["group", "level", "remaining"])
+
+    out = subprocess.run(
+        [sys.executable, str(tool), str(base / "sas"), str(base / "duck")],
+        capture_output=True, text=True)
+    assert out.returncode == 1, out.stdout
+    for expected in ("MISSING COLUMN", "ROW COUNT", "KEY MISMATCH", "VALUE"):
+        assert expected in out.stdout, (expected, out.stdout)
+
+    # identical trees must be clean, or the tool cries wolf and is ignored
+    same = subprocess.run(
+        [sys.executable, str(tool), str(base / "sas"), str(base / "sas")],
+        capture_output=True, text=True)
+    assert same.returncode == 0, same.stdout
+    assert "No differences" in same.stdout
+
+
+def test_parity_compare_tolerates_format_noise():
+    """SAS and DuckDB write floats and missing values differently. A
+    harness that flags every such difference produces thousands of false
+    positives and gets ignored — worse than not running it."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from parity_compare import same_value
+
+    assert same_value("1.0", "1.0000000001", 1e-9)
+    assert same_value("0.30000000000000004", "0.3", 1e-9)
+    assert same_value(".", "", 1e-9)        # SAS missing vs DuckDB empty
+    assert same_value("NULL", "NA", 1e-9)
+    # and it must still catch real differences
+    assert not same_value("1.0", "1.1", 1e-9)
+    assert not same_value("2011-01-01", "2011-01-02", 1e-9)
+
+
+def test_parity_dump_covers_the_deliverables_and_ignores_valid_columns():
+    """The dump must cover the OUTPUT tables, not just intermediates.
+
+    It originally dumped five intermediate stages. A sweep against the
+    SAS macros then found every deliverable wrong — wrong shape, wrong
+    column names, missing columns, and in one case (`mstr`) the wrong
+    table entirely. Comparing only intermediates would have caught none
+    of that.
+
+    Also guards the IGNORE_COLUMNS lists: they name columns to exclude,
+    and a stale entry makes the dump fail at runtime with
+    `Column "step" in EXCLUDE list not found` — which is how this test
+    came to exist.
+    """
+    from qrp import Engine
+    from qrp.parity import IGNORE_COLUMNS, STAGE_TABLES
+
+    dumped = {t for tables in STAGE_TABLES.values() for t in tables}
+    for deliverable in ("attrition", "censoring", "t2_cida", "denomcounts",
+                        "numcounts", "distindex", "distindexmap",
+                        "cohort_final"):
+        assert deliverable in dumped, f"{deliverable} is not dumped"
+
+    # every ignored column must actually exist on its table, or the
+    # EXCLUDE clause fails at runtime
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        for table, ignored in IGNORE_COLUMNS.items():
+            try:
+                cols = {d[0].lower() for d in eng.con.execute(
+                    f"SELECT * FROM {table} LIMIT 0").description}
+            except Exception:
+                continue          # table not produced by this study
+            stale = [c for c in ignored if c.lower() not in cols]
+            assert not stale, (
+                f"IGNORE_COLUMNS[{table!r}] names columns that do not "
+                f"exist: {stale}"
+            )
+    finally:
+        eng.close()
+
+
+# ---------------------------------------------------------------------
+# baseline distribution table
+# ---------------------------------------------------------------------
+
+
+def test_baseline_is_wide_one_row_per_group():
+    """SAS's baseline is WIDE: one row per cohort group, one column per
+    category LEVEL (ms_createdistbaselinetable.sas:455-526).
+
+    This was previously emitted as `covariate_prevalence` — one row per
+    covariate, long. A different table, not a renaming, and the last
+    deliverable in the output sweep that was structurally wrong rather
+    than just misnamed.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        groups = eng.con.execute(
+            "SELECT count(DISTINCT cohortgrp) FROM cohort_final").fetchone()[0]
+        assert eng.count("baseline") == groups, "not one row per group"
+
+        cols = [d[0] for d in eng.con.execute(
+            "SELECT * FROM baseline LIMIT 0").description]
+        for required in ("group", "patient", "n_episodes", "mean_age",
+                         "std_age"):
+            assert required in cols, (required, cols)
+        # one column per observed level, not a hardcoded list
+        assert any(c.startswith("Sex_") for c in cols), cols
+        assert any(c.startswith("Race_") for c in cols), cols
+        assert any(c.startswith("Age_") for c in cols), cols
+
+        # dummies are counts: they must sum to the episode count
+        bad = eng.con.execute(
+            'SELECT count(*) FROM baseline WHERE "Sex_F" + "Sex_M" '
+            '<> n_episodes').fetchone()[0]
+        assert bad == 0, "sex dummies do not sum to n_episodes"
+
+        total = eng.con.execute(
+            "SELECT sum(n_episodes) FROM baseline").fetchone()[0]
+        assert total == eng.count("cohort_final")
+    finally:
+        eng.close()
+
+
+def test_baseline_is_squared():
+    """A category absent from a group is 0, not a missing column
+    (ms_createdistbaselinetable.sas:529-537).
+
+    That is what makes the table stackable across groups and comparable
+    across runs — a missing column and a zero column mean different
+    things to a reader.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    # restrict ONE cohort to females, so Sex_M is genuinely absent there
+    cohortfile = [dict(r) for r in base["cohortfile"]]
+    cohortfile[0]["sex"] = "F"
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study_dict({**base, "cohortfile": cohortfile}),
+            DATA, engine=eng, verbose=False)
+        rows = eng.con.execute(
+            'SELECT "group", "Sex_F", "Sex_M" FROM baseline ORDER BY 1'
+        ).fetchall()
+        # every group carries both columns ...
+        assert all(r[1] is not None and r[2] is not None for r in rows), rows
+        # ... and the restricted one has a real zero, not a NULL
+        assert any(r[2] == 0 for r in rows), rows
+
+        # no NULLs anywhere in the table
+        cols = [d[0] for d in eng.con.execute(
+            "SELECT * FROM baseline LIMIT 0").description][1:]
+        nulls = eng.con.execute(
+            "SELECT " + " + ".join(
+                f'sum(CASE WHEN "{c}" IS NULL THEN 1 ELSE 0 END)'
+                for c in cols) + " FROM baseline").fetchone()[0]
+        assert nulls == 0, f"{nulls} NULL cells; the table is not squared"
     finally:
         eng.close()

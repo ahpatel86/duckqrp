@@ -62,3 +62,28 @@ SELECT
 FROM ptsmasterlist m
 LEFT JOIN cfg_zipfile z
        ON z.zip = m.zip;
+
+-- SAS carries these AS COLUMNS ON mstr, not as a separate dataset:
+-- `dplocal.&runid._mstr(keep=zip3 state hhs_reg cb_reg zip_uncertain
+-- patid indexdt group)` (ms_geographicvars.sas:158). There is no
+-- &RUNID._geography anywhere in the macro library — checked, not
+-- assumed.
+--
+-- So merge them on. The standalone `geography` table is kept as well
+-- (it is how this package has emitted them and is cheap to produce),
+-- but it is an ADDITION, not a SAS output, and is flagged as such in
+-- the manifest.
+CREATE OR REPLACE TABLE ptsmasterlist AS
+SELECT
+    m.*,
+    g.zip3,
+    g.state,
+    g.hhs_reg,
+    g.cb_reg,
+    g.sdi,
+    g.zip_uncertain
+FROM ptsmasterlist m
+LEFT JOIN geography g
+       ON g.cohortgrp = m.cohortgrp
+      AND g.patid     = m.patid
+      AND g.indexdt   = m.indexdt;

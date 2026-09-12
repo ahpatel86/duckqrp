@@ -811,7 +811,7 @@ nothing about their combination.
   `cohortType in ("mil","milhoi")` or writes to a `_preg` dataset. See
   docs/INCLUSION.md.
 * **`INDEXDT_EXP` anchors** — anchor on the exposed index date, which
-  only exists in comparator designs. Warned about at load.
+  is Type 4 (pregnancy) machinery. Warned about at load.
 * **Types 1, 3, 4, 5, 6** — not ported.
 
 ---
@@ -918,6 +918,85 @@ The study runs end to end in **6.1 s** against the real SCDM extract:
 259 episodes, 2,469 covariate rows, 238 CIDA rows across 4 strata
 levels.
 
+## The parity harness — comparison side
+
+`qrp run --parity-dump <dir>` writes the DuckDB side in the layout the
+existing harness expects. **`tools/parity_compare.py` is the other
+half**, and it is the piece that was missing:
+
+```bash
+qrp run --study s.json --indata data/ --out results/ --parity-dump duck_dbg/
+python tools/parity_compare.py sas_dbg/ duck_dbg/
+```
+
+Exit 0 means no differences; exit 1 lists them.
+
+### What it classifies, and why
+
+| class | why it is separate |
+|---|---|
+| `MISSING/EXTRA TABLE` | one side produced a table the other did not |
+| `MISSING/EXTRA COLUMN` | **the commonest defect found in this package** — invisible to any row-count check |
+| `ROW COUNT` | different numbers of rows |
+| `KEY MISMATCH` | same count, different rows — a count alone is a weak check |
+| `VALUE` | same key, different value; counted per column so one systematic error does not drown the report |
+
+Rows are aligned on declared key columns before values are compared. A
+positional diff on a 60,000-row master list says only "these differ",
+which is not actionable.
+
+Numeric and missing-value formatting is tolerated: SAS writes `.` for
+missing and formats floats differently. A harness that flags every such
+difference produces thousands of false positives and gets ignored, which
+is worse than not running it.
+
+### What the dump covers
+
+Thirteen tables across nine stages — the intermediates, where a
+divergence is easiest to localise, **and every deliverable**:
+
+| stage | tables |
+|---|---|
+| STOCKPILING / POV1 / PTSMASTERLIST / POV56 | `stockpiled`, `index_candidates`, `pov1`, `ptsmasterlist`, `cohort_final` |
+| ATTRITION / CENSOR | `attrition`, `censoring` |
+| CIDA | `t2_cida`, `numcounts`, `denomcounts` |
+| CODEDIST | `distindex`, `distindexmap` |
+| FOLLOWUPTIME | `followuptime` |
+
+The dump originally covered only the five intermediates. The sweep then
+found **every deliverable wrong** — wrong shape, wrong column names,
+missing columns, and in one case the wrong table entirely. Comparing
+only intermediates would have caught none of it.
+
+`IGNORE_COLUMNS` excludes this package's own column names on tables that
+carry both (`cohort_final` has `group` and `cohortgrp`, `FEventDt` and
+`eventdt`). A test asserts every ignored column actually exists — a
+stale entry makes the dump fail at runtime with
+`Column "step" in EXCLUDE list not found`, which is how that test came
+to exist.
+
+### Why this is the highest-value remaining work
+
+Every source of ground truth applied to this package has found defects:
+
+| ground truth | defects found |
+|---|---|
+| reading the SAS macros | 8 |
+| a reviewer pointing at a dismissed column | 1 |
+| real lab data | 4 |
+| a real input file | 4 |
+| a code review | 13 |
+| sweeping the outputs | 8 — *every output table* |
+
+Reading has repeatedly failed, including on claims already believed
+verified — the `INDEXDT_EXP` description in this document was fiction,
+written confidently and propagated across three files before being
+checked.
+
+**SAS's actual output is the one source of truth never applied.** One
+comparison against it would test every stage at once, including the ones
+read confidently and got wrong.
+
 ## Still unaudited
 
 - Covariate anchoring in `ms_cidacov`.
@@ -953,3 +1032,38 @@ different-code events; `2` removes those too. A third test asserts the
 event **flag** is identical across all three — only the count moves,
 since `min(adate)` really is invariant. That invariant is what let the
 bug hide, so it is worth pinning explicitly.
+
+
+---
+
+## Correction: what INDEXDT_EXP actually is
+
+This document described `INDEXDT_EXP` as "the exposed index date, which
+only exists in comparator designs" in several places. **That was wrong**
+and the correction is worth recording because the error was repeated
+across three files without ever being checked.
+
+`indexdt_exp` is **pregnancy machinery** (`ms_createmicohorts.sas:764`):
+
+```sas
+*assign indexdt_exp. If exposure date begins prior to exposure window
+ then set to start of exposure window;
+indexdt_exp = indexdt2;
+if . < indexdt_exp < exposurefromdt then indexdt_exp = exposurefromdt;
+```
+
+The surrounding variables are `pregstartdt`, `exposurefromdt`,
+`exposuretodt`, `exposureunit`. So `indexdt_exp` is **the date exposure
+actually began inside a pregnancy's exposure window**, clamped to the
+start of that window — distinct from `indexdt`, which for a pregnancy
+cohort is usually the pregnancy start date.
+
+Anchoring a window on `INDEXDT_EXP` therefore means "measure from when
+the drug exposure began, not from the pregnancy start".
+
+Every use is gated on `type = 4`, so it is not reachable from Type 2.
+The practical consequence for this package is unchanged — it still
+warns rather than silently treating it as an index-date anchor — but the
+*reason* given was fiction, and a reader deciding whether the gap
+mattered to them would have been misled about which study designs it
+affects.
