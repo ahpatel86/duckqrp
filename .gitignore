@@ -23,3 +23,31 @@ logs/
 results/
 *.duckdb
 *.duckdb.wal
+
+# Browser download artefacts. A commit on this branch picked up a bare
+# `download` file (a copy of this .gitignore) and `README (1).md` (a
+# copy of docs/README.md) — both the shape a browser produces when
+# saving a file that already exists locally.
+download
+*\ (1).*
+*\ (2).*
+*.download
+
+# Source files loose at the repository root. The package lives in
+# src/qrp/, docs/, study/, tests/ and tools/; a .py or .sql at the root
+# is a stray copy, and a STALE one is worse than a duplicate — a commit
+# here carried 83 flattened copies that were several changes behind the
+# real tree, so reading them gave the wrong answer.
+/*.py
+/*.sql
+/*.json
+!package.py
+
+# Images: the terminal UI renders are reproducible with
+# `export_screenshot()` and are not kept in the repository.
+*.svg
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
