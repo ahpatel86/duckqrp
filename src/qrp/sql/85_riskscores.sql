@@ -50,7 +50,22 @@ hits AS (
     JOIN cohort_claims s
       ON s.patid   = m.patid
      AND s.code    = r.code
-     AND s.codecat = CASE WHEN r.codecat = 'RX' THEN 'RX' ELSE 'DX' END
+     -- Match the code's OWN domain. This collapsed everything that was
+     -- not RX to DX, so a PX risk-score code looked for procedure codes
+     -- in the diagnosis table and could never match — silently scoring
+     -- 0 for a condition the study had defined. `r.codecat IN ('DX',
+     -- 'PX', 'RX')` two lines up says PX is accepted; this line made
+     -- that a promise the query did not keep. Reported in review.
+     AND s.codecat = r.codecat
+     -- Care setting. RISKSCORECODES carries its own
+     -- caresettingprincipal, parsed into (enctype, pdx) by
+     -- parse_care_setting(). It was parsed and never applied, so a
+     -- study restricting a condition to inpatient claims got a score
+     -- computed over every setting — plausible, and wrong. Same
+     -- wildcard convention as the event codes: '**' / '*' match
+     -- anything. Reported in review.
+     AND (r.enctype = '**' OR r.enctype = s.enctype)
+     AND (r.pdx     = '*'  OR r.pdx     = s.pdx)
      AND periods_overlap(
             -- Each end anchors independently
             -- (ms_computeriskscores.sas:107-117), the same mechanism the

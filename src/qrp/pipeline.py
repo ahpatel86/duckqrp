@@ -20,10 +20,11 @@ import re as _re
 from datetime import date, timedelta
 import time
 from dataclasses import dataclass
+import shutil as _shutil
 from pathlib import Path
 
 from .config import StudyConfig
-from .engine import Engine
+from .engine import Engine, sql_str
 from .events import EmptyResult, LogMessage, Level, RunFinished, RunStarted
 from .scdm import SCDM, columns_of, identify_by_columns, reader, resolve_table
 
@@ -206,17 +207,28 @@ CREATE OR REPLACE VIEW covar_source AS
 -- rxsup/rxamt are carried so the inclusion stage can compute dose from
 -- the MATCHED claim. They are NULL on the DX side, which is correct:
 -- a diagnosis has no supply or amount.
+-- enctype/pdx carry the CARE SETTING. Risk-score codes can restrict on
+-- it (RISKSCORECODES.caresettingprincipal), and without these columns
+-- that restriction was parsed and silently dropped — a score computed
+-- over every setting when the study asked for one.
 SELECT patid, adate, adate AS expiredt, code, 'DX' AS codecat,
-       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt
+       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt,
+       enctype, COALESCE(pdx, '') AS pdx
 FROM cdm_diagnosis
 UNION ALL
 SELECT patid, adate, adate + CAST(rxsup - 1 AS INTEGER) AS expiredt,
-       code, 'RX' AS codecat, rxsup, rxamt
+       code, 'RX' AS codecat, rxsup, rxamt,
+       -- A dispensing has no encounter type; '**'/'' is the wildcard,
+       -- so an unrestricted rule still matches and a restricted one
+       -- correctly does not.
+       '**' AS enctype, '' AS pdx
 FROM cdm_dispensing
 UNION ALL
 -- A procedure is a point event, like a diagnosis.
 SELECT patid, adate, adate AS expiredt, code, 'PX' AS codecat,
-       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt
+       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt,
+       -- procedures carry enctype but no principal-diagnosis flag
+       enctype, '' AS pdx
 FROM cdm_procedure
 """
 
@@ -282,6 +294,34 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
     _run_metadata(eng, study, sum(r.seconds for r in eng.log))
     run = study.run_id.lower()
 
+    # Clear THIS run's previous outputs before writing.
+    #
+    # Without it, a rerun into a populated directory leaves stale files
+    # that the current run did not produce, and nothing marks them as
+    # stale. Two ways that bites, both verified:
+    #
+    #   * Rerunning a study with a feature REMOVED — drop the
+    #     covariates, and covariates / baseline / covariate_prevalence
+    #     survive from the previous run. A reader gets covariate results
+    #     for a study that defines no covariates.
+    #   * Switching --names between `sas` and `logical` — the same table
+    #     is written under both names, so censor_cida and censoring sit
+    #     side by side with no indication they are one table.
+    #
+    # Scoped to this run_id's prefix, not the whole directory: a data
+    # partner may legitimately keep several runs' outputs together, and
+    # wiping a sibling run's results would be worse than the staleness
+    # this fixes.
+    for lib in ("dplocal", "msoc"):
+        d = out / lib
+        if not d.is_dir():
+            continue
+        for existing in d.glob(f"{run}_*"):
+            if existing.is_dir():
+                _shutil.rmtree(existing)
+            else:
+                existing.unlink()
+
     for tbl in [*tables, "signature", "runtimes"]:
         # Default to dplocal for anything unmapped: a new output should
         # have to be declared shareable, never become so by omission.
@@ -326,6 +366,18 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
             for t in [*tables, "signature", "runtimes"]
         },
     }
+    # Written LAST, deliberately. The write sequence is
+    # clear -> tables -> manifest, so a failure partway through leaves
+    # the tables without a manifest. Its PRESENCE is therefore the
+    # signal that a run completed and its outputs are the full set.
+    #
+    # A failure during the write loop does lose the previous run's
+    # outputs, since they were cleared first. The alternative — writing
+    # to a temp tree and swapping — doubles peak disk, and disk is
+    # already the binding constraint at scale (the pipeline spills
+    # roughly 2.6x the input size at its memory floor), so the cure
+    # would risk causing the disease. Re-running regenerates the
+    # outputs; a half-full disk does not.
     (out / "manifest.json").write_text(_json.dumps(manifest, indent=1))
 
 
@@ -421,14 +473,28 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
             f"SELECT DISTINCT {column} FROM cohort_final "
             f"WHERE {column} IS NOT NULL ORDER BY 1"
         ).fetchall()
+        seen: set[str] = set()
         for (value,) in rows:
             safe = _SAFE_LEVEL.sub("_", str(value))
             if not safe:
                 continue
+            # Two levels can sanitise to the same identifier — 'A-B' and
+            # 'A_B' both become 'A_B' — which would emit a duplicate
+            # column. Disambiguate rather than silently drop one.
+            base, n = safe, 2
+            while f"{prefix}_{safe}" in seen:
+                safe = f"{base}_{n}"
+                n += 1
+            seen.add(f"{prefix}_{safe}")
             # COUNT over a filtered CASE, so an absent level sums to 0
             # rather than NULL — that is the squaring.
+            # The IDENTIFIER is sanitised; the LITERAL must be escaped.
+            # A level value of O'BRIEN would otherwise emit
+            # `c.race = 'O'BRIEN'` — invalid SQL. These values come from
+            # claims data, so the assumption that they contain no quotes
+            # is not one to rely on. Reported in review.
             dummies.append(
-                f"sum(CASE WHEN c.{column} = '{str(value)}' "
+                f"sum(CASE WHEN c.{column} = {sql_str(value)} "
                 f"THEN 1 ELSE 0 END) AS \"{prefix}_{safe}\""
             )
 
@@ -732,6 +798,10 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "riskfrom": r.riskfrom, "riskto": r.riskto,
                 "riskfromanchor": r.riskfromanchor,
                 "risktoanchor": r.risktoanchor,
+                # Care setting, from RISKSCORECODES.caresettingprincipal.
+                # Parsed by parse_care_setting() and previously dropped
+                # before it reached the SQL.
+                "enctype": r.enctype, "pdx": r.pdx,
                 "is_intercept": r.is_intercept,
             }
             for r in study.risk_scores
@@ -739,6 +809,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         """riskscore VARCHAR, condid VARCHAR, codecat VARCHAR,
            code VARCHAR, weight DOUBLE, riskfrom INTEGER,
            riskto INTEGER, riskfromanchor VARCHAR, risktoanchor VARCHAR,
+           enctype VARCHAR, pdx VARCHAR,
            is_intercept BOOLEAN""",
     )
 
@@ -868,16 +939,18 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
              # once; two cohorts in the real file seen are defined purely
              # by HCPCS procedure codes.
              "codecat": codecat,
+             # CODESUPPLY: overrides the claim's RxSup when set.
+             "code_supply": code_supply,
              "stockgroup": dict(c.exposure_stockgroups).get(code, "_default")
                            if role == "DEF" else "_default"}
             for c in cohorts
             for role, codes in (("DEF", c.exposure_codes),
                                 ("EVENT", c.event_codes),
                                 ("IOC", c.ioc_codes))
-            for code, codecat in codes
+            for code, codecat, code_supply in codes
         ],
         """cohortgrp VARCHAR, role VARCHAR, code VARCHAR,
-           codecat VARCHAR, stockgroup VARCHAR""",
+           codecat VARCHAR, code_supply INTEGER, stockgroup VARCHAR""",
     )
 
 

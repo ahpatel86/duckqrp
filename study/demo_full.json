@@ -1,1315 +1,1395 @@
 {
-  "qrp_parameters": [
-    {
-      "type": 2,
-      "runid": "demo_full",
-      "startdate": "2011-01-01",
-      "enddate": "2015-06-30",
-      "censordate": "2015-06-30"
-    }
-  ],
-  "cohortfile": [
-    {
-      "cohortgrp": "lisinopril",
-      "enrollmentnum": 1,
-      "coverage": "MD",
-      "enrolgap": 45,
-      "chartres": "N",
-      "enrdays": 183,
-      "agestrat": "18-44 45-64 65-74 75+",
-      "reqdaysaftind": 0
-    },
-    {
-      "cohortgrp": "beta_blocker",
-      "enrollmentnum": 1,
-      "coverage": "MD",
-      "enrolgap": 45,
-      "chartres": "N",
-      "enrdays": 183,
-      "agestrat": "18-44 45-64 65-74 75+",
-      "reqdaysaftind": 0
-    }
-  ],
-  "type2file": [
-    {
-      "group": "lisinopril",
-      "t2washper": 183,
-      "point": "N",
-      "episodegap": 15,
-      "episodegaptype": "F",
-      "expextper": 0,
-      "minepisdur": 1,
-      "maxepisdur": 365,
-      "t2fupwashper": 183,
-      "eventcount": 1,
-      "censor_dth": "Y",
-      "t2atriskstart": 0,
-      "blackoutper": 0,
-      "reqdaysaftepi": 0,
-      "t2cumdoseper": 180,
-      "maxcfdd": 40.0,
-      "maxcumdose": 5000.0
-    },
-    {
-      "group": "beta_blocker",
-      "t2washper": 183,
-      "point": "N",
-      "episodegap": 30,
-      "episodegaptype": "F",
-      "expextper": 0,
-      "minepisdur": 1,
-      "maxepisdur": 365,
-      "t2fupwashper": 183,
-      "eventcount": 1,
-      "censor_dth": "Y",
-      "t2atriskstart": 0,
-      "blackoutper": 0,
-      "reqdaysaftepi": 0
-    }
-  ],
-  "cohortcodes": [
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00001"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00002"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00003"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00004"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00005"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00006"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00007"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00008"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00009"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00010"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00011"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00012"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00013"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00014"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00015"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00016"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00017"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00018"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00019"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "DEF",
-      "code": "E00020"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00001"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00002"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00003"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00004"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00005"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00006"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00007"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00008"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00009"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00010"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00011"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00012"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00013"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00014"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00015"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00016"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00017"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00018"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00019"
-    },
-    {
-      "group": "lisinopril",
-      "indexcriteria": "EVENT",
-      "code": "D00020"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00021"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00022"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00023"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00024"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00025"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00026"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00027"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00028"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00029"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00030"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00031"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00032"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00033"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00034"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00035"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00036"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00037"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00038"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00039"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "DEF",
-      "code": "E00040"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00001"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00002"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00003"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00004"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00005"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00006"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00007"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00008"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00009"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00010"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00011"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00012"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00013"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00014"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00015"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00016"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00017"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00018"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00019"
-    },
-    {
-      "group": "beta_blocker",
-      "indexcriteria": "EVENT",
-      "code": "D00020"
-    }
-  ],
-  "codestrength": [
-    {
-      "code": "E00001",
-      "strength": 7.5
-    },
-    {
-      "code": "E00002",
-      "strength": 10.0
-    },
-    {
-      "code": "E00003",
-      "strength": 12.5
-    },
-    {
-      "code": "E00004",
-      "strength": 15.0
-    },
-    {
-      "code": "E00005",
-      "strength": 17.5
-    },
-    {
-      "code": "E00006",
-      "strength": 20.0
-    },
-    {
-      "code": "E00007",
-      "strength": 5.0
-    },
-    {
-      "code": "E00008",
-      "strength": 7.5
-    },
-    {
-      "code": "E00009",
-      "strength": 10.0
-    },
-    {
-      "code": "E00010",
-      "strength": 12.5
-    },
-    {
-      "code": "E00011",
-      "strength": 15.0
-    },
-    {
-      "code": "E00012",
-      "strength": 17.5
-    },
-    {
-      "code": "E00013",
-      "strength": 20.0
-    },
-    {
-      "code": "E00014",
-      "strength": 5.0
-    },
-    {
-      "code": "E00015",
-      "strength": 7.5
-    },
-    {
-      "code": "E00016",
-      "strength": 10.0
-    },
-    {
-      "code": "E00017",
-      "strength": 12.5
-    },
-    {
-      "code": "E00018",
-      "strength": 15.0
-    },
-    {
-      "code": "E00019",
-      "strength": 17.5
-    },
-    {
-      "code": "E00020",
-      "strength": 20.0
-    },
-    {
-      "code": "E00021",
-      "strength": 5.0
-    },
-    {
-      "code": "E00022",
-      "strength": 7.5
-    },
-    {
-      "code": "E00023",
-      "strength": 10.0
-    },
-    {
-      "code": "E00024",
-      "strength": 12.5
-    },
-    {
-      "code": "E00025",
-      "strength": 15.0
-    },
-    {
-      "code": "E00026",
-      "strength": 17.5
-    },
-    {
-      "code": "E00027",
-      "strength": 20.0
-    },
-    {
-      "code": "E00028",
-      "strength": 5.0
-    },
-    {
-      "code": "E00029",
-      "strength": 7.5
-    },
-    {
-      "code": "E00030",
-      "strength": 10.0
-    },
-    {
-      "code": "E00031",
-      "strength": 12.5
-    },
-    {
-      "code": "E00032",
-      "strength": 15.0
-    },
-    {
-      "code": "E00033",
-      "strength": 17.5
-    },
-    {
-      "code": "E00034",
-      "strength": 20.0
-    },
-    {
-      "code": "E00035",
-      "strength": 5.0
-    },
-    {
-      "code": "E00036",
-      "strength": 7.5
-    },
-    {
-      "code": "E00037",
-      "strength": 10.0
-    },
-    {
-      "code": "E00038",
-      "strength": 12.5
-    },
-    {
-      "code": "E00039",
-      "strength": 15.0
-    },
-    {
-      "code": "E00040",
-      "strength": 17.5
-    }
-  ],
-  "covariatecodes": [
-    {
-      "covarnum": 1,
-      "covarname": "cov_01",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00001",
-        "X00002",
-        "X00003",
-        "X00004",
-        "X00005",
-        "X00006",
-        "X00007",
-        "X00008",
-        "X00009",
-        "X00010",
-        "X00011",
-        "X00012",
-        "X00013",
-        "X00014",
-        "X00015",
-        "X00016",
-        "X00017",
-        "X00018",
-        "X00019",
-        "X00020",
-        "X00021",
-        "X00022",
-        "X00023",
-        "X00024",
-        "X00025",
-        "X00026",
-        "X00027",
-        "X00028",
-        "X00029",
-        "X00030",
-        "X00031",
-        "X00032",
-        "X00033",
-        "X00034",
-        "X00035",
-        "X00036",
-        "X00037",
-        "X00038",
-        "X00039",
-        "X00040"
-      ]
-    },
-    {
-      "covarnum": 2,
-      "covarname": "cov_02",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00041",
-        "X00042",
-        "X00043",
-        "X00044",
-        "X00045",
-        "X00046",
-        "X00047",
-        "X00048",
-        "X00049",
-        "X00050",
-        "X00051",
-        "X00052",
-        "X00053",
-        "X00054",
-        "X00055",
-        "X00056",
-        "X00057",
-        "X00058",
-        "X00059",
-        "X00060",
-        "X00061",
-        "X00062",
-        "X00063",
-        "X00064",
-        "X00065",
-        "X00066",
-        "X00067",
-        "X00068",
-        "X00069",
-        "X00070",
-        "X00071",
-        "X00072",
-        "X00073",
-        "X00074",
-        "X00075",
-        "X00076",
-        "X00077",
-        "X00078",
-        "X00079",
-        "X00080"
-      ]
-    },
-    {
-      "covarnum": 3,
-      "covarname": "cov_03",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00081",
-        "X00082",
-        "X00083",
-        "X00084",
-        "X00085",
-        "X00086",
-        "X00087",
-        "X00088",
-        "X00089",
-        "X00090",
-        "X00091",
-        "X00092",
-        "X00093",
-        "X00094",
-        "X00095",
-        "X00096",
-        "X00097",
-        "X00098",
-        "X00099",
-        "X00100",
-        "X00101",
-        "X00102",
-        "X00103",
-        "X00104",
-        "X00105",
-        "X00106",
-        "X00107",
-        "X00108",
-        "X00109",
-        "X00110",
-        "X00111",
-        "X00112",
-        "X00113",
-        "X00114",
-        "X00115",
-        "X00116",
-        "X00117",
-        "X00118",
-        "X00119",
-        "X00120"
-      ]
-    },
-    {
-      "covarnum": 4,
-      "covarname": "cov_04",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00121",
-        "X00122",
-        "X00123",
-        "X00124",
-        "X00125",
-        "X00126",
-        "X00127",
-        "X00128",
-        "X00129",
-        "X00130",
-        "X00131",
-        "X00132",
-        "X00133",
-        "X00134",
-        "X00135",
-        "X00136",
-        "X00137",
-        "X00138",
-        "X00139",
-        "X00140",
-        "X00141",
-        "X00142",
-        "X00143",
-        "X00144",
-        "X00145",
-        "X00146",
-        "X00147",
-        "X00148",
-        "X00149",
-        "X00150",
-        "X00151",
-        "X00152",
-        "X00153",
-        "X00154",
-        "X00155",
-        "X00156",
-        "X00157",
-        "X00158",
-        "X00159",
-        "X00160"
-      ]
-    },
-    {
-      "covarnum": 5,
-      "covarname": "cov_05",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00161",
-        "X00162",
-        "X00163",
-        "X00164",
-        "X00165",
-        "X00166",
-        "X00167",
-        "X00168",
-        "X00169",
-        "X00170",
-        "X00171",
-        "X00172",
-        "X00173",
-        "X00174",
-        "X00175",
-        "X00176",
-        "X00177",
-        "X00178",
-        "X00179",
-        "X00180",
-        "X00181",
-        "X00182",
-        "X00183",
-        "X00184",
-        "X00185",
-        "X00186",
-        "X00187",
-        "X00188",
-        "X00189",
-        "X00190",
-        "X00191",
-        "X00192",
-        "X00193",
-        "X00194",
-        "X00195",
-        "X00196",
-        "X00197",
-        "X00198",
-        "X00199",
-        "X00200"
-      ]
-    },
-    {
-      "covarnum": 6,
-      "covarname": "cov_06",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00201",
-        "X00202",
-        "X00203",
-        "X00204",
-        "X00205",
-        "X00206",
-        "X00207",
-        "X00208",
-        "X00209",
-        "X00210",
-        "X00211",
-        "X00212",
-        "X00213",
-        "X00214",
-        "X00215",
-        "X00216",
-        "X00217",
-        "X00218",
-        "X00219",
-        "X00220",
-        "X00221",
-        "X00222",
-        "X00223",
-        "X00224",
-        "X00225",
-        "X00226",
-        "X00227",
-        "X00228",
-        "X00229",
-        "X00230",
-        "X00231",
-        "X00232",
-        "X00233",
-        "X00234",
-        "X00235",
-        "X00236",
-        "X00237",
-        "X00238",
-        "X00239",
-        "X00240"
-      ]
-    },
-    {
-      "covarnum": 7,
-      "covarname": "cov_07",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00241",
-        "X00242",
-        "X00243",
-        "X00244",
-        "X00245",
-        "X00246",
-        "X00247",
-        "X00248",
-        "X00249",
-        "X00250",
-        "X00251",
-        "X00252",
-        "X00253",
-        "X00254",
-        "X00255",
-        "X00256",
-        "X00257",
-        "X00258",
-        "X00259",
-        "X00260",
-        "X00261",
-        "X00262",
-        "X00263",
-        "X00264",
-        "X00265",
-        "X00266",
-        "X00267",
-        "X00268",
-        "X00269",
-        "X00270",
-        "X00271",
-        "X00272",
-        "X00273",
-        "X00274",
-        "X00275",
-        "X00276",
-        "X00277",
-        "X00278",
-        "X00279",
-        "X00280"
-      ]
-    },
-    {
-      "covarnum": 8,
-      "covarname": "cov_08",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00281",
-        "X00282",
-        "X00283",
-        "X00284",
-        "X00285",
-        "X00286",
-        "X00287",
-        "X00288",
-        "X00289",
-        "X00290",
-        "X00291",
-        "X00292",
-        "X00293",
-        "X00294",
-        "X00295",
-        "X00296",
-        "X00297",
-        "X00298",
-        "X00299",
-        "X00300",
-        "X00301",
-        "X00302",
-        "X00303",
-        "X00304",
-        "X00305",
-        "X00306",
-        "X00307",
-        "X00308",
-        "X00309",
-        "X00310",
-        "X00311",
-        "X00312",
-        "X00313",
-        "X00314",
-        "X00315",
-        "X00316",
-        "X00317",
-        "X00318",
-        "X00319",
-        "X00320"
-      ]
-    },
-    {
-      "covarnum": 9,
-      "covarname": "cov_09",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00321",
-        "X00322",
-        "X00323",
-        "X00324",
-        "X00325",
-        "X00326",
-        "X00327",
-        "X00328",
-        "X00329",
-        "X00330",
-        "X00331",
-        "X00332",
-        "X00333",
-        "X00334",
-        "X00335",
-        "X00336",
-        "X00337",
-        "X00338",
-        "X00339",
-        "X00340",
-        "X00341",
-        "X00342",
-        "X00343",
-        "X00344",
-        "X00345",
-        "X00346",
-        "X00347",
-        "X00348",
-        "X00349",
-        "X00350",
-        "X00351",
-        "X00352",
-        "X00353",
-        "X00354",
-        "X00355",
-        "X00356",
-        "X00357",
-        "X00358",
-        "X00359",
-        "X00360"
-      ]
-    },
-    {
-      "covarnum": 10,
-      "covarname": "cov_10",
-      "codecat": "DX",
-      "covfrom": -365,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00361",
-        "X00362",
-        "X00363",
-        "X00364",
-        "X00365",
-        "X00366",
-        "X00367",
-        "X00368",
-        "X00369",
-        "X00370",
-        "X00371",
-        "X00372",
-        "X00373",
-        "X00374",
-        "X00375",
-        "X00376",
-        "X00377",
-        "X00378",
-        "X00379",
-        "X00380",
-        "X00381",
-        "X00382",
-        "X00383",
-        "X00384",
-        "X00385",
-        "X00386",
-        "X00387",
-        "X00388",
-        "X00389",
-        "X00390",
-        "X00391",
-        "X00392",
-        "X00393",
-        "X00394",
-        "X00395",
-        "X00396",
-        "X00397",
-        "X00398",
-        "X00399",
-        "X00400"
-      ]
-    },
-    {
-      "covarnum": 11,
-      "covarname": "any_study_drug_prior",
-      "codecat": "RX",
-      "covfrom": -183,
-      "covto": -1,
-      "dateonly": "N",
-      "codes": [
-        "N00001",
-        "N00002",
-        "N00003",
-        "N00004",
-        "N00005",
-        "N00006",
-        "N00007",
-        "N00008",
-        "N00009",
-        "N00010",
-        "N00011",
-        "N00012",
-        "N00013",
-        "N00014",
-        "N00015",
-        "N00016",
-        "N00017",
-        "N00018",
-        "N00019",
-        "N00020",
-        "N00021",
-        "N00022",
-        "N00023",
-        "N00024",
-        "N00025",
-        "N00026",
-        "N00027",
-        "N00028",
-        "N00029",
-        "N00030",
-        "N00031",
-        "N00032",
-        "N00033",
-        "N00034",
-        "N00035",
-        "N00036",
-        "N00037",
-        "N00038",
-        "N00039",
-        "N00040",
-        "N00041",
-        "N00042",
-        "N00043",
-        "N00044",
-        "N00045",
-        "N00046",
-        "N00047",
-        "N00048",
-        "N00049",
-        "N00050",
-        "N00051",
-        "N00052",
-        "N00053",
-        "N00054",
-        "N00055",
-        "N00056",
-        "N00057",
-        "N00058",
-        "N00059"
-      ]
-    },
-    {
-      "covarnum": 12,
-      "covarname": "recent_dx_30d",
-      "codecat": "DX",
-      "covfrom": -30,
-      "covto": -1,
-      "dateonly": "Y",
-      "codes": [
-        "X00400",
-        "X00401",
-        "X00402",
-        "X00403",
-        "X00404",
-        "X00405",
-        "X00406",
-        "X00407",
-        "X00408",
-        "X00409",
-        "X00410",
-        "X00411",
-        "X00412",
-        "X00413",
-        "X00414",
-        "X00415",
-        "X00416",
-        "X00417",
-        "X00418",
-        "X00419",
-        "X00420",
-        "X00421",
-        "X00422",
-        "X00423",
-        "X00424",
-        "X00425",
-        "X00426",
-        "X00427",
-        "X00428",
-        "X00429",
-        "X00430",
-        "X00431",
-        "X00432",
-        "X00433",
-        "X00434",
-        "X00435",
-        "X00436",
-        "X00437",
-        "X00438",
-        "X00439",
-        "X00440",
-        "X00441",
-        "X00442",
-        "X00443",
-        "X00444",
-        "X00445",
-        "X00446",
-        "X00447",
-        "X00448",
-        "X00449",
-        "X00450",
-        "X00451",
-        "X00452",
-        "X00453",
-        "X00454",
-        "X00455",
-        "X00456",
-        "X00457",
-        "X00458",
-        "X00459",
-        "X00460",
-        "X00461",
-        "X00462",
-        "X00463",
-        "X00464",
-        "X00465",
-        "X00466",
-        "X00467",
-        "X00468",
-        "X00469",
-        "X00470",
-        "X00471",
-        "X00472",
-        "X00473",
-        "X00474",
-        "X00475",
-        "X00476",
-        "X00477",
-        "X00478",
-        "X00479",
-        "X00480",
-        "X00481",
-        "X00482",
-        "X00483",
-        "X00484",
-        "X00485",
-        "X00486",
-        "X00487",
-        "X00488",
-        "X00489",
-        "X00490",
-        "X00491",
-        "X00492",
-        "X00493",
-        "X00494",
-        "X00495",
-        "X00496",
-        "X00497",
-        "X00498",
-        "X00499"
-      ]
-    }
-  ]
+ "qrp_parameters": [
+  {
+   "type": 2,
+   "runid": "demo_full",
+   "startdate": "2011-01-01",
+   "enddate": "2015-06-30",
+   "censordate": "2015-06-30"
+  }
+ ],
+ "cohortfile": [
+  {
+   "cohortgrp": "lisinopril",
+   "enrollmentnum": 1,
+   "coverage": "MD",
+   "enrolgap": 45,
+   "chartres": "N",
+   "enrdays": 183,
+   "agestrat": "18-44 45-64 65-74 75+",
+   "reqdaysaftind": 0
+  },
+  {
+   "cohortgrp": "beta_blocker",
+   "enrollmentnum": 1,
+   "coverage": "MD",
+   "enrolgap": 45,
+   "chartres": "N",
+   "enrdays": 183,
+   "agestrat": "18-44 45-64 65-74 75+",
+   "reqdaysaftind": 0
+  }
+ ],
+ "type2file": [
+  {
+   "group": "lisinopril",
+   "t2washper": 183,
+   "point": "N",
+   "episodegap": 15,
+   "episodegaptype": "F",
+   "expextper": 0,
+   "minepisdur": 1,
+   "maxepisdur": 365,
+   "t2fupwashper": 183,
+   "eventcount": 1,
+   "censor_dth": "Y",
+   "t2atriskstart": 0,
+   "blackoutper": 0,
+   "reqdaysaftepi": 0,
+   "t2cumdoseper": 180,
+   "maxcfdd": 40.0,
+   "maxcumdose": 5000.0
+  },
+  {
+   "group": "beta_blocker",
+   "t2washper": 183,
+   "point": "N",
+   "episodegap": 30,
+   "episodegaptype": "F",
+   "expextper": 0,
+   "minepisdur": 1,
+   "maxepisdur": 365,
+   "t2fupwashper": 183,
+   "eventcount": 1,
+   "censor_dth": "Y",
+   "t2atriskstart": 0,
+   "blackoutper": 0,
+   "reqdaysaftepi": 0
+  }
+ ],
+ "cohortcodes": [
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00001",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00002",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00003",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00004",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00005",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00006",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00007",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00008",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00009",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00010",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00011",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00012",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00013",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00014",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00015",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00016",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00017",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00018",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00019",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00020",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00001",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00002",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00003",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00004",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00005",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00006",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00007",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00008",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00009",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00010",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00011",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00012",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00013",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00014",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00015",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00016",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00017",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00018",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00019",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00020",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00021",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00022",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00023",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00024",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00025",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00026",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00027",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00028",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00029",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00030",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00031",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00032",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00033",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00034",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00035",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00036",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00037",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00038",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00039",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00040",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00001",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00002",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00003",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00004",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00005",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00006",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00007",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00008",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00009",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00010",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00011",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00012",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00013",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00014",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00015",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00016",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00017",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00018",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00019",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00020",
+   "codecat": "DX"
+  }
+ ],
+ "codestrength": [
+  {
+   "code": "E00001",
+   "strength": 7.5
+  },
+  {
+   "code": "E00002",
+   "strength": 10.0
+  },
+  {
+   "code": "E00003",
+   "strength": 12.5
+  },
+  {
+   "code": "E00004",
+   "strength": 15.0
+  },
+  {
+   "code": "E00005",
+   "strength": 17.5
+  },
+  {
+   "code": "E00006",
+   "strength": 20.0
+  },
+  {
+   "code": "E00007",
+   "strength": 5.0
+  },
+  {
+   "code": "E00008",
+   "strength": 7.5
+  },
+  {
+   "code": "E00009",
+   "strength": 10.0
+  },
+  {
+   "code": "E00010",
+   "strength": 12.5
+  },
+  {
+   "code": "E00011",
+   "strength": 15.0
+  },
+  {
+   "code": "E00012",
+   "strength": 17.5
+  },
+  {
+   "code": "E00013",
+   "strength": 20.0
+  },
+  {
+   "code": "E00014",
+   "strength": 5.0
+  },
+  {
+   "code": "E00015",
+   "strength": 7.5
+  },
+  {
+   "code": "E00016",
+   "strength": 10.0
+  },
+  {
+   "code": "E00017",
+   "strength": 12.5
+  },
+  {
+   "code": "E00018",
+   "strength": 15.0
+  },
+  {
+   "code": "E00019",
+   "strength": 17.5
+  },
+  {
+   "code": "E00020",
+   "strength": 20.0
+  },
+  {
+   "code": "E00021",
+   "strength": 5.0
+  },
+  {
+   "code": "E00022",
+   "strength": 7.5
+  },
+  {
+   "code": "E00023",
+   "strength": 10.0
+  },
+  {
+   "code": "E00024",
+   "strength": 12.5
+  },
+  {
+   "code": "E00025",
+   "strength": 15.0
+  },
+  {
+   "code": "E00026",
+   "strength": 17.5
+  },
+  {
+   "code": "E00027",
+   "strength": 20.0
+  },
+  {
+   "code": "E00028",
+   "strength": 5.0
+  },
+  {
+   "code": "E00029",
+   "strength": 7.5
+  },
+  {
+   "code": "E00030",
+   "strength": 10.0
+  },
+  {
+   "code": "E00031",
+   "strength": 12.5
+  },
+  {
+   "code": "E00032",
+   "strength": 15.0
+  },
+  {
+   "code": "E00033",
+   "strength": 17.5
+  },
+  {
+   "code": "E00034",
+   "strength": 20.0
+  },
+  {
+   "code": "E00035",
+   "strength": 5.0
+  },
+  {
+   "code": "E00036",
+   "strength": 7.5
+  },
+  {
+   "code": "E00037",
+   "strength": 10.0
+  },
+  {
+   "code": "E00038",
+   "strength": 12.5
+  },
+  {
+   "code": "E00039",
+   "strength": 15.0
+  },
+  {
+   "code": "E00040",
+   "strength": 17.5
+  }
+ ],
+ "covariatecodes": [
+  {
+   "covarnum": 1,
+   "covarname": "cov_01",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00001",
+    "X00002",
+    "X00003",
+    "X00004",
+    "X00005",
+    "X00006",
+    "X00007",
+    "X00008",
+    "X00009",
+    "X00010",
+    "X00011",
+    "X00012",
+    "X00013",
+    "X00014",
+    "X00015",
+    "X00016",
+    "X00017",
+    "X00018",
+    "X00019",
+    "X00020",
+    "X00021",
+    "X00022",
+    "X00023",
+    "X00024",
+    "X00025",
+    "X00026",
+    "X00027",
+    "X00028",
+    "X00029",
+    "X00030",
+    "X00031",
+    "X00032",
+    "X00033",
+    "X00034",
+    "X00035",
+    "X00036",
+    "X00037",
+    "X00038",
+    "X00039",
+    "X00040"
+   ]
+  },
+  {
+   "covarnum": 2,
+   "covarname": "cov_02",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00041",
+    "X00042",
+    "X00043",
+    "X00044",
+    "X00045",
+    "X00046",
+    "X00047",
+    "X00048",
+    "X00049",
+    "X00050",
+    "X00051",
+    "X00052",
+    "X00053",
+    "X00054",
+    "X00055",
+    "X00056",
+    "X00057",
+    "X00058",
+    "X00059",
+    "X00060",
+    "X00061",
+    "X00062",
+    "X00063",
+    "X00064",
+    "X00065",
+    "X00066",
+    "X00067",
+    "X00068",
+    "X00069",
+    "X00070",
+    "X00071",
+    "X00072",
+    "X00073",
+    "X00074",
+    "X00075",
+    "X00076",
+    "X00077",
+    "X00078",
+    "X00079",
+    "X00080"
+   ]
+  },
+  {
+   "covarnum": 3,
+   "covarname": "cov_03",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00081",
+    "X00082",
+    "X00083",
+    "X00084",
+    "X00085",
+    "X00086",
+    "X00087",
+    "X00088",
+    "X00089",
+    "X00090",
+    "X00091",
+    "X00092",
+    "X00093",
+    "X00094",
+    "X00095",
+    "X00096",
+    "X00097",
+    "X00098",
+    "X00099",
+    "X00100",
+    "X00101",
+    "X00102",
+    "X00103",
+    "X00104",
+    "X00105",
+    "X00106",
+    "X00107",
+    "X00108",
+    "X00109",
+    "X00110",
+    "X00111",
+    "X00112",
+    "X00113",
+    "X00114",
+    "X00115",
+    "X00116",
+    "X00117",
+    "X00118",
+    "X00119",
+    "X00120"
+   ]
+  },
+  {
+   "covarnum": 4,
+   "covarname": "cov_04",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00121",
+    "X00122",
+    "X00123",
+    "X00124",
+    "X00125",
+    "X00126",
+    "X00127",
+    "X00128",
+    "X00129",
+    "X00130",
+    "X00131",
+    "X00132",
+    "X00133",
+    "X00134",
+    "X00135",
+    "X00136",
+    "X00137",
+    "X00138",
+    "X00139",
+    "X00140",
+    "X00141",
+    "X00142",
+    "X00143",
+    "X00144",
+    "X00145",
+    "X00146",
+    "X00147",
+    "X00148",
+    "X00149",
+    "X00150",
+    "X00151",
+    "X00152",
+    "X00153",
+    "X00154",
+    "X00155",
+    "X00156",
+    "X00157",
+    "X00158",
+    "X00159",
+    "X00160"
+   ]
+  },
+  {
+   "covarnum": 5,
+   "covarname": "cov_05",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00161",
+    "X00162",
+    "X00163",
+    "X00164",
+    "X00165",
+    "X00166",
+    "X00167",
+    "X00168",
+    "X00169",
+    "X00170",
+    "X00171",
+    "X00172",
+    "X00173",
+    "X00174",
+    "X00175",
+    "X00176",
+    "X00177",
+    "X00178",
+    "X00179",
+    "X00180",
+    "X00181",
+    "X00182",
+    "X00183",
+    "X00184",
+    "X00185",
+    "X00186",
+    "X00187",
+    "X00188",
+    "X00189",
+    "X00190",
+    "X00191",
+    "X00192",
+    "X00193",
+    "X00194",
+    "X00195",
+    "X00196",
+    "X00197",
+    "X00198",
+    "X00199",
+    "X00200"
+   ]
+  },
+  {
+   "covarnum": 6,
+   "covarname": "cov_06",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00201",
+    "X00202",
+    "X00203",
+    "X00204",
+    "X00205",
+    "X00206",
+    "X00207",
+    "X00208",
+    "X00209",
+    "X00210",
+    "X00211",
+    "X00212",
+    "X00213",
+    "X00214",
+    "X00215",
+    "X00216",
+    "X00217",
+    "X00218",
+    "X00219",
+    "X00220",
+    "X00221",
+    "X00222",
+    "X00223",
+    "X00224",
+    "X00225",
+    "X00226",
+    "X00227",
+    "X00228",
+    "X00229",
+    "X00230",
+    "X00231",
+    "X00232",
+    "X00233",
+    "X00234",
+    "X00235",
+    "X00236",
+    "X00237",
+    "X00238",
+    "X00239",
+    "X00240"
+   ]
+  },
+  {
+   "covarnum": 7,
+   "covarname": "cov_07",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00241",
+    "X00242",
+    "X00243",
+    "X00244",
+    "X00245",
+    "X00246",
+    "X00247",
+    "X00248",
+    "X00249",
+    "X00250",
+    "X00251",
+    "X00252",
+    "X00253",
+    "X00254",
+    "X00255",
+    "X00256",
+    "X00257",
+    "X00258",
+    "X00259",
+    "X00260",
+    "X00261",
+    "X00262",
+    "X00263",
+    "X00264",
+    "X00265",
+    "X00266",
+    "X00267",
+    "X00268",
+    "X00269",
+    "X00270",
+    "X00271",
+    "X00272",
+    "X00273",
+    "X00274",
+    "X00275",
+    "X00276",
+    "X00277",
+    "X00278",
+    "X00279",
+    "X00280"
+   ]
+  },
+  {
+   "covarnum": 8,
+   "covarname": "cov_08",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00281",
+    "X00282",
+    "X00283",
+    "X00284",
+    "X00285",
+    "X00286",
+    "X00287",
+    "X00288",
+    "X00289",
+    "X00290",
+    "X00291",
+    "X00292",
+    "X00293",
+    "X00294",
+    "X00295",
+    "X00296",
+    "X00297",
+    "X00298",
+    "X00299",
+    "X00300",
+    "X00301",
+    "X00302",
+    "X00303",
+    "X00304",
+    "X00305",
+    "X00306",
+    "X00307",
+    "X00308",
+    "X00309",
+    "X00310",
+    "X00311",
+    "X00312",
+    "X00313",
+    "X00314",
+    "X00315",
+    "X00316",
+    "X00317",
+    "X00318",
+    "X00319",
+    "X00320"
+   ]
+  },
+  {
+   "covarnum": 9,
+   "covarname": "cov_09",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00321",
+    "X00322",
+    "X00323",
+    "X00324",
+    "X00325",
+    "X00326",
+    "X00327",
+    "X00328",
+    "X00329",
+    "X00330",
+    "X00331",
+    "X00332",
+    "X00333",
+    "X00334",
+    "X00335",
+    "X00336",
+    "X00337",
+    "X00338",
+    "X00339",
+    "X00340",
+    "X00341",
+    "X00342",
+    "X00343",
+    "X00344",
+    "X00345",
+    "X00346",
+    "X00347",
+    "X00348",
+    "X00349",
+    "X00350",
+    "X00351",
+    "X00352",
+    "X00353",
+    "X00354",
+    "X00355",
+    "X00356",
+    "X00357",
+    "X00358",
+    "X00359",
+    "X00360"
+   ]
+  },
+  {
+   "covarnum": 10,
+   "covarname": "cov_10",
+   "codecat": "DX",
+   "covfrom": -365,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00361",
+    "X00362",
+    "X00363",
+    "X00364",
+    "X00365",
+    "X00366",
+    "X00367",
+    "X00368",
+    "X00369",
+    "X00370",
+    "X00371",
+    "X00372",
+    "X00373",
+    "X00374",
+    "X00375",
+    "X00376",
+    "X00377",
+    "X00378",
+    "X00379",
+    "X00380",
+    "X00381",
+    "X00382",
+    "X00383",
+    "X00384",
+    "X00385",
+    "X00386",
+    "X00387",
+    "X00388",
+    "X00389",
+    "X00390",
+    "X00391",
+    "X00392",
+    "X00393",
+    "X00394",
+    "X00395",
+    "X00396",
+    "X00397",
+    "X00398",
+    "X00399",
+    "X00400"
+   ]
+  },
+  {
+   "covarnum": 11,
+   "covarname": "any_study_drug_prior",
+   "codecat": "RX",
+   "covfrom": -183,
+   "covto": -1,
+   "dateonly": "N",
+   "codes": [
+    "N00001",
+    "N00002",
+    "N00003",
+    "N00004",
+    "N00005",
+    "N00006",
+    "N00007",
+    "N00008",
+    "N00009",
+    "N00010",
+    "N00011",
+    "N00012",
+    "N00013",
+    "N00014",
+    "N00015",
+    "N00016",
+    "N00017",
+    "N00018",
+    "N00019",
+    "N00020",
+    "N00021",
+    "N00022",
+    "N00023",
+    "N00024",
+    "N00025",
+    "N00026",
+    "N00027",
+    "N00028",
+    "N00029",
+    "N00030",
+    "N00031",
+    "N00032",
+    "N00033",
+    "N00034",
+    "N00035",
+    "N00036",
+    "N00037",
+    "N00038",
+    "N00039",
+    "N00040",
+    "N00041",
+    "N00042",
+    "N00043",
+    "N00044",
+    "N00045",
+    "N00046",
+    "N00047",
+    "N00048",
+    "N00049",
+    "N00050",
+    "N00051",
+    "N00052",
+    "N00053",
+    "N00054",
+    "N00055",
+    "N00056",
+    "N00057",
+    "N00058",
+    "N00059"
+   ]
+  },
+  {
+   "covarnum": 12,
+   "covarname": "recent_dx_30d",
+   "codecat": "DX",
+   "covfrom": -30,
+   "covto": -1,
+   "dateonly": "Y",
+   "codes": [
+    "X00400",
+    "X00401",
+    "X00402",
+    "X00403",
+    "X00404",
+    "X00405",
+    "X00406",
+    "X00407",
+    "X00408",
+    "X00409",
+    "X00410",
+    "X00411",
+    "X00412",
+    "X00413",
+    "X00414",
+    "X00415",
+    "X00416",
+    "X00417",
+    "X00418",
+    "X00419",
+    "X00420",
+    "X00421",
+    "X00422",
+    "X00423",
+    "X00424",
+    "X00425",
+    "X00426",
+    "X00427",
+    "X00428",
+    "X00429",
+    "X00430",
+    "X00431",
+    "X00432",
+    "X00433",
+    "X00434",
+    "X00435",
+    "X00436",
+    "X00437",
+    "X00438",
+    "X00439",
+    "X00440",
+    "X00441",
+    "X00442",
+    "X00443",
+    "X00444",
+    "X00445",
+    "X00446",
+    "X00447",
+    "X00448",
+    "X00449",
+    "X00450",
+    "X00451",
+    "X00452",
+    "X00453",
+    "X00454",
+    "X00455",
+    "X00456",
+    "X00457",
+    "X00458",
+    "X00459",
+    "X00460",
+    "X00461",
+    "X00462",
+    "X00463",
+    "X00464",
+    "X00465",
+    "X00466",
+    "X00467",
+    "X00468",
+    "X00469",
+    "X00470",
+    "X00471",
+    "X00472",
+    "X00473",
+    "X00474",
+    "X00475",
+    "X00476",
+    "X00477",
+    "X00478",
+    "X00479",
+    "X00480",
+    "X00481",
+    "X00482",
+    "X00483",
+    "X00484",
+    "X00485",
+    "X00486",
+    "X00487",
+    "X00488",
+    "X00489",
+    "X00490",
+    "X00491",
+    "X00492",
+    "X00493",
+    "X00494",
+    "X00495",
+    "X00496",
+    "X00497",
+    "X00498",
+    "X00499"
+   ]
+  }
+ ]
 }

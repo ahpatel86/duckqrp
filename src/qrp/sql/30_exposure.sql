@@ -49,7 +49,10 @@ SELECT
     d.patid,
     d.adate,
     d.code,
-    d.rxsup,
+    -- CODESUPPLY overrides the claim's own RxSup when the study sets
+    -- it (ms_createmicohorts.sas:571). It was parsed, validated against
+    -- the CFDD limits, and never applied.
+    COALESCE(k.code_supply, d.rxsup) AS rxsup,
     d.rxamt
 FROM cdm_dispensing d
 JOIN cfg_codes k
@@ -62,7 +65,12 @@ UNION ALL
 
 SELECT
     k.cohortgrp, k.stockgroup, x.patid, x.adate, x.code,
-    1                AS rxsup,
+    -- A procedure has no days-supply of its own, which is exactly why
+    -- CODESUPPLY exists: all 150 PX exposure codes in the real study
+    -- file carry it. The hardcoded 1 was right only because every one
+    -- of them happens to be 1 — a study specifying 30 got 1-day
+    -- episodes.
+    COALESCE(k.code_supply, 1) AS rxsup,
     NULL::DOUBLE     AS rxamt
 FROM cdm_procedure x
 JOIN cfg_codes k
@@ -75,7 +83,7 @@ UNION ALL
 
 SELECT
     k.cohortgrp, k.stockgroup, x.patid, x.adate, x.code,
-    1                AS rxsup,
+    COALESCE(k.code_supply, 1) AS rxsup,
     NULL::DOUBLE     AS rxamt
 FROM cdm_diagnosis x
 JOIN cfg_codes k
@@ -180,26 +188,55 @@ SELECT
     cohortgrp,
     patid,
     adate,
-    code
+    code,
+    codetype
 FROM (
     SELECT
         k.cohortgrp,
         x.patid,
         x.adate,
         x.code,
+        -- codetype is part of SAS's eventcount=1 key
+        -- (PatId, Adate, codecat, codetype, code). Dropping it
+        -- collapsed an ICD-9 and an ICD-10 claim carrying the same code
+        -- on the same day into one event. There are 26 such pairs in
+        -- the real extract, so this is not hypothetical. Reported in
+        -- review.
+        x.codetype,
         c.event_count,
         row_number() OVER (
             PARTITION BY k.cohortgrp, x.patid, x.adate,
                          -- key widens with eventcount: by code for 1,
                          -- by nothing more for 2, and 0 never dedups.
                          CASE WHEN c.event_count = 2 THEN NULL
-                              ELSE x.code END
+                              ELSE x.code END,
+                         CASE WHEN c.event_count = 2 THEN NULL
+                              ELSE x.codetype END
             ORDER BY x.code
         ) AS rn
-    FROM cdm_diagnosis x
+    -- Events come from the code's OWN domain, not from diagnosis alone.
+    -- SAS sets _FUPEvent from _ITDrugs (RX), _ITMeds (DX and PX),
+    -- _ITLabs, _itenc and _itDth (ms_cidanum.sas:1663-1672), so an
+    -- outcome defined by a dispensing or a procedure is legitimate.
+    -- Reading cdm_diagnosis only meant such an outcome NEVER fired —
+    -- the same defect the exposure extraction had. Reported in review.
+    FROM (
+        SELECT patid, adate, code, codetype, enctype,
+               COALESCE(pdx, '') AS pdx, 'DX' AS codecat
+        FROM cdm_diagnosis
+        UNION ALL
+        SELECT patid, adate, code, codetype, enctype, '' AS pdx,
+               'PX' AS codecat
+        FROM cdm_procedure
+        UNION ALL
+        SELECT patid, adate, code, NULL AS codetype, '**' AS enctype,
+               '' AS pdx, 'RX' AS codecat
+        FROM cdm_dispensing
+    ) x
     JOIN cfg_codes k
-      ON k.code = x.code
-     AND k.role = 'EVENT'
+      ON k.code    = x.code
+     AND k.role    = 'EVENT'
+     AND k.codecat = x.codecat
     JOIN cfg_cohort c
       ON c.cohortgrp = k.cohortgrp
     JOIN cfg_care_setting cs

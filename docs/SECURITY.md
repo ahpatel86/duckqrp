@@ -181,3 +181,21 @@ python -m qrp run --study s.json --indata /data/scdm \
 * Put `--temp-dir` on encrypted storage under the same controls as the
   source data.
 * Leave `allow_extension_download` at its default.
+
+---
+
+## `qrp show --where` accepts raw SQL, by design
+
+Elsewhere this package is strict that no study-supplied text reaches a
+query: combo covariate expressions are parsed to a template, `run_id`
+is sanitised before it touches a path, and category levels are escaped
+before becoming literals.
+
+`--where` is the deliberate exception. It is a local analyst CLI reading
+parquet the caller already has on disk, so a restricted filter language
+would be a worse tool and no privilege boundary is crossed.
+
+**The caveat that matters:** if `show` is ever exposed over a network —
+`qrp serve`, or an HTTP API — this parameter must not be passed through
+unchanged. Reported in review, and recorded here so the exception is a
+decision rather than an oversight.

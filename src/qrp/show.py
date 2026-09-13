@@ -104,6 +104,12 @@ def show(out: str | Path, table: str | None = None, limit: int = 50,
 
     con = duckdb.connect()
     try:
+        # `--where` is RAW SQL, deliberately: a local analyst CLI
+        # reading parquet the caller already has on disk. It is the one
+        # place the "no supplied text reaches SQL" rule does not apply.
+        # If show is ever exposed over a network (qrp serve, an API),
+        # this must NOT be passed through unchanged. See
+        # docs/SECURITY.md.
         clause = f"WHERE {where}" if where else ""
         total = con.execute(
             f"SELECT count(*) FROM read_parquet('{src}') {clause}"

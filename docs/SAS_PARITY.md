@@ -1067,3 +1067,111 @@ warns rather than silently treating it as an index-date anchor — but the
 *reason* given was fiction, and a reader deciding whether the gap
 mattered to them would have been misled about which study designs it
 affects.
+
+
+---
+
+## Second review — findings and outcomes
+
+Twelve items. **One was incorrect, five were real correctness bugs**,
+and the rest were cleanups. Each was verified before acting, which
+mattered: the incorrect one would have made a working function worse.
+
+### Not a bug
+
+**`Engine.shape()` returns bytes as rows.** It does not.
+`duckdb_tables().estimated_size` IS the row count — verified on a wide
+table with 400 bytes of padding per row, where rows and bytes differ by
+~400x, and it tracked rows exactly. The suggested test was added anyway,
+because nothing pinned the semantic and the claim could not be checked
+from the code alone.
+
+### Real bugs, all of one kind
+
+Every one had the same shape: **the config layer promises a feature the
+SQL does not deliver.**
+
+| finding | effect |
+|---|---|
+| PX risk-score codes | join forced `codecat='DX'`, so PX codes searched the diagnosis table. Score 0 before, 5,510 after. |
+| risk-score care settings | `enctype`/`pdx` parsed into `RiskScoreCode` and never reached the SQL. A study restricting to inpatient got a score over every setting. |
+| `eventcount` key | missing `codetype`. **26 real pairs** in the extract where ICD-9 and ICD-10 share a code on one patient-day were collapsed into one event. |
+| EVENT / IOC domains | read `cdm_diagnosis` only. SAS sets `_FUPEvent` from `_ITDrugs` (RX), `_ITMeds` (DX and PX), `_ITLabs`, `_itenc`, `_itDth` — so a PX or RX **outcome could never fire**. |
+| path quoting | `/data/O'Brien/scdm` terminated the SQL string. Verified: DuckDB rejects it outright. |
+
+The EVENT/IOC one is the most serious: an outcome defined by a procedure
+or a dispensing produced a cohort reporting no events, with no error.
+Measured after the fix — DX 19, PX 192, RX 17 episodes with an event,
+where PX and RX were previously 0.
+
+### A fixture that was not exercising the real shape
+
+The EVENT fix surfaced it: `demo_full.json` omitted `codecat` on all 80
+cohort-code rows. Real input files **always** carry it — 0 of 1,124 rows
+omit it in the study file seen. The fixture has been corrected rather
+than the default relaxed; a fixture that cannot distinguish domains
+cannot test domain handling.
+
+### A near-miss
+
+The first care-setting test read `IP_` as a wildcard and the expected
+ordering came out backwards, which looked like a bug in the fix. `IP_`
+is "IP with MISSING pdx"; `IPA` is the wildcard. The code was right and
+the test was wrong — the correct ordering is 745 unrestricted >= 150
+IP-any >= 55 IP-principal >= 0 IP-missing.
+
+
+---
+
+## Sweep: config fields that never reach SQL
+
+The five real bugs in the second review were all one shape — **the
+config parses a field and the SQL never uses it**. Rather than wait for
+a third review to find the rest, every config field was checked against
+its consumer.
+
+**130 columns across 18 `cfg_*` tables are all genuinely referenced**
+as `<alias>.<column>` in SQL. Four dataclass fields came back
+unreferenced; two were false positives (`StratumLevel.table_id` and
+`InclusionRule.subcondlevel` are used inside `config.py` itself, which
+the scan excluded).
+
+### CODESUPPLY was the one real hit
+
+`CODESUPPLY` replaces the claim's own `RxSup`
+(`ms_createmicohorts.sas:571`: `if not missing(codesupply) then
+RxSup = CodeSupply`). It was parsed, validated against the CFDD limits,
+and **never applied**.
+
+It is per **CODE**, not per cohort. In the real study file 150 of 1,124
+rows carry it — all of them PX, because a procedure claim has no
+days-supply of its own.
+
+The PX exposure arm hardcoded `rxsup = 1`. That was correct **only
+because every one of those 150 values happens to be 1**. A study
+specifying 30 would have got 1-day episodes. Verified after the fix:
+mean episode length moves 50.9 -> 31.4 -> 89.8 days for CODESUPPLY of
+none / 30 / 90.
+
+Correct by coincidence is the failure mode worth naming here: the
+production study produced right answers, so no amount of running it
+would have surfaced this.
+
+### A second bug inside the first
+
+The CFDD conflict check read `supply_rows[0]` — collapsing a per-code
+value to one per cohort. A study where only the **third** code set
+CODESUPPLY passed validation silently; one where the first set it
+failed. Now checked across every exposure code.
+
+The test pins the last code specifically, since that is the case the
+old code missed.
+
+### A fixture assumption caught in passing
+
+The first version of that test asserted the conflict raises for any
+code. It does not: only `lisinopril` carries a CFDD limit in the
+fixture, so `beta_blocker` setting CODESUPPLY is legitimate. The test
+now targets the cohort with the limit and asserts the other is
+accepted — the assertion that would otherwise have been wrong in the
+permissive direction.

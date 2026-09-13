@@ -349,13 +349,15 @@ class CohortConfig:
     code_supply: int | None = None
     # (code, codecat) pairs. codecat is one of RX / PX / DX and decides
     # which claim domain the code is extracted from.
-    exposure_codes: tuple[tuple[str, str], ...] = ()
-    event_codes: tuple[tuple[str, str], ...] = ()
+    # (code, codecat, code_supply). code_supply overrides the claim's
+    # RxSup when set; None means use the claim's own value.
+    exposure_codes: tuple[tuple[str, str, int | None], ...] = ()
+    event_codes: tuple[tuple[str, str, int | None], ...] = ()
     # fupcriteria='IOC' codes: the follow-up washout is evaluated
     # against these as well as against the event codes
     # (ms_createmicohorts.sas:1685 -> _FUPWash, consumed by
     # _WashEventsInFupWash in ms_createpov56.sas).
-    ioc_codes: tuple[tuple[str, str], ...] = ()
+    ioc_codes: tuple[tuple[str, str, int | None], ...] = ()
     # (code, stockgroup) for DEF codes. SAS stockpiles WITHIN a
     # stockgroup (ms_stockpiling.sas passes GROUPING=StockGroup ...), so
     # two drugs in one cohort are pushed forward independently. Absent a
@@ -427,10 +429,19 @@ class CohortConfig:
                 f"<= wash_per ({self.wash_per}) excludes every index date: "
                 f"washout guarantees no prior claims in that window"
             )
-        if self.code_supply is not None and (
+        # Checked across ALL exposure codes, not just the first. This
+        # used to read `supply_rows[0]`, collapsing a per-CODE value to
+        # one per cohort: a study where only the third code set
+        # CODESUPPLY passed validation, and a study where only the first
+        # did failed it. CODESUPPLY is per code — 150 of 1,124 rows
+        # carry it in the real study file.
+        if any(sup is not None for _, _, sup in self.exposure_codes) and (
             self.min_cfdd is not None or self.max_cfdd is not None
         ):
-            errs.append("code_supply must be unset when CFDD limits are used")
+            errs.append(
+                "CODESUPPLY must be unset when CFDD limits are used: "
+                "CFDD is dose per day of supply, so overriding the "
+                "supply changes the quantity the limit is applied to")
         if self.coverage.upper() not in {"MD", "M", "D"}:
             errs.append(f"coverage must be MD, M or D (got {self.coverage!r})")
         if errs:
@@ -680,7 +691,7 @@ class StudyConfig:
                 if c.needs_dose
                 # exposure_codes is (code, codecat) pairs; dose applies
                 # to dispensings, so only RX codes need a strength.
-                for code, codecat in c.exposure_codes
+                for code, codecat, _supply in c.exposure_codes
                 if codecat == "RX" and code not in known
             }
             if missing:
@@ -1111,7 +1122,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
 
     # (code, codecat) pairs per role — codecat decides which claim
     # domain each code is extracted from.
-    codes_by_group: dict[str, dict[str, list[tuple[str, str]]]] = {}
+    codes_by_group: dict[str, dict[str, list[tuple[str, str, int | None]]]] = {}
     stock_by_group: dict[str, dict[str, str]] = {}
     care_by_group: dict[str, list[tuple[str, str, str]]] = {}
     for r in rows("cohortcodes"):
@@ -1137,7 +1148,13 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         else:
             key = "DEF" if crit == "DEF" else "EVENT"
         if r.get("code"):
-            bucket[key].append((str(r["code"]), codecat))
+            # CODESUPPLY overrides the claim's own RxSup
+            # (ms_createmicohorts.sas:571 — `if not missing(codesupply)
+            # then RxSup = CodeSupply`). It is per CODE, not per cohort:
+            # 150 of 1,124 rows carry it in the real study file, all of
+            # them PX, because a procedure claim has no days-supply.
+            bucket[key].append((str(r["code"]), codecat,
+                                _int(r.get("codesupply"), 0) or None))
             if key == "DEF":
                 stock_by_group.setdefault(str(g), {})[str(r["code"])] = (
                     str(r.get("stockgroup") or "").strip() or "_default"
@@ -1194,7 +1211,10 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
                 cum_dose_per=_int(t2.get("t2cumdoseper"), None),
                 min_cfdd=_float(t2.get("mincfdd")),
                 max_cfdd=_float(t2.get("maxcfdd")),
-                code_supply=supply_rows[0] if supply_rows else None,
+                # Kept for the signature/description only; the value
+                # that matters is carried per code on exposure_codes.
+                code_supply=next((v for v in supply_rows if v is not None),
+                                 None),
                 exposure_codes=tuple(codes.get("DEF", ())),
                 exposure_stockgroups=tuple(
                     sorted(stock_by_group.get(str(grp), {}).items())

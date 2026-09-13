@@ -3012,8 +3012,12 @@ def _ioc_study(ioc_codes):
     cc = [dict(r) for r in base["cohortcodes"]]
     for code in ioc_codes:
         for g in ("lisinopril", "beta_blocker"):
+            # codecat is required: IOC codes are read from the domain
+            # they name, and real input files always specify it (0 of
+            # 1,124 rows omit it in the study file seen).
             cc.append({"group": g, "indexcriteria": "", "fupcriteria": "IOC",
-                       "code": code, "caresettingprincipal": ""})
+                       "codecat": "DX", "code": code,
+                       "caresettingprincipal": ""})
     return load_study_dict({
         "qrp_parameters_scalars": {
             "type": 2, "runid": "ioc",
@@ -3038,11 +3042,14 @@ def test_ioc_codes_are_a_separate_role():
     # (code, codecat) pairs — codecat decides which claim domain each
     # code is read from, so a study can define exposure across RX, PX
     # and DX at once.
-    assert {code for code, _ in c.ioc_codes} == {"X00001", "X00002"}
-    assert not ({code for code, _ in c.ioc_codes}
-                & {code for code, _ in c.event_codes})
-    assert not ({code for code, _ in c.ioc_codes}
-                & {code for code, _ in c.exposure_codes})
+    # (code, codecat, code_supply) triples — codecat decides which claim
+    # domain the code is read from, code_supply overrides the claim's
+    # own RxSup when the study sets CODESUPPLY.
+    assert {code for code, _, _ in c.ioc_codes} == {"X00001", "X00002"}
+    assert not ({code for code, _, _ in c.ioc_codes}
+                & {code for code, _, _ in c.event_codes})
+    assert not ({code for code, _, _ in c.ioc_codes}
+                & {code for code, _, _ in c.exposure_codes})
     assert s.any_ioc
 
 
@@ -4884,3 +4891,385 @@ def test_baseline_is_squared():
         assert nulls == 0, f"{nulls} NULL cells; the table is not squared"
     finally:
         eng.close()
+
+
+# ---------------------------------------------------------------------
+# Second review
+# ---------------------------------------------------------------------
+
+
+def test_engine_shape_returns_rows_not_bytes():
+    """`duckdb_tables().estimated_size` is a ROW COUNT, not a byte size.
+
+    A review flagged this as reporting bytes. It does not — verified on
+    a wide table with 400 bytes of padding per row, where the two would
+    diverge by orders of magnitude. The test exists because nothing
+    pinned the semantics, so the claim could not be checked from the
+    code alone.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        eng.con.execute(
+            "CREATE OR REPLACE TABLE shape_narrow AS SELECT * FROM range(1234)")
+        assert eng.shape("shape_narrow") == (1234, 1)
+
+        # wide + padded: rows and bytes differ by ~400x here
+        eng.con.execute("""
+            CREATE OR REPLACE TABLE shape_wide AS
+            SELECT i, i*2 AS b, repeat('x', 200) AS pad
+            FROM range(5000) t(i)
+        """)
+        rows, cols = eng.shape("shape_wide")
+        assert (rows, cols) == (5000, 3), (rows, cols)
+
+        # a VIEW reports -1 rows: counting one would execute it
+        eng.con.execute(
+            "CREATE OR REPLACE VIEW shape_view AS SELECT * FROM shape_narrow")
+        assert eng.shape("shape_view")[0] == -1
+    finally:
+        eng.close()
+
+
+def _risk_codecat_study(codecat, code, csp=None):
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    row = {"riskscore": "T", "condid": "C1", "codecat": codecat,
+           "code": code, "weight": 5.0, "riskfrom": -365, "riskto": -1}
+    if csp:
+        row["caresettingprincipal"] = csp
+    return load_study_dict({**base, "riskscorecodes": [
+        {"riskscore": "T", "condid": "IN", "codecat": "IN", "weight": 0.0},
+        row,
+    ]})
+
+
+def test_px_risk_score_codes_match_procedure_claims():
+    """A PX risk-score code must read the PROCEDURE domain.
+
+    The join collapsed everything that was not RX to DX, so a PX code
+    looked for procedure codes in the diagnosis table and could never
+    match — scoring 0 for a condition the study had defined, silently.
+    `codecat IN ('DX','PX','RX')` two lines above said PX was accepted.
+    Reported in review.
+    """
+    from qrp import Engine
+
+    def total(codecat, code):
+        eng = Engine(verbose=False)
+        try:
+            run(_risk_codecat_study(codecat, code), DATA, engine=eng,
+                verbose=False)
+            return eng.con.execute(
+                "SELECT sum(score) FROM risk_scores").fetchone()[0] or 0
+        finally:
+            eng.close()
+
+    assert total("DX", "X00001") > 0, "DX risk codes score nothing"
+    assert total("PX", "P00001") > 0, "PX risk codes score nothing"
+
+
+def test_risk_score_care_setting_is_applied():
+    """RISKSCORECODES carries its own caresettingprincipal. It was
+    parsed into (enctype, pdx) and then never reached the SQL, so a
+    study restricting a condition to inpatient claims got a score
+    computed over every setting — plausible, and wrong.
+
+    Note the token semantics: `IPA` is "IP, any pdx"; `IP_` is "IP with
+    MISSING pdx". Reading `_` as a wildcard makes the expected ordering
+    come out backwards.
+    """
+    from qrp import Engine
+
+    def total(csp):
+        eng = Engine(verbose=False)
+        try:
+            run(_risk_codecat_study("DX", "X00001", csp), DATA,
+                engine=eng, verbose=False)
+            return eng.con.execute(
+                "SELECT sum(score) FROM risk_scores").fetchone()[0] or 0
+        finally:
+            eng.close()
+
+    unrestricted = total(None)
+    assert total("AAA") == unrestricted, "the wildcard must not restrict"
+    ip_any = total("IPA")
+    ip_principal = total("IPP")
+    assert unrestricted > ip_any > ip_principal, (
+        unrestricted, ip_any, ip_principal)
+
+
+def test_eventcount_key_includes_codetype():
+    """SAS's eventcount=1 key is (PatId, Adate, codecat, codetype, code).
+
+    Dropping codetype collapsed an ICD-9 and an ICD-10 claim carrying
+    the same code on the same day into one event. The real extract has
+    26 such pairs, so this is not hypothetical. Reported in review.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(_eventcount_study(1), DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM event_claims LIMIT 0").description}
+        assert "codetype" in cols, sorted(cols)
+
+        # under eventcount=1 the FULL key must be unique
+        dupes = eng.con.execute("""
+            SELECT count(*) FROM (
+                SELECT cohortgrp, patid, adate, code, codetype
+                FROM event_claims GROUP BY 1,2,3,4,5 HAVING count(*) > 1)
+        """).fetchone()[0]
+        assert dupes == 0, f"{dupes} duplicate (patid, date, code, codetype)"
+    finally:
+        eng.close()
+
+
+def test_event_and_ioc_codes_read_their_own_domain():
+    """SAS sets `_FUPEvent` from _ITDrugs (RX), _ITMeds (DX and PX),
+    _ITLabs, _itenc and _itDth (ms_cidanum.sas:1663-1672). Outcomes are
+    NOT diagnosis-only.
+
+    Reading `cdm_diagnosis` alone meant an outcome defined by a
+    dispensing or a procedure could never fire — the cohort simply
+    reported no events, with no error. `_FUPWash` (IOC) shares the same
+    source and had the same defect. Reported in review.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def with_event(codecat, code):
+        cc = [dict(r) for r in base["cohortcodes"]
+              if r.get("indexcriteria") != "EVENT"]
+        for g in ("lisinopril", "beta_blocker"):
+            cc.append({"group": g, "indexcriteria": "EVENT",
+                       "codecat": codecat, "code": code,
+                       "caresettingprincipal": ""})
+        eng = Engine(verbose=False)
+        try:
+            run(load_study_dict({**base, "cohortcodes": cc}), DATA,
+                engine=eng, verbose=False)
+            return eng.con.execute(
+                "SELECT count(*) FROM cohort_final WHERE has_event = 1"
+            ).fetchone()[0]
+        finally:
+            eng.close()
+
+    assert with_event("DX", "X00001") > 0, "DX outcomes do not fire"
+    assert with_event("PX", "P00001") > 0, "PX outcomes do not fire"
+    assert with_event("RX", "N00001") > 0, "RX outcomes do not fire"
+
+
+def test_codesupply_overrides_the_claim_rxsup():
+    """CODESUPPLY replaces the claim's own RxSup
+    (ms_createmicohorts.sas:571).
+
+    It was parsed, validated against the CFDD limits, and never applied.
+    It is per CODE — 150 of 1,124 rows carry it in the real study file,
+    all of them PX, because a procedure claim has no days-supply of its
+    own. The PX arm hardcoded `1`, which was right only because every
+    one of those 150 happens to BE 1; a study specifying 30 got 1-day
+    episodes.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    # CFDD limits and CODESUPPLY are mutually exclusive, so drop them
+    t2 = [{k: v for k, v in r.items() if k not in ("mincfdd", "maxcfdd")}
+          for r in base["type2file"]]
+
+    def mean_days(supply):
+        cc = [dict(r) for r in base["cohortcodes"]]
+        if supply:
+            for r in cc:
+                if r.get("indexcriteria") == "DEF":
+                    r["codesupply"] = supply
+        eng = Engine(verbose=False)
+        try:
+            run(load_study_dict({**base, "type2file": t2, "cohortcodes": cc}),
+                DATA, engine=eng, verbose=False)
+            return eng.con.execute(
+                "SELECT avg(episode_days) FROM cohort_final").fetchone()[0]
+        finally:
+            eng.close()
+
+    base_days = mean_days(None)
+    assert mean_days(30) < base_days < mean_days(90), (
+        base_days, mean_days(30), mean_days(90))
+
+
+def test_codesupply_conflicts_with_cfdd_across_all_codes():
+    """The check reads every exposure code, not just the first.
+
+    It used to read `supply_rows[0]`, collapsing a per-code value to one
+    per cohort: a study where only the THIRD code set CODESUPPLY passed
+    validation silently.
+    """
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    # Only `lisinopril` carries a CFDD limit in this fixture, so the
+    # conflict can only arise on ITS codes — beta_blocker setting
+    # CODESUPPLY is legitimate. Targeting a cohort without the limit
+    # would assert a failure that should not happen.
+    def with_supply_on(nth):
+        cc = [dict(r) for r in base["cohortcodes"]]
+        defs = [r for r in cc
+                if r.get("indexcriteria") == "DEF"
+                and (r.get("group") or r.get("cohortgrp")) == "lisinopril"]
+        defs[nth]["codesupply"] = 30
+        return {**base, "cohortcodes": cc}
+
+    n_lisinopril = len([r for r in base["cohortcodes"]
+                        if r.get("indexcriteria") == "DEF"
+                        and (r.get("group") or r.get("cohortgrp"))
+                        == "lisinopril"])
+    # first, middle and LAST — the last is the one that slipped through
+    # when the check read only supply_rows[0]
+    for nth in (0, n_lisinopril // 2, n_lisinopril - 1):
+        with pytest.raises(ValueError, match="CODESUPPLY"):
+            load_study_dict(with_supply_on(nth))
+
+    # a cohort WITHOUT a CFDD limit may set CODESUPPLY freely
+    cc = [dict(r) for r in base["cohortcodes"]]
+    for r in cc:
+        if (r.get("indexcriteria") == "DEF"
+                and (r.get("group") or r.get("cohortgrp")) == "beta_blocker"):
+            r["codesupply"] = 30
+    load_study_dict({**base, "cohortcodes": cc})
+
+
+# ---------------------------------------------------------------------
+# Rerun safety
+# ---------------------------------------------------------------------
+
+
+def _runid_study(runid, **overrides):
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    params = [{**base["qrp_parameters"][0], "runid": runid}]
+    return load_study_dict({**base, "qrp_parameters": params, **overrides})
+
+
+def test_rerun_clears_this_runs_stale_outputs():
+    """A rerun into a populated directory must not leave files the
+    current run did not produce.
+
+    Verified as a real hazard before fixing: rerunning with the
+    covariates REMOVED left covariates, baseline and
+    covariate_prevalence from the previous run, so a reader got
+    covariate results for a study that defines none. Nothing marked
+    them stale.
+    """
+    import tempfile
+    import time
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(_runid_study("rr"), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    first = {p.name for p in (out / "msoc").iterdir()}
+    assert any("baseline" in n for n in first), first
+
+    time.sleep(1.1)                      # so mtimes are distinguishable
+    _run(_runid_study("rr", covariatecodes=[]), DATA, output_dir=str(out),
+         names="sas", verbose=False)
+
+    files = list(out.rglob("*.parquet"))
+    newest = max(f.stat().st_mtime for f in files)
+    stale = [str(f) for f in files if newest - f.stat().st_mtime > 1]
+    assert not stale, f"stale files survived the rerun: {stale}"
+
+
+def test_rerun_with_different_names_mode_does_not_duplicate_tables():
+    """Switching --names between `sas` and `logical` wrote the same
+    table under BOTH names — censor_cida and censoring side by side,
+    with nothing indicating they are one table."""
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(_runid_study("rr"), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    _run(_runid_study("rr"), DATA, output_dir=str(out), names="logical",
+         verbose=False)
+
+    names = {p.name for p in (out / "msoc").iterdir()}
+    assert not (any("censor_cida" in n for n in names)
+                and any(n.endswith("_censoring.parquet") for n in names)), (
+        "the same table is present under two names", sorted(names))
+
+
+def test_rerun_does_not_touch_a_SIBLING_runs_outputs():
+    """The clear is scoped to THIS run_id's prefix.
+
+    A data partner may legitimately keep several runs' outputs in one
+    directory, and wiping a sibling's results would be worse than the
+    staleness this fixes.
+    """
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(_runid_study("studya"), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    a_files = {p.name for p in (out / "msoc").iterdir()}
+    _run(_runid_study("studyb"), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    after = {p.name for p in (out / "msoc").iterdir()}
+
+    assert a_files <= after, (
+        "a sibling run's outputs were destroyed",
+        sorted(a_files - after))
+    assert any(n.startswith("studyb_") for n in after)
+
+
+def test_failed_rerun_leaves_previous_results_intact():
+    """A run that fails during the PIPELINE must not destroy the
+    previous run's outputs — the clear happens inside the
+    output-writing block, which only runs after the pipeline succeeds.
+    """
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(_runid_study("rr"), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    before = len(list(out.rglob("*.parquet")))
+    assert before > 0
+
+    with pytest.raises(Exception):
+        _run(_runid_study("rr"), "/nonexistent/input/path",
+             output_dir=str(out), names="sas", verbose=False)
+
+    assert len(list(out.rglob("*.parquet"))) == before
+
+
+def test_manifest_is_written_last_and_marks_completeness():
+    """The write sequence is clear -> tables -> manifest, so the
+    manifest's PRESENCE signals that a run completed and its outputs are
+    the full set."""
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    _run(_runid_study("rr"), DATA, output_dir=str(out), names="sas",
+         verbose=False)
+    manifest = out / "manifest.json"
+    assert manifest.exists()
+    # no table file may be newer than the manifest
+    newest_table = max(f.stat().st_mtime for f in out.rglob("*.parquet"))
+    assert manifest.stat().st_mtime >= newest_table - 0.01

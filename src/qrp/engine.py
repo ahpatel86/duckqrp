@@ -8,7 +8,7 @@ boundaries — it was that the boundaries were implicit, hand-placed as 50
 scattered `localCheckpoint(eager=True)` calls tuned by trial and error to
 one dataset size.
 
-Here a stage boundary is a first-class object. `Engine.stage()` runs one
+Here a stage boundary is a first-class object. `Engine.script_stage()` runs one
 named SQL script, materialises the result as a real table, records rows
 and wall time, and (optionally) writes a parity dump. There is exactly
 one place that decides what "materialise" means, so changing the policy
@@ -73,6 +73,24 @@ class StageResult:
     seconds: float
 
 
+
+
+def sql_str(value: object) -> str:
+    """A path or other value as a SQL single-quoted literal.
+
+    Paths are interpolated into SET, COPY and read_parquet() because
+    those take a literal, not a parameter. A perfectly legal path —
+    `/data/O'Brien/scdm` — otherwise terminates the string early and
+    produces a parser error. Verified: DuckDB rejects it outright, so
+    this is a correctness fix rather than an injection concern in a
+    controlled environment.
+
+    Doubling the quote is the SQL standard escape and what DuckDB
+    expects.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 @dataclass
 class Engine:
     """Owns the DuckDB connection and the stage log."""
@@ -119,10 +137,10 @@ class Engine:
         # therefore means "the package default", not "no limit".
         limit = self.memory_limit or _suggest_memory_limit()
         if limit and limit != "auto":
-            self.con.execute(f"SET memory_limit = '{limit}'")
+            self.con.execute(f"SET memory_limit = {sql_str(limit)}")
         if self.temp_directory:
             Path(self.temp_directory).mkdir(parents=True, exist_ok=True)
-            self.con.execute(f"SET temp_directory = '{self.temp_directory}'")
+            self.con.execute(f"SET temp_directory = {sql_str(self.temp_directory)}")
         # Preserve insertion order only where we ask for it; letting DuckDB
         # drop the guarantee lets it parallelise scans more aggressively.
         self.con.execute("SET preserve_insertion_order = false")
@@ -361,52 +379,6 @@ class Engine:
 
     # ---------------- stage boundary --------------------------------
 
-    def stage(self, name: str, sql: str, *, table: str | None = None,
-              materialise: bool = True) -> StageResult:
-        """Run one named stage.
-
-        The policy, in one sentence: **materialise on fan-out, stay lazy
-        on single consumption.**
-
-        A TABLE is an optimiser barrier. That is exactly what you want
-        where several stages read the same result — it is the SAS
-        materialisation boundary that Spark lacked and that the PySpark
-        port tried to recreate with 50 hand-placed localCheckpoint calls.
-        It is exactly what you do NOT want for a staging step read once,
-        because the copy is pure cost and the barrier blocks filter
-        pushdown into the parquet scan.
-
-        Measured, at 2m patients: leaving `covar_source` (a UNION ALL of
-        diagnosis and dispensing, consumed once) as a TABLE cost 65.1s in
-        the covariates stage. As a VIEW it is 8.8s — 7.4x — because the
-        code filter now reaches the scan. Total runtime 153.7s -> 94.7s,
-        database file 1103MB -> 423MB, output byte-identical.
-
-        So: count the downstream consumers. Two or more, materialise.
-        Exactly one, use a view.
-        """
-        self.raise_if_cancelled()
-        target = table or name
-        self._stage_index += 1
-        self.emit(StageStarted(name=name, index=self._stage_index,
-                               total=self._stage_total))
-        t0 = time.perf_counter()
-        kind = "TABLE" if materialise else "VIEW"
-        self._run_with_progress(
-            name,
-            lambda: self.con.execute(
-                f"CREATE OR REPLACE {kind} {target} AS {sql}"
-            ),
-        )
-        rows = self.count(target) if materialise else -1
-        dt = time.perf_counter() - t0
-        res = StageResult(name, target, rows, dt)
-        self.log.append(res)
-        self.emit(StageFinished(name=name, index=self._stage_index,
-                                total=self._stage_total, table=target,
-                                rows=rows, seconds=dt))
-        return res
-
     def script_stage(self, name: str, script: str, **params: Any) -> None:
         """Run a .sql file, one statement at a time.
 
@@ -485,7 +457,7 @@ class Engine:
             if path.exists():
                 _shutil.rmtree(path)
             opts += f", PARTITION_BY ({partition_by}), OVERWRITE_OR_IGNORE"
-        self.con.execute(f"COPY {table} TO '{path}' ({opts})")
+        self.con.execute(f"COPY {table} TO {sql_str(path)} ({opts})")
 
     def write_csv(self, table: str, path: str | Path) -> None:
         """Export a table as CSV, for opening in Excel.
@@ -497,7 +469,7 @@ class Engine:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con.execute(f"COPY {table} TO '{path}' (FORMAT CSV, HEADER)")
+        self.con.execute(f"COPY {table} TO {sql_str(path)} (FORMAT CSV, HEADER)")
 
     def summary(self) -> str:
         total = sum(s.seconds for s in self.log)

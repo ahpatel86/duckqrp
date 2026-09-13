@@ -331,3 +331,50 @@ shape matches.
 Verified: both levels reconcile against `cohort_final` (65,052
 episodes), and **every episode carries at least one censoring reason** —
 the flags are exhaustive, not a sample.
+
+
+---
+
+## Rerun safety
+
+Two hazards, both verified as real before fixing.
+
+### Stale outputs from a previous run
+
+Rerunning into a populated directory left files the current run did not
+produce, with nothing marking them stale:
+
+* **A feature removed between runs.** Drop the covariates and
+  `covariates`, `baseline` and `covariate_prevalence` survived from the
+  previous run. A reader got covariate results for a study that defines
+  no covariates.
+* **Switching `--names`** between `sas` and `logical` wrote the same
+  table under BOTH names — `censor_cida` and `censoring` side by side,
+  with nothing indicating they are one table.
+
+Fixed by clearing this run's previous outputs before writing.
+
+### Scoped to the run id, not the directory
+
+The clear matches `<runid>_*` only. A data partner may legitimately keep
+several runs' outputs together, and wiping a sibling run's results would
+be worse than the staleness being fixed. A test asserts `studyB` leaves
+all eight of `studyA`'s outputs intact.
+
+### What a failure does
+
+| failure point | previous outputs |
+|---|---|
+| during the pipeline | **intact** — the clear lives inside the output-writing block, which only runs after the pipeline succeeds |
+| during the write loop | lost, and the new set is partial |
+
+The second case is a real window and is not closed. Writing to a temp
+tree and swapping would close it, but doubles peak disk — and disk is
+already the binding constraint at scale, since the pipeline spills
+roughly 2.6x the input size at its memory floor. The cure would risk
+causing the disease. Re-running regenerates the outputs; a half-full
+disk does not.
+
+**`manifest.json` is written LAST**, so its presence is the signal that
+a run completed and its outputs are the full set. A tree with tables but
+no manifest is a partial write.

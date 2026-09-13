@@ -21,11 +21,22 @@
 CREATE OR REPLACE VIEW washout_claims AS
 SELECT cohortgrp, patid, adate FROM event_claims
 UNION ALL
+-- IOC codes come from the code's own domain too. _FUPWash is set from
+-- the same union as _FUPEvent (ms_cidanum.sas:1663-1672), so an IOC
+-- code naming a dispensing or a procedure is legitimate and was
+-- silently never matching.
 SELECT k.cohortgrp, x.patid, x.adate
-FROM cdm_diagnosis x
+FROM (
+    SELECT patid, adate, code, 'DX' AS codecat FROM cdm_diagnosis
+    UNION ALL
+    SELECT patid, adate, code, 'PX' AS codecat FROM cdm_procedure
+    UNION ALL
+    SELECT patid, adate, code, 'RX' AS codecat FROM cdm_dispensing
+) x
 JOIN cfg_codes k
-  ON k.code = x.code
- AND k.role = 'IOC';
+  ON k.code    = x.code
+ AND k.role    = 'IOC'
+ AND k.codecat = x.codecat;
 
 -- Most recent disqualifying claim strictly before each index date.
 -- A view: consumed once, by cohort_final.

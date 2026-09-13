@@ -269,6 +269,10 @@ Works in Windows Terminal, VS Code, WSL, macOS and any Linux terminal.
 with no code changes. See
 **[docs/PERFORMANCE_AND_TERMINALS.md](docs/PERFORMANCE_AND_TERMINALS.md)**.
 
+Screenshots (real `export_screenshot()` renders, not mockups) are in
+[docs/screenshots/](docs/screenshots/) — including the spilling and
+out-of-memory states.
+
 A terminal UI with editable paths, a free-text Memory limit
 (defaulted from detected host RAM, cgroup-aware), an in-memory/on-disk
 Storage toggle, a spill directory, an Inspect button that checks inputs
