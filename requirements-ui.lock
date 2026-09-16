@@ -1,3 +1,0 @@
-# Optional: terminal UI. Not needed for CLI-only operation.
--r requirements.lock
-textual>=0.80

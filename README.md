@@ -55,7 +55,7 @@ than SAS's — the dangerous direction.
 
 On **1 CPU core / 3 GB RAM**.
 
-Measured on a **real SCDM extract** — 174,064 patients, 35.2M rows,
+Measured on a **synthetic SCDM extract** — 174,064 patients, 35.2M rows,
 175 MB of parquet — and on a 4× replica (~140M rows). Best of three,
 single core.
 
@@ -321,9 +321,8 @@ Measured on the 2m-patient study (316 MB input, 10 stages):
 A 5.5× memory reduction for a 33% time cost.
 
 *(This table and the memory floor below were measured on synthetic data
-at 100k/500k/2m patients, before the real extract was available. The
-shape of the result — spilling rather than failing — has held on real
-data, but the absolute numbers have not been re-measured.)*
+at 100k/500k/2m patients. The
+shape of the result — spilling rather than failing — has held, but the absolute numbers have not been re-measured.)*
 
 The memory floor is **flat
 across scale** — 100k, 500k and 2m patients all complete at 160 MB,
@@ -458,7 +457,7 @@ executed. A test that cannot fail reads as evidence and isn't.
 
 Two fixes, both in the repository:
 
-- `tools/gen_synthetic.py` now injects the tie shapes that occur in real
+- `tools/gen_synthetic.py` now injects the tie shapes that occur in
   claims — duplicate demographic rows with the same birth date, and
   same-day same-supply dispensings with differing amounts.
 - `tests/test_determinism.py` constructs ties directly and asserts both
@@ -479,7 +478,7 @@ upstream rather than from the clause, so the SQL says so in a comment.
   the macros, not the PySpark port, so a defect in the port would not be
   inherited silently. It found eight divergences, all fixed. But reading
   has limits: two further divergences were found only when a reviewer
-  pointed at a column I had dismissed, and four more only when real lab
+  pointed at a column I had dismissed, and four more only when lab
   data and a real input file arrived. **One comparison against SAS
   output for a real study would test every stage at once**, including
   the ones read confidently and got wrong.
@@ -489,7 +488,7 @@ upstream rather than from the clause, so the SQL says so in a comment.
   full sweep now shows no stage meaningfully superlinear. The prediction
   was right, which is a reason to take the remaining caveats seriously
   rather than a reason to relax.
-- **The 4× dataset is replicated, not independent.** It is the real 1×
+- **The 4× dataset is replicated, not independent.** It is the synthetic 1×
   extract with offset patient ids, so patient count grows while
   per-patient claim density stays identical. A real 4× extract would
   have a different distribution, and the covariate join's behaviour
