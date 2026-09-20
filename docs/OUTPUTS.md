@@ -551,3 +551,52 @@ disk does not.
 **`manifest.json` is written LAST**, so its presence is the signal that
 a run completed and its outputs are the full set. A tree with tables but
 no manifest is a partial write.
+
+
+---
+
+## When denominators are NOT computed
+
+`denomcounts` needs a USERSTRATA file. That is not a quirk of this
+implementation — SAS gates on it explicitly:
+
+> Only compute denominators if OUTPUTDENOM ne N and USERSTRATA file is
+> specified and contains relevant tables — `ms_cidadenom.sas:113`
+
+So a study with no USERSTRATA correctly gets no denominators.
+
+Checking that turned up **a second gate this package was ignoring
+entirely**.
+
+### `OUTPUTDENOM`
+
+A per-cohort field on the type2 file, and it was not parsed at all:
+
+| value | meaning |
+|---|---|
+| `Y` | members and member-days |
+| `M` | members only — `DenNumMemDays` is blanked (`ms_cidadenom.sas:1347`) |
+| `N` | no denominator for that cohort |
+
+A cohort setting `N` was getting a denominator anyway — a plausible
+number with no SAS counterpart.
+
+### `minrxdays` forces it off
+
+**`minrxdays > 1` in ANY inclusion rule disables the denominator for
+Types 1-2**, with a warning:
+
+> Outputdenom set to N for &itgroup. because minrxdays is used in
+> inclusion/exclusion criteria — `ms_setnumloopmacrovars.sas:898-900`
+
+A pro-rated supply requirement makes the eligible-member count
+incoherent, so SAS refuses to emit one rather than emit a wrong one.
+This package emitted one regardless.
+
+Both gates are now applied, and both warn at load rather than silently
+dropping a deliverable.
+
+**The production study is unaffected**: all 14 cohorts are
+`OUTPUTDENOM=Y` and no inclusion rule uses `minrxdays`, so its output is
+unchanged at 238 rows. The divergence would only have appeared on a
+different study — which is exactly the kind that gets noticed late.

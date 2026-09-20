@@ -41,7 +41,11 @@
 CREATE OR REPLACE TEMP TABLE _denom_windows AS
 WITH windows AS (
     SELECT
-        c.cohortgrp,
+        -- Keyed on the denominator CONFIG. Cohorts agreeing on every
+        -- parameter this stage reads produce identical denominators;
+        -- one pass per config and a fan-out at the end turns 14 cohorts
+        -- into 5 passes on the study seen.
+        c.denom_cfg_id,
         e.patid,
         e.episode                       AS eligepisode,
         e.enr_start,
@@ -61,7 +65,7 @@ WITH windows AS (
                                               c.min_days_supp - 1,
                                               c.blackout_per)
             )                           AS denom_end
-    FROM cfg_cohort c
+    FROM cfg_denom_cohort c
     JOIN enrollment_spans e
       ON e.enr_cfg_id = c.enr_cfg_id
     WHERE e.enr_end >= DATE '{start_date}'
@@ -80,7 +84,7 @@ WHERE w.denom_end >= w.denom_start;
 -- Pass 2a: demographic eligibility, same rules the numerator applies.
 CREATE OR REPLACE TEMP TABLE _denom_demog AS
 SELECT
-    el.cohortgrp,
+    el.denom_cfg_id,
     el.patid,
     el.eligepisode,
     el.denom_start,
@@ -94,11 +98,11 @@ FROM _denom_windows el
 JOIN demographics dm ON dm.patid = el.patid
 LEFT JOIN demographics_multi   mx ON mx.patid = el.patid
 LEFT JOIN demographics_missing ms ON ms.patid = el.patid
-JOIN cfg_demog ds ON ds.cohortgrp = el.cohortgrp
+JOIN cfg_denom_demog ds ON ds.denom_cfg_id = el.denom_cfg_id
                  AND ds.dimension = 'sex' AND ds.value = dm.sex_raw
-JOIN cfg_demog dr ON dr.cohortgrp = el.cohortgrp
+JOIN cfg_denom_demog dr ON dr.denom_cfg_id = el.denom_cfg_id
                  AND dr.dimension = 'race' AND dr.value = dm.race
-JOIN cfg_demog dh ON dh.cohortgrp = el.cohortgrp
+JOIN cfg_denom_demog dh ON dh.denom_cfg_id = el.denom_cfg_id
                  AND dh.dimension = 'hispanic' AND dh.value = dm.hispanic
 WHERE mx.patid IS NULL AND ms.patid IS NULL;
 
@@ -108,7 +112,7 @@ DROP TABLE _denom_windows;
 -- the earliest date an index could occur in it.
 CREATE OR REPLACE TEMP TABLE _denom_strat AS
 SELECT
-    d.cohortgrp,
+    d.denom_cfg_id,
     d.patid,
     d.eligepisode,
     d.denom_start,
@@ -121,8 +125,8 @@ SELECT
     a.ordinal                    AS agegroupnum,
     year(d.denom_start)::VARCHAR AS index_year
 FROM _denom_demog d
-JOIN cfg_age_strata a
-  ON a.cohortgrp = d.cohortgrp
+JOIN cfg_denom_strata a
+  ON a.denom_cfg_id = d.denom_cfg_id
  AND age_in_unit(d.birth_date, d.denom_start, a.unit) BETWEEN a.lo AND a.hi;
 
 DROP TABLE _denom_demog;
@@ -130,7 +134,8 @@ DROP TABLE _denom_demog;
 CREATE OR REPLACE TABLE denomcounts AS
 SELECT
     lv.level_id                                        AS level,
-    s.cohortgrp                                        AS "group",
+    -- Fan out: one row per COHORT, from the config that produced it.
+    m.cohortgrp                                        AS "group",
     CASE WHEN lv.has_agegroup THEN s.agegroup    END   AS agegroup,
     CASE WHEN lv.has_agegroup THEN s.agegroupnum END   AS agegroupnum,
     CASE WHEN lv.has_sex      THEN s.sex         END   AS sex,
@@ -157,9 +162,11 @@ SELECT
     count(DISTINCT s.patid)                            AS dennumpts,
     sum(s.memberdays)                                  AS dennummemdays
 FROM _denom_strat s
+-- one row per cohort sharing this config
+JOIN cfg_denom_map m ON m.denom_cfg_id = s.denom_cfg_id
 CROSS JOIN cfg_strata lv
 GROUP BY
-    lv.level_id, s.cohortgrp,
+    lv.level_id, m.cohortgrp,
     CASE WHEN lv.has_agegroup THEN s.agegroup    END,
     CASE WHEN lv.has_agegroup THEN s.agegroupnum END,
     CASE WHEN lv.has_sex      THEN s.sex         END,

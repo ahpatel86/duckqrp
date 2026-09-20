@@ -5648,3 +5648,186 @@ def test_an_undocumented_addition_is_rejected():
     # an addition without one is refused
     with pytest.raises(ValueError, match="no note"):
         Output("x", "x", "msoc")
+
+
+def _two_cohort_study(**override):
+    """Two identical cohorts, the second differing in one field."""
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    cf = [dict(base["cohortfile"][0]), dict(base["cohortfile"][0])]
+    cf[0]["cohortgrp"], cf[1]["cohortgrp"] = "a", "b"
+    t2 = [dict(base["type2file"][0]), dict(base["type2file"][0])]
+    t2[0]["group"], t2[1]["group"] = "a", "b"
+    cc = []
+    for r in base["cohortcodes"]:
+        for g in ("a", "b"):
+            r2 = dict(r)
+            r2["group"] = g
+            cc.append(r2)
+    for k, v in override.items():
+        target = (cf[1] if (k in cf[1] or k in ("sex", "race", "hispanic"))
+                  else t2[1])
+        target[k] = v
+    if any(k in ("coverage", "enrolgap", "chartres") for k in override):
+        # enrollment params are keyed by enrollmentnum; cohorts sharing
+        # the number must share the params
+        cf[1]["enrollmentnum"] = 2
+    # denomcounts only exists when the study requests a CIDA table
+    return load_study_dict({
+        **base, "cohortfile": cf, "type2file": t2, "cohortcodes": cc,
+        "userstrata": [{"tableid": "t2cida", "levelid": "1",
+                        "levelvars": ""}],
+    })
+
+
+def test_denominator_config_key_is_complete():
+    """`_denom_cfg_id` decides which cohorts SHARE one denominator pass.
+
+    If it omits a parameter the denominator SQL reads, two cohorts whose
+    denominators differ are silently merged and both get the wrong
+    numbers. That is the failure mode this optimisation risks, so the
+    key is tested against every field rather than reasoned about.
+
+    Each case changes ONE field and asserts the config splits. The
+    assertion that the override actually reached the parsed cohort
+    matters as much: a field written where nothing reads it looks
+    exactly like a complete key, and four cases initially "passed" that
+    way.
+    """
+    from qrp.pipeline import _denom_cfg_id
+
+    cases = {
+        "enrdays": 365, "coverage": "M", "enrolgap": 99, "chartres": "Y",
+        "reqdaysaftind": 7, "reqdaysaftepi": 7, "minepisdur": 9,
+        "mindaysupp": 9, "blackoutper": 9, "agestrat": "18-64 65+",
+        "sex": "F", "race": "1", "hispanic": "Y",
+    }
+    watched = ("enr_days", "coverage", "enrol_gap", "chart_required",
+               "req_days_aft_ind", "req_days_aft_epi", "min_epis_dur",
+               "min_days_supp", "blackout_per", "sex", "race", "hispanic")
+
+    for field, value in cases.items():
+        s = _two_cohort_study(**{field: value})
+        a, b = s.cohorts[0], s.cohorts[1]
+        changed = [f for f in watched
+                   if getattr(a, f, None) != getattr(b, f, None)]
+        if a.age_strata and b.age_strata and \
+                a.age_strata.strata != b.age_strata.strata:
+            changed.append("age_strata")
+        assert changed, (
+            f"{field}: the override never reached the parsed cohort, so "
+            f"this case proves nothing")
+        assert len({_denom_cfg_id(a), _denom_cfg_id(b)}) == 2, (
+            f"{field} differs ({changed}) but the cohorts share a "
+            f"denominator config — they would be merged and both get "
+            f"the wrong denominator")
+
+
+def test_shared_denominator_config_gives_identical_results():
+    """Cohorts sharing a config must get the SAME denominator, and
+    cohorts differing must not.
+
+    The optimisation computes one pass per config and fans out; this
+    checks the fan-out end to end rather than trusting the key.
+    """
+    from qrp import Engine
+    from qrp.pipeline import _denom_cfg_id
+
+    # identical cohorts -> one config, identical denominators
+    same = _two_cohort_study()
+    assert len({_denom_cfg_id(c) for c in same.cohorts}) == 1
+
+    eng = Engine(verbose=False)
+    try:
+        run(same, DATA, engine=eng, verbose=False)
+        rows = eng.con.execute("""
+            SELECT "group", sum(dennumpts), sum(dennummemdays)
+            FROM denomcounts GROUP BY 1 ORDER BY 1
+        """).fetchall()
+        assert len(rows) == 2, rows
+        assert rows[0][1:] == rows[1][1:], (
+            "cohorts sharing a config got different denominators", rows)
+    finally:
+        eng.close()
+
+    # a differing cohort -> two configs, and the denominators differ
+    diff = _two_cohort_study(sex="F")
+    assert len({_denom_cfg_id(c) for c in diff.cohorts}) == 2
+    eng = Engine(verbose=False)
+    try:
+        run(diff, DATA, engine=eng, verbose=False)
+        rows = eng.con.execute("""
+            SELECT "group", sum(dennumpts) FROM denomcounts
+            GROUP BY 1 ORDER BY 1
+        """).fetchall()
+        assert rows[0][1] != rows[1][1], (
+            "a sex-restricted cohort got the same denominator as an "
+            "unrestricted one", rows)
+    finally:
+        eng.close()
+
+
+def test_outputdenom_controls_whether_a_denominator_is_computed():
+    """SAS: "Only compute denominators if OUTPUTDENOM ne N and
+    USERSTRATA file is specified" (ms_cidadenom.sas:113).
+
+    `OUTPUTDENOM` is a per-cohort field that was not parsed at all, so a
+    cohort asking for no denominator got one anyway — a plausible number
+    with no SAS counterpart.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    t2 = [dict(r) for r in base["type2file"]]
+    t2[0]["outputdenom"] = "N"          # lisinopril
+    s = load_study_dict({
+        **base, "type2file": t2,
+        "userstrata": [{"tableid": "t2cida", "levelid": "1",
+                        "levelvars": ""}]})
+
+    assert "lisinopril" not in s.denominator_cohorts()
+    assert "beta_blocker" in s.denominator_cohorts()
+
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        groups = {r[0] for r in eng.con.execute(
+            'SELECT DISTINCT "group" FROM denomcounts').fetchall()}
+        assert groups == {"beta_blocker"}, groups
+    finally:
+        eng.close()
+
+
+def test_minrxdays_forces_denominators_off():
+    """`minrxdays > 1` in ANY inclusion rule disables OUTPUTDENOM for
+    Types 1-2, with a warning (ms_setnumloopmacrovars.sas:898-900).
+
+    A pro-rated supply requirement makes the eligible-member count
+    incoherent, so SAS refuses to emit one rather than emit a wrong one.
+    This package emitted one regardless.
+    """
+    import warnings as w
+
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    inclusion = [{"group": "lisinopril", "criteria": "INC",
+                  "condlevel": "1", "subcondlevel": "1", "codecat": "RX",
+                  "code": "E00001", "minrxdays": 30,
+                  "condfrom": -183, "condto": -1}]
+
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        s = load_study_dict({**base, "inclusioncodes": inclusion})
+
+    assert s.denominators_suppressed_by_minrxdays
+    assert s.denominator_cohorts() == ()
+    assert any("minrxdays" in str(x.message) for x in caught), (
+        "suppressing a deliverable without saying so is the failure mode "
+        "this guards against")
+
+    # and without minrxdays, every cohort keeps its denominator
+    plain = load_study_dict(base)
+    assert len(plain.denominator_cohorts()) == len(plain.cohorts)

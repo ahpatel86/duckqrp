@@ -347,6 +347,15 @@ class CohortConfig:
 
     # --- codes --------------------------------------------------------
     code_supply: int | None = None
+    # OUTPUTDENOM: whether this cohort's denominator is computed.
+    #   "Y"  members and member-days
+    #   "M"  members only — DenNumMemDays is blanked
+    #        (ms_cidadenom.sas:1347)
+    #   "N"  no denominator at all
+    # SAS gates the whole denominator stage on it
+    # (ms_cidadenom.sas:113-115), so ignoring it produced denominators
+    # for a study that asked for none.
+    output_denom: str = "Y"
     # (code, codecat) pairs. codecat is one of RX / PX / DX and decides
     # which claim domain the code is extracted from.
     # (code, codecat, code_supply). code_supply overrides the claim's
@@ -928,6 +937,38 @@ class StudyConfig:
                 seen.append(r.riskscore)
         return tuple(seen)
 
+    def denominator_cohorts(self) -> tuple[str, ...]:
+        """Cohorts whose denominator SAS would actually compute.
+
+        Two gates, both from SAS:
+
+        * `OUTPUTDENOM = N` on the cohort — no denominator at all.
+        * **`minrxdays > 1` anywhere in the inclusion criteria forces
+          it off**, with a warning: "Outputdenom set to N for <group>
+          because minrxdays is used in inclusion/exclusion criteria"
+          (ms_setnumloopmacrovars.sas:898-900). A pro-rated supply
+          requirement makes the eligible-member count incoherent, so
+          SAS refuses to emit one rather than emit a wrong one.
+
+        Ignoring either produced a denominator for a study that would
+        get none from SAS — a plausible number with no counterpart.
+        """
+        forced_off = any(r.minrxdays > 1 for r in self.inclusions)
+        out = []
+        for c in self.cohorts:
+            if c.output_denom == "N":
+                continue
+            if forced_off and self.study_type <= 2:
+                continue
+            out.append(c.cohortgrp)
+        return tuple(out)
+
+    @property
+    def denominators_suppressed_by_minrxdays(self) -> bool:
+        return (self.study_type <= 2
+                and any(r.minrxdays > 1 for r in self.inclusions)
+                and any(c.output_denom != "N" for c in self.cohorts))
+
     @property
     def any_cida_tables(self) -> bool:
         return bool(self.cida_levels())
@@ -1030,6 +1071,31 @@ def _bool_yn(v: Any, default: bool = False) -> bool:
     if v is None or v == "":
         return default
     return str(v).strip().upper() in {"Y", "YES", "TRUE", "1"}
+
+
+def _warn_denominator_suppressed(study: StudyConfig) -> None:
+    """SAS warns when minrxdays forces the denominator off; so do we.
+
+    Silently omitting a deliverable the study asked for is the failure
+    mode this whole package has been most prone to.
+    """
+    import warnings
+
+    if study.denominators_suppressed_by_minrxdays:
+        warnings.warn(
+            "denominators will NOT be computed because an inclusion rule "
+            "uses minrxdays > 1 — SAS disables OUTPUTDENOM in that case "
+            "(ms_setnumloopmacrovars.sas:898), since a pro-rated supply "
+            "requirement makes the eligible-member count incoherent",
+            stacklevel=3,
+        )
+    off = [c.cohortgrp for c in study.cohorts if c.output_denom == "N"]
+    if off:
+        warnings.warn(
+            f"cohort(s) {sorted(off)} set OUTPUTDENOM=N, so no "
+            f"denominator is computed for them",
+            stacklevel=3,
+        )
 
 
 def _warn_unsupported_tables(study: StudyConfig) -> None:
@@ -1206,6 +1272,8 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
                 req_days_aft_ind=_int(cf.get("reqdaysaftind"), 0),
                 req_days_aft_epi=_int(t2.get("reqdaysaftepi"), 0),
                 censor_death=_bool_yn(t2.get("censor_dth"), default=True),
+                output_denom=str(
+                    t2.get("outputdenom") or "Y").strip().upper()[:1] or "Y",
                 min_cum_dose=_float(t2.get("mincumdose")),
                 max_cum_dose=_float(t2.get("maxcumdose")),
                 cum_dose_per=_int(t2.get("t2cumdoseper"), None),
@@ -1454,6 +1522,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     )
     study.validate()
     _warn_unsupported_tables(study)
+    _warn_denominator_suppressed(study)
     return study
 
 

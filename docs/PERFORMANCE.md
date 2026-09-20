@@ -358,3 +358,63 @@ mapfile -t IDS < chunk0.txt && pytest "${IDS[@]}" -q
 contain commas and brackets. A check afterwards confirmed the six chunks
 partition the collected set exactly: 243 collected, 243 dispatched, 243
 unique.
+
+
+---
+
+## Deduplicating the denominator pass
+
+`cida denominators` was **63% of warm runtime** on the production study.
+Profiling found the cost is structural, not a slow query: it builds one
+enrolled-member window per cohort per enrollment span, so 14 cohorts
+meant 14 passes over 160,304 spans to produce 238 rows.
+
+**Cohorts agreeing on every parameter that stage reads produce identical
+denominators.** On the production study 14 cohorts collapse to 5
+configs. Computing one pass per config and fanning out at the end:
+
+| | before | after |
+|---|--:|--:|
+| `cida denominators` | 1.98 s | **1.08 s** |
+| end-to-end | 5.36 s | **3.84 s** |
+
+Same trick `_enr_cfg_id` already plays one level down.
+
+### The first attempt was wrong, and worse
+
+Relabelling the per-cohort config rows with a config id FANS OUT rather
+than deduplicating: three cohorts sharing a config give three copies of
+every demographic filter row, and the join multiplies. That version
+spilled to disk and ran out of space. The fix is genuinely DISTINCT
+config-level tables — `cfg_denom_cohort`, `cfg_denom_demog`,
+`cfg_denom_strata` — plus `cfg_denom_map` for the fan-out. Measured:
+cfg_demog 160 rows becomes 56, cfg_age_strata 22 becomes 9.
+
+### Proving it does not change the answer
+
+The optimisation is only safe if the config key is COMPLETE. A missing
+parameter silently merges two cohorts whose denominators differ, and
+both get the wrong numbers — a plausible wrong answer, not an error.
+
+Two checks, not one:
+
+* **Byte-for-byte.** `denomcounts` was dumped from both the per-cohort
+  and the per-config version on the production study and diffed. 238
+  rows, identical.
+* **Key completeness.** Thirteen cases, each varying ONE parameter
+  between two otherwise-identical cohorts, asserting the config splits.
+
+The second check needed a check of its own. Four cases initially
+"passed" because the override was written to a table that does not
+carry that field — `sex` went to the type2 file, `mindayssupp` was
+spelt wrong — so the cohorts really were identical and sharing a config
+was correct. **A field written where nothing reads it looks exactly
+like a complete key.** The test now asserts the override reached the
+parsed cohort before drawing any conclusion from it.
+
+### Cold cache reads as a hot spot
+
+The first profile of this work blamed `exposure_claims` at 9.00 s, 73%
+of runtime. It was the first touch of the parquet files. Warm, the same
+statement is 0.52 s. Profile a warmed run, or the answer is about the
+filesystem.

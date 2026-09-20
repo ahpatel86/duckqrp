@@ -479,6 +479,34 @@ def _enr_cfg_id(c) -> str:
     return f"{c.coverage}|{c.enrol_gap}|{int(c.chart_required)}"
 
 
+def _denom_cfg_id(c) -> str:
+    """Cohorts agreeing on this produce IDENTICAL denominators.
+
+    `92_cidadenom.sql` builds one enrolled-member window per cohort per
+    enrollment span, filters by demographics, then bands by age. Every
+    parameter those steps read is in this key, so two cohorts sharing it
+    can share one pass.
+
+    Measured on a real study: 14 cohorts collapse to 5 configs, and the
+    stage was 63% of warm runtime. The same trick `_enr_cfg_id` plays
+    one level down.
+
+    Derived from what the SQL reads, not guessed — a parameter missing
+    here would silently merge two cohorts whose denominators differ.
+    """
+    demog = "|".join(
+        f"{dim}={','.join(sorted(vals))}"
+        for dim, vals in (("sex", c.sex), ("race", c.race),
+                          ("hispanic", c.hispanic)) if vals)
+    strata = ",".join(
+        f"{lv.lo}-{lv.hi}-{lv.unit}"
+        for lv in (c.age_strata.strata if c.age_strata else ()))
+    return "|".join(str(x) for x in (
+        _enr_cfg_id(c), c.enr_days, c.min_days_supp, c.min_epis_dur,
+        c.req_days_aft_epi, c.req_days_aft_ind, c.blackout_per,
+        strata, demog))
+
+
 def register_config(eng: Engine, study: StudyConfig) -> None:
     cohorts = study.cohorts
 
@@ -540,6 +568,67 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         list(seen.values()),
         """enr_cfg_id VARCHAR, coverage VARCHAR,
            enrol_gap INTEGER, chart_required BOOLEAN""",
+    )
+
+    # --- denominator config tables -------------------------------
+    # DISTINCT per config, not per cohort. Relabelling the per-cohort
+    # rows with a config id instead FANS OUT: three cohorts sharing a
+    # config give three copies of every filter row, and the join
+    # multiplies rather than deduplicates. That version spilled to disk
+    # and ran out of space.
+    eng.register(
+        "cfg_denom_map",
+        # Only cohorts SAS would compute a denominator for: OUTPUTDENOM
+        # is not "N", and no inclusion rule uses minrxdays > 1.
+        [{"denom_cfg_id": _denom_cfg_id(c), "cohortgrp": c.cohortgrp}
+         for c in cohorts
+         if c.cohortgrp in set(study.denominator_cohorts())],
+        "denom_cfg_id VARCHAR, cohortgrp VARCHAR",
+    )
+    eng.register(
+        "cfg_denom_cohort",
+        list({
+            _denom_cfg_id(c): {
+                "denom_cfg_id": _denom_cfg_id(c),
+                "enr_cfg_id": _enr_cfg_id(c),
+                "enr_days": c.enr_days,
+                "min_days_supp": c.min_days_supp,
+                "min_epis_dur": c.min_epis_dur,
+                "req_days_aft_epi": c.req_days_aft_epi,
+                "req_days_aft_ind": c.req_days_aft_ind,
+                "blackout_per": c.blackout_per,
+            } for c in cohorts
+        }.values()),
+        """denom_cfg_id VARCHAR, enr_cfg_id VARCHAR, enr_days INTEGER,
+           min_days_supp INTEGER, min_epis_dur INTEGER,
+           req_days_aft_epi INTEGER, req_days_aft_ind INTEGER,
+           blackout_per INTEGER""",
+    )
+    eng.register(
+        "cfg_denom_demog",
+        list({
+            (_denom_cfg_id(c), dim, v): {
+                "denom_cfg_id": _denom_cfg_id(c), "dimension": dim,
+                "value": v}
+            for c in cohorts
+            for dim, vals in (("sex", c.sex), ("race", c.race),
+                              ("hispanic", c.hispanic))
+            for v in vals
+        }.values()),
+        "denom_cfg_id VARCHAR, dimension VARCHAR, value VARCHAR",
+    )
+    eng.register(
+        "cfg_denom_strata",
+        list({
+            (_denom_cfg_id(c), lv.ordinal): {
+                "denom_cfg_id": _denom_cfg_id(c), "ordinal": lv.ordinal,
+                "label": lv.label, "lo": lv.lo, "hi": lv.hi,
+                "unit": lv.unit}
+            for c in cohorts
+            for lv in (c.age_strata.strata if c.age_strata else ())
+        }.values()),
+        """denom_cfg_id VARCHAR, ordinal INTEGER, label VARCHAR,
+           lo INTEGER, hi INTEGER, unit VARCHAR""",
     )
 
     eng.register(
