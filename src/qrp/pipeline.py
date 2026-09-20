@@ -21,364 +21,33 @@ from datetime import date, timedelta
 import time
 from dataclasses import dataclass
 import shutil as _shutil
+import warnings
 from pathlib import Path
 
 from .config import StudyConfig
 from .engine import Engine, sql_str
+# Output naming, disclosure routing and writing live in outputs.py.
+# Re-exported here because callers and tests import them from the
+# pipeline, and moving a name is not the point of the split.
+from .outputs import (  # noqa: F401
+    DISCLOSURE,
+    OPTIONAL_OUTPUT_TABLES,
+    OUTPUT_TABLES,
+    OUTPUTS,
+    SAS_CONTRACT,
+    SAS_NAME_NOTES,
+    SAS_NAMES,
+    Output,
+    _run_metadata,
+    tables_for,
+    _write_split_layout,
+)
 from .events import EmptyResult, LogMessage, Level, RunFinished, RunStarted
 from .scdm import SCDM, columns_of, identify_by_columns, reader, resolve_table
 
 # Stages that produce a table the caller may want on disk.
-OUTPUT_TABLES = (
-    "cohort_final",
-    "ptsmasterlist",
-    "attrition",
-    "denominators",
-    "censoring",
-)
-
-OPTIONAL_OUTPUT_TABLES = ("covariates_long", "covariate_prevalence",
-                          "baseline")
-
-# Which outputs may leave the Data Partner site.
-#
-# This is the ONE thing worth taking from the SAS layout, and it is not
-# a naming convention — it is a disclosure boundary:
-#
-#   dplocal  patient-level, stays behind the DP firewall
-#   msoc     aggregate, returned to the Sentinel Operations Center
-#
-# A flat directory collapses it, putting patient-level output next to
-# aggregate output with nothing to distinguish them, which makes "may
-# this file leave the site" a thing a human has to remember per file.
-#
-# File naming is controlled by --names:
-#
-#   sas      (default) reproduce the SAS QRP dataset names, so outputs
-#            drop into existing SOPs, parity tooling and review habits
-#            unchanged. `<runid>_mstr`, `<runid>_denomcounts`, ...
-#   logical  this pipeline's own table names, which are what `qrp show`
-#            and the documentation call them.
-#
-# Both write the same data to the same two libraries, and both write a
-# manifest, so `qrp show` and any downstream tool look tables up by
-# logical name either way — the convention never reaches a reader.
-#
-# Outputs whose SAS name this package reproduces EXACTLY. msoc datasets
-# go to the Operations Center, where tooling matches on dataset name, so
-# a plausible-looking rename is a breakage rather than a cosmetic
-# difference. Anything not listed here is either named differently in
-# SAS (see SAS_NAME_NOTES) or is an addition this package makes.
-SAS_CONTRACT: frozenset[str] = frozenset({
-    "attrition", "censoring", "distindex", "distindexmap",
-    "runtimes", "signature", "t2_cida", "followuptime",
-    "cohort_final", "denomcounts", "numcounts",
-})
-
-# Where this package cannot reproduce the SAS name exactly, and why.
-# Recorded in the manifest so a DP sending msoc onward can see it
-# rather than discover it downstream.
-SAS_NAME_NOTES: dict[str, str] = {
-    "covariate_prevalence":
-        "Not a SAS output. SAS's baseline table is wide and squared "
-        "(one row per group, one column per category level); this is "
-        "one row per covariate. Kept because the long form is easier "
-        "to read when checking a single covariate definition.",
-    "baseline":
-        "SAS: <runid>_baseline<outcohort>_<i>. The _<i> suffix is a "
-        "surveillance period index; this package does not model "
-        "surveillance periods, so there is no value to supply. The "
-        "shape and columns match.",
-    "mfu":
-        "SAS: <runid>_baseline_<mfu>_<i>. Same period-index caveat.",
-    "lab_summary":
-        "Not a SAS output. An aggregate summary this package adds.",
-    "risk_score_summary":
-        "Not a SAS output. An aggregate summary this package adds.",
-    "utilization_summary":
-        "Not a SAS output. An aggregate summary this package adds.",
-    "risk_scores":
-        "Not a SAS output. ms_computeriskscores attaches the score to "
-        "the master list; there is no dplocal.<runid>_risk_scores. The "
-        "&RUNID._RISKDIFFDATA_ datasets are a different analysis "
-        "(risk differences), not comorbidity scores.",
-    "risk_score_summary":
-        "Not a SAS output. An aggregate summary this package adds.",
-    "covariates_long":
-        "Not a SAS output. SAS holds covariate detection in work "
-        "datasets and emits only the derived baseline table; there is "
-        "no dplocal.<runid>_covariates. Kept because the long form is "
-        "what the CIDA and baseline stages read, and it is useful for "
-        "checking a covariate definition.",
-    "inclusion_excluded":
-        "Not a SAS output. There is no dplocal.<runid>_inclexcl; SAS "
-        "records exclusions in the attrition table. Kept because it "
-        "names WHICH condition excluded each episode, which attrition "
-        "counts but does not identify.",
-    "ptsmasterlist":
-        "Not a SAS output. SAS has one master list and it is the "
-        "FINALISED one (emitted here as cohort_final -> <runid>_mstr). "
-        "This is the pre-follow-up intermediate, kept for debugging "
-        "attrition.",
-    "geography":
-        "Not a SAS output. SAS carries zip3/state/hhs_reg/cb_reg/"
-        "zip_uncertain as COLUMNS ON mstr (ms_geographicvars.sas:158) "
-        "and has no &RUNID._geography dataset. Those columns are now on "
-        "mstr; this standalone table is kept as a convenience.",
-    "denominators":
-        "Not a SAS output under this name. SAS has exactly one "
-        "<runid>_denomcounts, which is ms_cidadenom's and is emitted as "
-        "`denomcounts`; this is a separate per-stratum aggregate.",
-}
-
-SAS_NAMES: dict[str, str] = {
-    # SAS has ONE master list. `DPLocal.&RUNID._mstr` is set from
-    # `_PtsMasterList` AFTER ms_finalizeptsmasterlist has attached the
-    # event and censoring columns (ms_createmicohorts.sas:2117), so
-    # SAS's mstr is the FINALISED list — this package's `cohort_final`.
-    #
-    # There is no `&RUNID._mstr_final` anywhere in the macro library.
-    # Mapping the pre-follow-up intermediate to `mstr` meant a DP
-    # reading `<runid>_mstr` got 6,687 extra episodes that had not been
-    # through the follow-up washout, and no eventdt/has_event columns.
-    "cohort_final":         "mstr",
-    # The pre-follow-up list is an intermediate SAS does not emit. Kept
-    # because it is useful for debugging attrition, under a name that
-    # does not claim to be a SAS output.
-    "ptsmasterlist":        "mstr_episodes",
-    "covariates_long":      "covariates",
-    # NOT "denomcounts". SAS has exactly one &RUNID._denomcounts and it
-    # is ms_cidadenom's output, which this package emits as the
-    # `denomcounts` table. `denominators` is a separate per-stratum
-    # aggregate from 70_outputs.sql; mapping both to the same SAS name
-    # meant the second write silently overwrote the first and one of the
-    # two outputs simply vanished. Reported in review.
-    "denominators":         "denomstrata",
-    # NOT "baseline". SAS's baseline is a WIDE, squared, one-row-per-
-    # group table (ms_createdistbaselinetable.sas:524); this is one row
-    # per covariate. A different table, not a renaming.
-    "covariate_prevalence": "covariate_prevalence",
-    "inclusion_excluded":   "inclexcl",
-    "attrition":            "attrition",
-    # SAS calls this censor_cida (ms_createcensortable.sas:22, 200).
-    # The msoc outputs go to the Operations Center, where downstream
-    # tooling matches on dataset name, so a plausible-looking rename is
-    # a breakage rather than a cosmetic difference.
-    "censoring":            "censor_cida",
-    "followuptime":         "followuptime_cida",
-    "signature":            "signature",
-    "runtimes":             "runtimes",
-}
-
-DISCLOSURE: dict[str, str] = {
-    "ptsmasterlist":        "dplocal",   # one row per patient-episode
-    "cohort_final":         "dplocal",   # one row per patient-episode
-    "covariates_long":      "dplocal",   # one row per patient-covariate
-    "inclusion_excluded":   "dplocal",   # one row per excluded episode
-    "denominators":         "dplocal",   # small cells can be identifying
-    "attrition":            "msoc",      # counts per step
-    "censoring":            "msoc",      # counts per exit reason
-    "covariate_prevalence": "msoc",      # counts per covariate
-    "baseline":             "msoc",      # the SAS distribution table
-    "t2_cida":              "msoc",
-    "followuptime":         "msoc",      # aggregate, per SAS      # the study output table
-    "denomcounts":          "dplocal",   # SAS puts this in dplocal
-    "numcounts":            "dplocal",   # numerator detail, per SAS
-    "distindex":            "msoc",      # counts per code combination
-    "distindexmap":         "msoc",      # code -> ID map
-    "mfu":                  "msoc",      # aggregate code counts
-    "lab_results":          "dplocal",   # patient-level results
-    "lab_summary":          "msoc",      # distribution only
-    "utilization":          "dplocal",   # one row per patient-episode
-    "utilization_summary":  "msoc",      # distribution only
-    "geography":            "dplocal",   # zip-level, identifying
-    "risk_scores":          "dplocal",   # one row per patient-episode
-    "risk_score_summary":   "msoc",      # distribution only
-    "signature":            "msoc",      # run provenance
-    "runtimes":             "msoc",      # per-stage timings
-}
 
 
-# covar_source is the union of claim domains that both the inclusion and
-# covariate stages match against. Defined here because either stage can
-# be the first to need it, and it must not be created twice.
-COVAR_SOURCE_VIEW = """
-CREATE OR REPLACE VIEW covar_source AS
--- rxsup/rxamt are carried so the inclusion stage can compute dose from
--- the MATCHED claim. They are NULL on the DX side, which is correct:
--- a diagnosis has no supply or amount.
--- enctype/pdx carry the CARE SETTING. Risk-score codes can restrict on
--- it (RISKSCORECODES.caresettingprincipal), and without these columns
--- that restriction was parsed and silently dropped — a score computed
--- over every setting when the study asked for one.
-SELECT patid, adate, adate AS expiredt, code, 'DX' AS codecat,
-       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt,
-       enctype, COALESCE(pdx, '') AS pdx
-FROM cdm_diagnosis
-UNION ALL
-SELECT patid, adate, adate + CAST(rxsup - 1 AS INTEGER) AS expiredt,
-       code, 'RX' AS codecat, rxsup, rxamt,
-       -- A dispensing has no encounter type; '**'/'' is the wildcard,
-       -- so an unrestricted rule still matches and a restricted one
-       -- correctly does not.
-       '**' AS enctype, '' AS pdx
-FROM cdm_dispensing
-UNION ALL
--- A procedure is a point event, like a diagnosis.
-SELECT patid, adate, adate AS expiredt, code, 'PX' AS codecat,
-       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt,
-       -- procedures carry enctype but no principal-diagnosis flag
-       enctype, '' AS pdx
-FROM cdm_procedure
-"""
-
-
-def _run_metadata(eng: Engine, study: StudyConfig, seconds: float) -> None:
-    """Build the SAS `_signature` and `_runtimes` tables.
-
-    Both are real SAS QRP outputs and both are MSOC — they are the
-    provenance that travels with the results. The data already exists in
-    the event log; this just materialises it in the expected shape.
-    """
-    import platform
-    import sys
-    from datetime import date, datetime
-
-    import duckdb as _ddb
-
-    eng.con.execute("""
-        CREATE OR REPLACE TABLE signature (
-            runid VARCHAR, study_type INTEGER, run_datetime TIMESTAMP,
-            start_date DATE, end_date DATE, censor_date DATE,
-            n_cohorts INTEGER, n_covariates INTEGER, n_inclusion_rules INTEGER,
-            engine VARCHAR, engine_version VARCHAR,
-            python_version VARCHAR, platform VARCHAR, wall_seconds DOUBLE,
-            -- The EFFECTIVE limit and thread count, not what was asked
-            -- for. Omitting memory_limit means DuckDB's own default of
-            -- 80% of physical RAM: 3.1 GiB on a 4 GB box, ~102 GB on a
-            -- 128 GB server. A run record that does not say which is
-            -- not a record of what the job took.
-            memory_limit VARCHAR, threads INTEGER
-        )""")
-    eng.con.execute(
-        "INSERT INTO signature VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [study.run_id, study.study_type, datetime.now(),
-         study.start_date, study.end_date, study.effective_censor_date,
-         len(study.cohorts), len(study.covariates), len(study.inclusions),
-         "duckdb", _ddb.__version__, sys.version.split()[0],
-         platform.platform(), round(seconds, 3),
-         eng.effective_memory_limit, eng.effective_threads],
-    )
-
-    eng.con.execute("""
-        CREATE OR REPLACE TABLE runtimes (
-            runid VARCHAR, step INTEGER, process VARCHAR,
-            seconds DOUBLE, rows BIGINT
-        )""")
-    eng.con.executemany(
-        "INSERT INTO runtimes VALUES (?,?,?,?,?)",
-        [[study.run_id, i, r.name, round(r.seconds, 3), r.rows]
-         for i, r in enumerate(eng.log, start=1)],
-    )
-
-
-def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
-                        tables: list[str], csv: bool = False,
-                        names: str = "sas") -> None:
-    """Write outputs under dplocal/ and msoc/.
-
-    `names="sas"` reproduces the SAS QRP dataset names; `"logical"` uses
-    this pipeline's own. The manifest maps logical -> file either way,
-    so readers never have to know which was used.
-    """
-    _run_metadata(eng, study, sum(r.seconds for r in eng.log))
-    run = study.run_id.lower()
-
-    # Clear THIS run's previous outputs before writing.
-    #
-    # Without it, a rerun into a populated directory leaves stale files
-    # that the current run did not produce, and nothing marks them as
-    # stale. Two ways that bites, both verified:
-    #
-    #   * Rerunning a study with a feature REMOVED — drop the
-    #     covariates, and covariates / baseline / covariate_prevalence
-    #     survive from the previous run. A reader gets covariate results
-    #     for a study that defines no covariates.
-    #   * Switching --names between `sas` and `logical` — the same table
-    #     is written under both names, so censor_cida and censoring sit
-    #     side by side with no indication they are one table.
-    #
-    # Scoped to this run_id's prefix, not the whole directory: a data
-    # partner may legitimately keep several runs' outputs together, and
-    # wiping a sibling run's results would be worse than the staleness
-    # this fixes.
-    for lib in ("dplocal", "msoc"):
-        d = out / lib
-        if not d.is_dir():
-            continue
-        for existing in d.glob(f"{run}_*"):
-            if existing.is_dir():
-                _shutil.rmtree(existing)
-            else:
-                existing.unlink()
-
-    for tbl in [*tables, "signature", "runtimes"]:
-        # Default to dplocal for anything unmapped: a new output should
-        # have to be declared shareable, never become so by omission.
-        lib = DISCLOSURE.get(tbl, "dplocal")
-        try:
-            eng.count(tbl)
-        except Exception:
-            continue
-        target_dir = out / lib
-        target_dir.mkdir(parents=True, exist_ok=True)
-        suffix = SAS_NAMES.get(tbl, tbl) if names == "sas" else tbl
-        name = f"{run}_{suffix}"
-        part = "cohortgrp" if tbl in ("cohort_final", "ptsmasterlist") else None
-        dest = target_dir / name if part else target_dir / f"{name}.parquet"
-        eng.write_parquet(tbl, dest, partition_by=part)
-        if csv:
-            csv_dir = out / lib / "csv"
-            csv_dir.mkdir(parents=True, exist_ok=True)
-            eng.write_csv(tbl, csv_dir / f"{name}.csv")
-
-    # A manifest, so `qrp show` and any downstream tool can find tables by
-    # their logical name without having to parse the SAS convention.
-    import json as _json
-
-    manifest = {
-        "runid": study.run_id,
-        "layout": "split",
-        "names": names,
-        "tables": {
-            t: {
-                "library": DISCLOSURE.get(t, "dplocal"),
-                "file": f"{run}_"
-                        f"{SAS_NAMES.get(t, t) if names == 'sas' else t}",
-                # Whether this file's name matches the SAS output it
-                # corresponds to. False means either the SAS name
-                # carries a suffix this package cannot supply, or the
-                # output is an addition — `note` says which.
-                "sas_contract": t in SAS_CONTRACT,
-                **({"note": SAS_NAME_NOTES[t]} if t in SAS_NAME_NOTES
-                   else {}),
-            }
-            for t in [*tables, "signature", "runtimes"]
-        },
-    }
-    # Written LAST, deliberately. The write sequence is
-    # clear -> tables -> manifest, so a failure partway through leaves
-    # the tables without a manifest. Its PRESENCE is therefore the
-    # signal that a run completed and its outputs are the full set.
-    #
-    # A failure during the write loop does lose the previous run's
-    # outputs, since they were cleared first. The alternative — writing
-    # to a temp tree and swapping — doubles peak disk, and disk is
-    # already the binding constraint at scale (the pipeline spills
-    # roughly 2.6x the input size at its memory floor), so the cure
-    # would risk causing the disease. Re-running regenerates the
-    # outputs; a half-full disk does not.
-    (out / "manifest.json").write_text(_json.dumps(manifest, indent=1))
 
 
 def _finish(eng: Engine, study: StudyConfig, dt: float,
@@ -452,6 +121,56 @@ def _check_exposure(eng: Engine, study: StudyConfig, indata) -> None:
 _SAFE_LEVEL = _re.compile(r"[^A-Za-z0-9]")
 
 
+def _covar_strata(study: StudyConfig) -> tuple[int, ...]:
+    """Covariate numbers any t2cida level stratifies on.
+
+    SAS's `&covarstrat.`: USERSTRATA levelvars beginning with "covar"
+    add a column per covariate to t2_cida
+    (ms_cidatables.sas:403-412, 425). Without them a study asking to
+    stratify by covar1 got the UNSTRATIFIED totals labelled as that
+    level — silently wrong, which is worse than a missing column.
+
+    The union across levels, because the table is one relation: a level
+    that does not stratify on a covariate carries NULL for it, the same
+    convention used for agegroup and sex.
+    """
+    out: set[int] = set()
+    for lv in study.cida_levels():
+        for var in lv.levelvars:
+            v = var.lower()
+            if v.startswith("covar") and v[5:].isdigit():
+                out.add(int(v[5:]))
+    return tuple(sorted(out))
+
+
+def _covar_strata_sql(study: StudyConfig) -> tuple[str, str, str, str]:
+    """(base, select, group_by, final) SQL fragments for covariate strata.
+
+    Empty strings when no level stratifies on a covariate, so the query
+    is unchanged for the common case.
+    """
+    nums = _covar_strata(study)
+    if not nums:
+        return "", "", "", ""
+
+    base_parts, sel_parts, grp_parts = [], [], []
+    for n in nums:
+        base_parts.append(
+            ",\n        EXISTS (SELECT 1 FROM covariates_long x"
+            " WHERE x.cohortgrp = c.cohortgrp AND x.patid = c.patid"
+            f" AND x.indexdt = c.indexdt AND x.covarnum = {n})::INTEGER"
+            f" AS covar{n}")
+        # `covarstrat` is a space-joined list, so match the PADDED string:
+        # a bare LIKE '%covar1%' would also match covar12.
+        cond = (f"CASE WHEN ' ' || lv.covarstrat || ' ' LIKE '% covar{n} %'"
+                f" THEN b.covar{n} END")
+        sel_parts.append(f",\n    {cond} AS covar{n}")
+        grp_parts.append(f",\n    {cond}")
+    final_parts = [f",\n    n.covar{n}" for n in nums]
+    return ("".join(base_parts), "".join(sel_parts), "".join(grp_parts),
+            "".join(final_parts))
+
+
 def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
     """Widen `baseline` with one column per OBSERVED category level.
 
@@ -467,8 +186,14 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
     never interpolated raw.
     """
     dummies: list[str] = []
+    # SAS sums these dummy groups: patient, Age:, Sex_:, year_:,
+    # race_:, hispanic_:, covar1..N, and cb_reg_:/sdi_: when geography
+    # is on (ms_createdistbaselinetable.sas:457-460). `year_` was
+    # missing here — an index-year distribution the study asked for and
+    # did not get.
     for column, prefix in (("sex", "Sex"), ("race", "Race"),
-                           ("hispanic", "Hispanic"), ("agegroup", "Age")):
+                           ("hispanic", "Hispanic"), ("agegroup", "Age"),
+                           ):
         rows = eng.con.execute(
             f"SELECT DISTINCT {column} FROM cohort_final "
             f"WHERE {column} IS NOT NULL ORDER BY 1"
@@ -498,6 +223,33 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
                 f"THEN 1 ELSE 0 END) AS \"{prefix}_{safe}\""
             )
 
+    # Index-year dummies. Derived, not a stored column, so built
+    # separately from the categorical ones above.
+    years = eng.con.execute(
+        "SELECT DISTINCT year(indexdt) FROM cohort_final "
+        "WHERE indexdt IS NOT NULL ORDER BY 1").fetchall()
+    for (yr,) in years:
+        dummies.append(
+            f"sum(CASE WHEN year(c.indexdt) = {int(yr)} "
+            f"THEN 1 ELSE 0 END) AS \"year_{int(yr)}\"")
+
+    # Geography dummies, only when the geography stage ran — SAS gates
+    # these on `&geog = Y` for the same reason.
+    for column, prefix in (("cb_reg", "cb_reg"), ("sdi_cat", "sdi")):
+        try:
+            rows = eng.con.execute(
+                f"SELECT DISTINCT {column} FROM cohort_final "
+                f"WHERE {column} IS NOT NULL ORDER BY 1").fetchall()
+        except Exception:
+            continue                      # column absent: stage not run
+        for (value,) in rows:
+            safe = _SAFE_LEVEL.sub("_", str(value))
+            if not safe:
+                continue
+            dummies.append(
+                f"sum(CASE WHEN c.{column} = {sql_str(value)} "
+                f"THEN 1 ELSE 0 END) AS \"{prefix}_{safe}\"")
+
     for cov in study.covariates:
         dummies.append(
             f"sum(CASE WHEN EXISTS (SELECT 1 FROM covariates_long x "
@@ -505,6 +257,47 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
             f"AND x.indexdt = c.indexdt AND x.covarnum = {int(cov.covarnum)})"
             f" THEN 1 ELSE 0 END) AS \"covar{int(cov.covarnum)}\""
         )
+
+    # Continuous variables get mean_ and std_, not a sum
+    # (ms_createdistbaselinetable.sas:474-500). SAS lists Age, the risk
+    # scores, and the utilization counts NumAV/NumOA/NumIP/NumIS/NumED
+    # and NumGeneric/NumClass/NumRx. Age is in 96_baseline.sql; the
+    # others are added here when their optional stage produced them,
+    # exactly as SAS gates them.
+    # (source column, SAS name). The two differ: the utilization stage
+    # names its encounter counts enc_av/enc_oa/..., SAS calls them
+    # NumAV/NumOA/.... An earlier version listed only the SAS names and
+    # the `continue` below silently skipped five of the eight — the
+    # exact failure this mapping exists to prevent.
+    for table, cols in (
+        ("utilization", (("enc_av", "NumAV"), ("enc_oa", "NumOA"),
+                         ("enc_ip", "NumIP"), ("enc_is", "NumIS"),
+                         ("enc_ed", "NumED"), ("numgeneric", "NumGeneric"),
+                         ("numclass", "NumClass"), ("numrx", "NumRx"))),
+        ("risk_scores", (("score", "RiskScore"),)),
+    ):
+        try:
+            have = {d[0].lower() for d in eng.con.execute(
+                f"SELECT * FROM {table} LIMIT 0").description}
+        except Exception:
+            continue                      # optional stage did not run
+        missing = [src for src, _ in cols if src not in have]
+        if missing:
+            # Loud, not silent: a column the stage was expected to
+            # produce and did not is a defect, not a configuration.
+            warnings.warn(
+                f"baseline: {table} is missing {missing}; those "
+                f"mean_/std_ columns will be absent from the baseline "
+                f"table", stacklevel=2)
+        for src, sas in cols:
+            if src not in have:
+                continue
+            lookup = (f"(SELECT u.{src} FROM {table} u "
+                      f"WHERE u.cohortgrp = c.cohortgrp "
+                      f"AND u.patid = c.patid AND u.indexdt = c.indexdt)")
+            dummies.append(f"round(avg({lookup}), 4) AS \"mean_{sas}\"")
+            dummies.append(
+                f"round(stddev_samp({lookup}), 4) AS \"std_{sas}\"")
 
     if not dummies:
         return ""
@@ -560,48 +353,106 @@ def _empty_relation(spec) -> str:
     return f"(SELECT {cols} WHERE FALSE)"
 
 
-def plan_stages(study: StudyConfig) -> list[str]:
-    """Stage names in order.
+COVAR_SOURCE_VIEW = """
+CREATE OR REPLACE VIEW covar_source AS
+-- rxsup/rxamt are carried so the inclusion stage can compute dose from
+-- the MATCHED claim. They are NULL on the DX side, which is correct:
+-- a diagnosis has no supply or amount.
+-- enctype/pdx carry the CARE SETTING. Risk-score codes can restrict on
+-- it (RISKSCORECODES.caresettingprincipal), and without these columns
+-- that restriction was parsed and silently dropped — a score computed
+-- over every setting when the study asked for one.
+SELECT patid, adate, adate AS expiredt, code, 'DX' AS codecat,
+       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt,
+       enctype, COALESCE(pdx, '') AS pdx
+FROM cdm_diagnosis
+UNION ALL
+SELECT patid, adate, adate + CAST(rxsup - 1 AS INTEGER) AS expiredt,
+       code, 'RX' AS codecat, rxsup, rxamt,
+       -- A dispensing has no encounter type; '**'/'' is the wildcard,
+       -- so an unrestricted rule still matches and a restricted one
+       -- correctly does not.
+       '**' AS enctype, '' AS pdx
+FROM cdm_dispensing
+UNION ALL
+-- A procedure is a point event, like a diagnosis.
+SELECT patid, adate, adate AS expiredt, code, 'PX' AS codecat,
+       NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt,
+       -- procedures carry enctype but no principal-diagnosis flag
+       enctype, '' AS pdx
+FROM cdm_procedure
+"""
 
-    Single source of truth: a progress bar needs the total before the
-    first stage starts, and the log needs it to write [3/10] rather than
-    [3/0]. Both the CLI and the UI read it from here, so the two paths
-    cannot drift.
+
+@dataclass(frozen=True)
+class Stage:
+    """One pipeline stage: its name, its SQL, and when it runs.
+
+    THE stage list. `plan_stages()` filters it and `run()` executes it,
+    so the two cannot disagree about which stages exist or in what
+    order.
+
+    They used to be two parallel sequences — one in `plan_stages()`, one
+    in `run()` — and the docstring on the former claimed to be the
+    single source of truth while the latter quietly went its own way.
+    Three stages were added during one session and each needed
+    editing in both places; one was missed, and only a UI test comparing
+    the two counts caught it.
+
+    `gate` names a StudyConfig property. None means the stage always
+    runs. `skip_note` is what verbose mode prints when it does not.
     """
-    stages = ["normalize", "enrollment_spans", "exposure + stockpiling",
-              "index dates"]
-    if study.any_dose:
-        stages.append("dose restrictions")
-    stages.append("pov1")
-    stages.append("episodes + masterlist")
-    if study.any_inclusions:
-        stages.append("inclusion criteria")
-    if study.any_dose_censoring:
-        stages.append("dose censoring")
-    stages += ["follow-up + events", "attrition + denominators"]
-    if study.any_code_distribution:
-        stages.append("code distribution")
-    if study.any_mfu:
-        stages.append("most frequent use")
-    if study.any_labs:
-        stages.append("labs")
-    if study.any_utilization:
-        stages.append("utilization")
-    if study.any_geography:
-        stages.append("geography")
-    if study.any_risk_scores:
-        stages.append("risk scores")
-    if study.any_covariates:
-        stages.append("covariates")
-        # The SAS baseline distribution table runs with the covariates,
-        # since its dummy columns come from covariates_long.
-        stages.append("baseline")
-    if study.any_cida_tables:
-        stages += ["cida denominators", "cida tables"]
-    if study.any_followuptime:
-        stages.append("follow-up time table")
-    return stages
+    name: str
+    script: str
+    gate: str | None = None
+    skip_note: str = ""
 
+    def runs_for(self, study: StudyConfig) -> bool:
+        return self.gate is None or bool(getattr(study, self.gate))
+
+
+STAGES: tuple[Stage, ...] = (
+    Stage("normalize",              "10_normalize.sql"),
+    Stage("enrollment_spans",       "20_enrollment.sql"),
+    Stage("exposure + stockpiling", "30_exposure.sql"),
+    Stage("index dates",            "40_index.sql"),
+    Stage("dose restrictions",      "42_dose.sql", "any_dose",
+          "dose restrictions (no cohort sets a dose limit)"),
+    Stage("pov1",                   "45_pov1.sql"),
+    Stage("episodes + masterlist",  "50_episodes.sql"),
+    Stage("inclusion criteria",     "52_inclusion.sql", "any_inclusions"),
+    Stage("dose censoring",         "55_dose_censor.sql",
+          "any_dose_censoring"),
+    Stage("follow-up + events",     "60_followup.sql"),
+    Stage("attrition + denominators", "70_outputs.sql"),
+    Stage("code distribution",      "72_codedistribution.sql",
+          "any_code_distribution"),
+    Stage("most frequent use",      "78_mfu.sql", "any_mfu"),
+    Stage("labs",                   "76_labs.sql", "any_labs"),
+    Stage("utilization",            "74_utilization.sql", "any_utilization"),
+    Stage("geography",              "47_geography.sql", "any_geography"),
+    Stage("risk scores",            "85_riskscores.sql", "any_risk_scores"),
+    Stage("covariates",             "80_covariates.sql", "any_covariates",
+          "covariates (none defined)"),
+    Stage("baseline",               "96_baseline.sql", "any_covariates"),
+    Stage("cida denominators",      "92_cidadenom.sql", "any_cida_tables"),
+    Stage("cida tables",            "90_cidatables.sql", "any_cida_tables"),
+    Stage("follow-up time table",   "94_followuptime.sql", "any_followuptime"),
+)
+
+
+_STAGE_BY_NAME: dict[str, Stage] = {st.name: st for st in STAGES}
+
+
+def plan_stages(study: StudyConfig) -> list[str]:
+    """Stage names in order, for this study.
+
+    Derived from STAGES, so it cannot disagree with what `run()`
+    actually executes. A progress bar needs the total before the first
+    stage starts, and the log needs it to write [3/10] rather than
+    [3/0]; both the CLI and the UI read it from here.
+    """
+    return [st.name for st in STAGES if st.runs_for(study)]
 
 @dataclass
 class RunResult:
@@ -619,8 +470,6 @@ class RunResult:
 # --------------------------------------------------------------------
 # Config -> DuckDB tables
 # --------------------------------------------------------------------
-
-
 def _enr_cfg_id(c) -> str:
     """Enrollment configs are deduplicated across cohorts.
 
@@ -824,6 +673,13 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "has_hispanic": "hispanic" in lv.levelvars,
                 "has_year": "index_year" in lv.levelvars
                             or "year" in lv.levelvars,
+                # USERSTRATA levelvars beginning with "covar" stratify
+                # the table by a COVARIATE — SAS's `&covarstrat.`
+                # (ms_cidatables.sas:403-412). Stored as a space-joined
+                # string so one row per level still describes the level
+                # completely.
+                "covarstrat": " ".join(
+                    v for v in lv.levelvars if v.lower().startswith("covar")),
             }
             # Both output tables share the level shape; each is filtered
             # to its own tableid at registration time.
@@ -831,7 +687,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                                    or study.followuptime_levels())
         ],
         """level_id VARCHAR, has_agegroup BOOLEAN, has_sex BOOLEAN,
-           has_race BOOLEAN, has_hispanic BOOLEAN, has_year BOOLEAN""",
+           has_race BOOLEAN, has_hispanic BOOLEAN, has_year BOOLEAN,
+           covarstrat VARCHAR""",
     )
 
     eng.register(
@@ -1097,7 +954,33 @@ def run(
         "claims_to": study.effective_censor_date.isoformat(),
     }
 
-    eng.script_stage("normalize", "10_normalize.sql", **fmt)
+    # Stages run from STAGES, so `run()` and `plan_stages()` cannot
+    # disagree. Stages with side effects (a view to create, a rebuild to
+    # trigger) declare them in AFTER_STAGE below rather than being
+    # hand-written in sequence here.
+    def _stage_params(name: str) -> dict:
+        """Extra SQL parameters for a stage, beyond the common `fmt`.
+
+        Only the CIDA table needs them: its covariate-stratum columns
+        are generated from USERSTRATA and so cannot be static SQL.
+        """
+        if name == "cida tables":
+            cbase, csel, cgrp, cfin = _covar_strata_sql(study)
+            return {**fmt, "covar_base": cbase, "covar_select": csel,
+                    "covar_group": cgrp, "covar_final": cfin}
+        return fmt
+
+    def _stage(name: str) -> bool:
+        """Run the named stage if this study calls for it."""
+        st = _STAGE_BY_NAME[name]
+        if not st.runs_for(study):
+            if verbose and st.skip_note:
+                print(f"  {'[ skipped ]':>10} {st.skip_note}")
+            return False
+        eng.script_stage(st.name, st.script, **_stage_params(name))
+        return True
+
+    _stage("normalize")
     # covar_source is a VIEW over the claim domains, used by the
     # covariate, inclusion, risk-score and event-anchored stages. It was
     # created conditionally in two places, which meant adding a fourth
@@ -1105,8 +988,8 @@ def run(
     # costs nothing (nothing is materialised) and removes the ordering
     # bug entirely.
     eng.con.execute(COVAR_SOURCE_VIEW.format(**fmt))
-    eng.script_stage("enrollment_spans", "20_enrollment.sql", **fmt)
-    eng.script_stage("exposure + stockpiling", "30_exposure.sql", **fmt)
+    _stage("enrollment_spans")
+    _stage("exposure + stockpiling")
     # claim_dose is a VIEW over exposure_claims with three consumers: the
     # dose restrictions, the dose censoring, and the per-subcondition
     # dose thresholds on inclusion rules. It used to live inside
@@ -1122,7 +1005,7 @@ def run(
     # Say so here, where the cause is still obvious, rather than letting
     # the run finish "successfully" with every output table empty.
     _check_exposure(eng, study, indata)
-    eng.script_stage("index dates", "40_index.sql", **fmt)
+    _stage("index dates")
 
     # Conditional stage. The decision is a property over config, so an
     # unused stage costs nothing — not even the probe query the PySpark
@@ -1130,15 +1013,11 @@ def run(
     #
     # ORDER MATTERS: this rewrites index_candidates in place, so it must
     # run before 45_pov1.sql reads it.
-    if study.any_dose:
-        eng.script_stage("dose restrictions", "42_dose.sql", **fmt)
-    elif verbose:
-        print(f"  {'[ skipped ]':>10} dose restrictions "
-              f"(no cohort sets a dose limit)")
+    _stage("dose restrictions")
 
-    eng.script_stage("pov1", "45_pov1.sql", **fmt)
+    _stage("pov1")
 
-    eng.script_stage("episodes + masterlist", "50_episodes.sql", **fmt)
+    _stage("episodes + masterlist")
 
     # Narrow the claim scan to cohort members, ONCE.
     #
@@ -1202,37 +1081,28 @@ def run(
     # which is where SAS evaluates them (ms_createpov3 is called with
     # _PtsMasterList). The master list carries episodeenddt, so
     # EPISODEENDDT-anchored windows work here and could not before.
-    if study.any_inclusions:
-        eng.script_stage("inclusion criteria", "52_inclusion.sql", **fmt)
+    _stage("inclusion criteria")
 
     # maxcumdose censors the episode as well as excluding index dates.
     # Needs claim_dose from 42_dose.sql, hence the same gate.
-    if study.any_dose_censoring:
-        eng.script_stage("dose censoring", "55_dose_censor.sql", **fmt)
+    _stage("dose censoring")
 
-    eng.script_stage("follow-up + events", "60_followup.sql", **fmt)
-    eng.script_stage("attrition + denominators", "70_outputs.sql", **fmt)
+    _stage("follow-up + events")
+    _stage("attrition + denominators")
 
-    if study.any_code_distribution:
-        eng.script_stage("code distribution", "72_codedistribution.sql",
-                         **fmt)
+    _stage("code distribution")
 
     # Risk scores need covar_source, defined by the covariates stage or
     # created here when only risk scores need it.
-    if study.any_mfu:
-        eng.script_stage("most frequent use", "78_mfu.sql", **fmt)
+    _stage("most frequent use")
 
-    if study.any_labs:
-        eng.script_stage("labs", "76_labs.sql", **fmt)
+    _stage("labs")
 
-    if study.any_utilization:
-        eng.script_stage("utilization", "74_utilization.sql", **fmt)
+    _stage("utilization")
 
-    if study.any_geography:
-        eng.script_stage("geography", "47_geography.sql", **fmt)
+    _stage("geography")
 
-    if study.any_risk_scores:
-        eng.script_stage("risk scores", "85_riskscores.sql", **fmt)
+    _stage("risk scores")
 
     if study.any_covariates:
         eng.script_stage("covariates", "80_covariates.sql", **fmt)
@@ -1262,40 +1132,19 @@ def run(
         # Denominators first: the CIDA table merges them onto the
         # numerators, matching SAS's order.
         eng.script_stage("cida denominators", "92_cidadenom.sql", **fmt)
-        eng.script_stage("cida tables", "90_cidatables.sql", **fmt)
-    elif verbose:
-        print(f"  {'[ skipped ]':>10} covariates (none defined)")
+        cbase, csel, cgrp, cfin = _covar_strata_sql(study)
+        eng.script_stage("cida tables", "90_cidatables.sql",
+                         covar_base=cbase, covar_select=csel,
+                         covar_group=cgrp, covar_final=cfin, **fmt)
 
     # msoc.<runid>_followuptime_cida — requested via USERSTRATA
     # tableid='t2followuptime' (ms_cidanum.sas:2826). Gated separately
     # from t2cida: a study can ask for either, both, or neither.
-    if study.any_followuptime:
-        eng.script_stage("follow-up time table", "94_followuptime.sql",
-                         **fmt)
+    _stage("follow-up time table")
 
     if output_dir:
         out = Path(output_dir)
-        tables = list(OUTPUT_TABLES)
-        if study.any_covariates:
-            tables += list(OPTIONAL_OUTPUT_TABLES)
-        if study.any_inclusions:
-            tables.append("inclusion_excluded")
-        if study.any_cida_tables:
-            tables += ["t2_cida", "denomcounts", "numcounts"]
-        if study.any_followuptime:
-            tables.append("followuptime")
-        if study.any_risk_scores:
-            tables += ["risk_scores", "risk_score_summary"]
-        if study.any_geography:
-            tables.append("geography")
-        if study.any_code_distribution:
-            tables += ["distindex", "distindexmap"]
-        if study.any_utilization:
-            tables += ["utilization", "utilization_summary"]
-        if study.any_labs:
-            tables += ["lab_results", "lab_summary"]
-        if study.any_mfu:
-            tables.append("mfu")
+        tables = tables_for(study)
 
         if layout == "split":
             _write_split_layout(eng, study, out, tables, csv=csv,

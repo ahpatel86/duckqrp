@@ -54,10 +54,9 @@ IGNORE_COLUMNS: dict[str, tuple[str, ...]] = {
                      "episode_days", "person_days", "episode",
                      "episodestartdt", "episode_rxsup", "dataavail_dt",
                      "atriskindexdt"),
-    # attrition leads with the SAS contract columns and carries this
-    # package's extra counts after them; only the extras are excluded.
-    "attrition": ("records", "patients", "records_dropped",
-                  "patients_dropped"),
+    # attrition carries EXACTLY the SAS columns now, so nothing to
+    # exclude. The extras it used to append were removed as
+    # non-contract.
 }
 
 
@@ -72,6 +71,16 @@ class ParityDumper:
         written: list[Path] = []
         for stage in stages or tuple(STAGE_TABLES):
             for table in STAGE_TABLES.get(stage, ()):
+                # Optional stages produce no table. Dumping what exists
+                # and skipping the rest is the whole point: a parity run
+                # compares the tables BOTH sides produced. Raising here
+                # meant the dump died on any study without USERSTRATA —
+                # so the first thing a data partner tried would fail,
+                # and the comparison they were setting up never ran.
+                try:
+                    eng.count(table)
+                except Exception:
+                    continue
                 written += self._dump_table(eng, stage, table)
         return written
 

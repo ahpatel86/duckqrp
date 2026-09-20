@@ -224,3 +224,77 @@ Three things the checker found that were worth fixing, all of them mine:
 
 The dependency direction is one-way: `tui.py` → `runner.py` → `engine.py`
 → SQL. Nothing lower knows a UI exists.
+
+
+---
+
+## The stage table
+
+`STAGES` is a tuple of `Stage(name, script, gate, skip_note)`.
+`plan_stages()` filters it; `run()` executes it. Neither enumerates
+stages independently, so they cannot disagree about which exist or in
+what order.
+
+They used to be two parallel sequences. `plan_stages()`'s docstring
+claimed to be the single source of truth while `run()` went its own way,
+and three stages added in one session each needed editing in both
+places. One was missed — caught only because a UI test compared the two
+counts.
+
+`plan_stages()` is now 8 lines instead of 40, and adding a stage is one
+tuple entry.
+
+Two tests enforce the structure rather than the symptom:
+
+* every stage names a SQL file that exists, and a gate that is a real
+  `StudyConfig` property (a typo'd gate would mean the stage silently
+  never runs)
+* every numbered SQL file is referenced by some stage, so a file no
+  stage runs is caught as dead code
+
+Stages with side effects — a view to create, a rebuild to trigger,
+generated SQL to pass — keep explicit code in `run()`; the table still
+decides whether they run. `cida tables` is the only stage needing extra
+SQL parameters, because its covariate-stratum columns come from
+USERSTRATA and cannot be static.
+
+## One declaration per output
+
+`OUTPUTS` is a tuple of `Output(name, sas_name, library, contract, emit,
+note)`. `OUTPUT_TABLES`, `OPTIONAL_OUTPUT_TABLES`, `SAS_NAMES`,
+`DISCLOSURE`, `SAS_CONTRACT` and `SAS_NAME_NOTES` are all projections of
+it.
+
+They used to be six independent dicts over the same 25 tables, held in
+agreement by tests. That is what produced the two worst output bugs
+found in review: `mstr` named the wrong table, because nothing tied the
+SAS name to the table that actually holds the finalised cohort; and
+`geography` claimed a SAS name that does not exist anywhere in the macro
+library, because `SAS_CONTRACT` had been populated from what this
+package emits rather than from what SAS does.
+
+**The constructor refuses a non-contract output with no note.** An
+addition has to say what it is, or a reader cannot tell it from an
+omission. That check found two outputs — `lab_results` and
+`utilization` — that were neither verified as SAS names nor documented
+as additions. `lab_results` may correspond to
+`DPLocal.<runid>_Claims_lab`, but its columns have not been compared, so
+it is recorded as unverified rather than claimed.
+
+### `emit` is three-valued, not a boolean
+
+An early version used `always: bool` and derived the optional list as
+its complement. That was wrong: `OPTIONAL_OUTPUT_TABLES` means
+specifically the COVARIATE-gated outputs, not everything that is not
+always written, and the complement would have made every covariate study
+try to write all twenty optional tables. `emit` is `"always"`,
+`"covariate"` or `"gated"`.
+
+### Remaining debt
+
+`run()` is still long (~385 lines), and `pipeline.py` still mixes
+orchestration with output naming and disclosure routing. The output
+contract — SAS name, library, column list — is declared across
+`SAS_NAMES`, `DISCLOSURE` and `SAS_CONTRACT` with tests holding them in
+agreement, where one declaration per output would make the mismatch
+unrepresentable. Both are known and neither is fixed.

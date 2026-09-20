@@ -42,6 +42,18 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="qrp", description="Sentinel QRP Type 2")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # Identity and self-check. Listed first because they are what a
+    # site needs when something is wrong, and a subcommand nobody can
+    # find is a subcommand that does not exist.
+    sub.add_parser(
+        "version",
+        help="what is installed, including a hash that reveals patches")
+    d = sub.add_parser(
+        "doctor",
+        help="run the pipeline on generated data and check it (no site data)")
+    d.add_argument("--keep", action="store_true",
+                   help="keep the working files for inspection")
+
     r = sub.add_parser("run", help="run the pipeline")
     r.add_argument("--study", required=True, help="study definition JSON")
     r.add_argument("--indata", required=True, help="CDM parquet root")
@@ -124,6 +136,17 @@ def main(argv: list[str] | None = None) -> int:
                    help="skip row counts (faster on large data)")
 
     a = ap.parse_args(argv)
+
+    # Dispatched first: these take no run arguments, and anything below
+    # reads attributes that only `run` defines.
+    if a.cmd == "version":
+        from .selfcheck import version_report
+        print(version_report())
+        return 0
+
+    if a.cmd == "doctor":
+        from .selfcheck import doctor
+        return doctor(keep=a.keep)
 
     if a.cmd == "ui":
         try:

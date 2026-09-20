@@ -48,11 +48,17 @@ SELECT
     -- matching on `level` should not have to know it was called
     -- `step_no` here.
     --
-    -- `claim_level` is "Member" or "Episode" and says which unit
-    -- remaining/excluded are counted in. SAS carries ONE pair plus that
-    -- label; this keeps both units as extra columns after the contract
-    -- ones, since the information is already computed and losing it to
-    -- match a shape would be a worse trade than carrying it.
+    -- EXACTLY the SAS columns, nothing more. SAS's attrition data step
+    -- writes level, claim_level, descr, remaining, excluded and group
+    -- and stops (ms_attrition_cidacompute.sas:125-134).
+    --
+    -- This used to carry records / patients / records_dropped /
+    -- patients_dropped after the contract columns, on the reasoning
+    -- that the values were already computed. That was wrong: for an
+    -- msoc output the column SET is the contract, not just the column
+    -- names, and a table with four unexpected columns is one a
+    -- downstream reader has to be taught to ignore. Reported by a data
+    -- partner who noticed the extra columns in their own run.
     cohortgrp                       AS "group",
     step_no                         AS level,
     step                            AS descr,
@@ -68,11 +74,6 @@ SELECT
     -- a wrong one is not.
     CASE WHEN step_no = 4 THEN NULL
          ELSE lag(records) OVER w - records END            AS excluded,
-    -- Beyond the contract: both units side by side.
-    records,
-    patients,
-    lag(records)  OVER w - records  AS records_dropped,
-    lag(patients) OVER w - patients AS patients_dropped
 FROM steps
 WINDOW w AS (PARTITION BY cohortgrp ORDER BY step_no)
 ORDER BY cohortgrp, step_no;
@@ -126,6 +127,9 @@ WITH censored AS (
         c.cohortgrp,
         c.agegroup,
         c.sex,
+        c.race,
+        c.hispanic,
+        year(c.indexdt)::VARCHAR AS index_year,
         c.deathdt,
         c.enr_end,
         least(c.enr_end,
@@ -161,8 +165,18 @@ SELECT
     f.cohortgrp              AS "group",
     lv.level_id              AS level,
     CAST(f.timetocensor AS VARCHAR) AS censdays_value_cat,
+    -- ALL the USERSTRATA levelvars, not just two. `censorstrat` is
+    -- the levelvars (ms_cidanum.sas:123), so race, hispanic and year
+    -- stratify this table exactly as agegroup and sex do. Honouring
+    -- only agegroup and sex meant a level asking for `year` got the
+    -- UNSTRATIFIED totals labelled as that level — every level came
+    -- back with identical row counts. The production study seen
+    -- stratifies on `year`.
     CASE WHEN lv.has_agegroup THEN f.agegroup END AS agegroup,
     CASE WHEN lv.has_sex      THEN f.sex      END AS sex,
+    CASE WHEN lv.has_race     THEN f.race     END AS race,
+    CASE WHEN lv.has_hispanic THEN f.hispanic END AS hispanic,
+    CASE WHEN lv.has_year     THEN f.index_year END AS "year",
     count(*)                 AS episodes,
     sum(f.cens_elig)         AS cens_elig,
     sum(f.cens_dth)          AS cens_dth,
@@ -174,9 +188,10 @@ FROM flagged f
 -- the CROSS JOIN yields NOTHING for a study that defines no strata —
 -- an msoc output silently absent rather than unstratified.
 CROSS JOIN (
-    SELECT level_id, has_agegroup, has_sex FROM cfg_strata
+    SELECT level_id, has_agegroup, has_sex, has_race,
+           has_hispanic, has_year FROM cfg_strata
     UNION ALL
-    SELECT '1', FALSE, FALSE
+    SELECT '1', FALSE, FALSE, FALSE, FALSE, FALSE
     WHERE NOT EXISTS (SELECT 1 FROM cfg_strata)
 ) lv
 GROUP BY ALL

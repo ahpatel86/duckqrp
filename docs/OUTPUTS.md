@@ -69,6 +69,179 @@ matching.
 Verified after the rename: `denomcounts` and `t2_cida` reconcile at
 154,300 `dennumpts`.
 
+## Which tables stratify, and which correctly do not
+
+Checked exhaustively after the same defect turned up in three tables:
+
+| output | stratifies by levelvars? | verified |
+|---|---|---|
+| `t2_cida` | yes, incl. `&covarstrat.` | fixed |
+| `censoring` | yes | fixed |
+| `followuptime` | yes | fixed |
+| `denomcounts` | yes | already correct |
+| `numcounts` | yes | already correct |
+| `baseline` | **no** — SAS classes on `&groupvar.` only | correct |
+| `utilization`, `labs`, `mfu`, `riskscores`, `codedistribution` | **no** | correct |
+
+The last group is not an omission: none of those SAS macros references
+`levelvars` either. They feed the baseline and CIDA tables rather than
+producing stratified output of their own.
+
+### Reconciliation holds at every level, not just the first
+
+`t2_cida` is a merge of `numcounts` and `denomcounts` BY NAME, and that
+had only ever been checked at the unstratified level. Verified across
+three levels on the fixture and all four on the production study:
+
+```
+level 000: t2_cida 564,468  denomcounts 564,468
+level 001: t2_cida 597,826  denomcounts 597,826
+level 002: t2_cida 564,468  denomcounts 564,468
+level 003: t2_cida 597,826  denomcounts 597,826
+```
+
+**Note what correct looks like.** A year-stratified level reports MORE
+patients than the unstratified one — 597,826 against 564,468 — because
+a patient enrolled across two years counts in both. That is a stratified
+count, not double counting, and a test asserting equality across levels
+would have been wrong.
+
+## The same defect was in three tables, not one
+
+USERSTRATA levelvars stratify **every** table that takes them.
+`censorstrat` is the levelvars (`ms_cidanum.sas:123`), so race, hispanic
+and year stratify `censoring` and `followuptime` exactly as agegroup and
+sex do.
+
+Both honoured **only agegroup and sex**. A level asking for `year`
+received the unstratified totals labelled as that level, and every level
+came back with an identical row count:
+
+```
+rows per level:  1: 3081   2 (year): 3081   3 (race): 3081
+```
+
+After the fix:
+
+```
+rows per level:  1: 3081   2 (year): 9439   3 (race): 12725
+episodes:        1: 64663  2: 64663         3: 64663
+```
+
+Each level stratifies, and each remains a complete partition.
+
+**This affects the production study**, which stratifies on `year`
+(levels `001` and `003`). Its censoring table now varies by level —
+937 / 1,037 / 1,003 / 1,057 rows — where all four were previously the
+same numbers under different labels.
+
+The test is parameterised across `censoring`, `followuptime` and
+`t2_cida`, because the defect was found in one, fixed there, and left
+in the other two.
+
+## `t2_cida` is built from USERSTRATA, and the dynamic part was missing
+
+SAS's retain list for `t2_cida` ends with **`&covarstrat.`** — the
+USERSTRATA levelvars beginning with `covar`
+(`ms_cidatables.sas:403-412, 425`). A study can stratify the CIDA table
+by a **covariate**, which adds a column per covariate.
+
+This package parsed `covar1` into levelvars and then ignored it, so a
+study asking to stratify by covariate 1 received the **unstratified
+totals labelled as that level**. Silently wrong, which is worse than a
+missing column.
+
+Implemented and verified across four levels:
+
+| level | levelvars | episodes | rows w/ covar1 | rows w/ covar12 |
+|---|---|--:|--:|--:|
+| 1 | *(none)* | 64,663 | 0 | 0 |
+| 2 | `covar1` | 64,663 | 4 | 0 |
+| 3 | `covar12` | 64,663 | 0 | 4 |
+| 4 | `sex covar1` | 64,663 | 8 | 0 |
+
+Every level is a complete partition, and **`covar1` does not match
+`covar12`**: the levelvars list is compared as a space-padded string,
+because a bare `LIKE '%covar1%'` would collide.
+
+The standard strata (sex, agegroup, year, geography) are a FIXED list in
+SAS's retain — emitted always, NULL where a level does not use them —
+which is the existing behaviour.
+
+## `baseline` was missing a dummy group and five continuous columns
+
+SAS sums `patient, Age:, Sex_:, year_:, race_:, hispanic_:, covar1..N`
+and takes mean/std over Age, the risk scores, and the utilization counts
+(`ms_createdistbaselinetable.sas:457-500`).
+
+**`year_` was missing entirely** — an index-year distribution the study
+asks for and did not get.
+
+The continuous columns exposed a second bug. The utilization stage names
+its encounter counts `enc_av` / `enc_oa` / ...; SAS calls them `NumAV` /
+`NumOA` / .... The first version listed only the SAS names, and the
+"skip if the column is absent" branch **silently dropped five of the
+eight**. There is now an explicit source-to-SAS mapping, and a missing
+column warns rather than being skipped quietly.
+
+Geography (`cb_reg_`, `sdi_`) and the continuous means are gated on
+their optional stage, exactly as SAS gates them on `&geog = Y`.
+
+### A population difference that looks like a bug
+
+`utilization` covers every master-list episode (71,350 on the fixture);
+`baseline` averages over the episodes that survive the follow-up washout
+(64,663). The two means differ — 0.3355 against 0.3179 for `NumIP` — and
+both look plausible.
+
+SAS builds `_RawData` from the master list, so the baseline figure is
+the right one. Restricting the utilization mean to `cohort_final`
+reproduces the baseline value exactly, and a test pins that rather than
+the raw average.
+
+## Extra columns are a defect too
+
+A data partner noticed `attrition` carrying more columns than the query
+requires. It was — four of them.
+
+The reasoning behind them was wrong: the values (`records`, `patients`,
+`records_dropped`, `patients_dropped`) were already computed, so they
+were appended after the contract columns rather than discarded. **For an
+msoc output the column SET is the contract, not just the column names.**
+A table with four unexpected columns is one a downstream reader has to
+be taught to ignore, and it is one more thing to explain at a disclosure
+review.
+
+SAS's attrition data step writes `level, claim_level, descr, remaining,
+excluded` and `group`, and stops
+(`ms_attrition_cidacompute.sas:125-134`).
+
+Swept across every contract output:
+
+| output | was | now |
+|---|--:|--:|
+| `attrition` | 10 columns | **6** |
+| `distindex` | 5 | **4** |
+| `t2_cida` | `index_year`, 8 strata missing | **27, exact** |
+| `censoring` | 10 | 10 — correct already |
+| `distindexmap` | 9 | 9 — correct already |
+
+`t2_cida` had the same `year` / `index_year` mismatch fixed in
+`denomcounts` earlier and never carried across — so the two tables named
+the same column differently, and **the merge between them is by name**.
+It was also missing `month`, `quarter` and the five geography columns
+from SAS's retain list; those are now emitted NULL, the same convention
+already used for a level that does not stratify on agegroup or sex.
+
+`censoring` keeping `agegroup` and `sex` is correct: the SAS keep is
+`group level <censorstrat> episodes <msocflaglist>`, and `censorstrat`
+is the USERSTRATA levelvars (`ms_cidanum.sas:123`).
+
+`test_output_column_names_match_the_sas_contract` now asserts the column
+set is EXACT, not merely a superset. The earlier version checked only
+that the contract columns were present and in order, which is why four
+extras sat there unnoticed.
+
 ## The sweep, and what it found
 
 Every output was checked against the SAS macro library. **All of them

@@ -47,7 +47,7 @@ WITH base AS (
         c.person_days                                 AS followuptime,
         -- time from index to the end of available data, which is what
         -- SAS calls timetocensor
-        span_days(c.indexdt, c.dataavail_dt)          AS timetocensor
+        span_days(c.indexdt, c.dataavail_dt)          AS timetocensor{covar_base}
     FROM cohort_final c
 )
 SELECT
@@ -61,7 +61,7 @@ SELECT
     CASE WHEN lv.has_sex      THEN b.sex         END   AS sex,
     CASE WHEN lv.has_race     THEN b.race        END   AS race,
     CASE WHEN lv.has_hispanic THEN b.hispanic    END   AS hispanic,
-    CASE WHEN lv.has_year     THEN b.index_year  END   AS index_year,
+    CASE WHEN lv.has_year     THEN b.index_year  END   AS index_year{covar_select},
     count(DISTINCT b.patid)                            AS npts,
     sum(b.patient)                                     AS episodes,
     sum(b.adjusteddisp)                                AS adjustedcodecount,
@@ -81,7 +81,7 @@ GROUP BY
     CASE WHEN lv.has_sex      THEN b.sex         END,
     CASE WHEN lv.has_race     THEN b.race        END,
     CASE WHEN lv.has_hispanic THEN b.hispanic    END,
-    CASE WHEN lv.has_year     THEN b.index_year  END
+    CASE WHEN lv.has_year     THEN b.index_year  END{covar_group}
 ;
 
 -- Merge numerators with denominators.
@@ -101,7 +101,26 @@ SELECT
     coalesce(n.sex, d.sex)                 AS sex,
     coalesce(n.race, d.race)               AS race,
     coalesce(n.hispanic, d.hispanic)       AS hispanic,
-    coalesce(n.index_year, d."year")       AS index_year,
+    -- SAS calls this `year` (ms_cidatables.sas:425), not `index_year`.
+    -- Fixed in denomcounts earlier and not carried across to here, so
+    -- the two tables named the same column differently — and the merge
+    -- between them is by name.
+    -- Covariate strata (SAS `&covarstrat.`) come from the NUMERATOR
+    -- only: denomcounts is built from enrolled members, who need not
+    -- have an episode and so have no covariate value.
+    coalesce(n.index_year, d."year")       AS "year"{covar_final},
+    -- Finer time and geography strata appear in SAS's retain list and
+    -- are populated only when a level stratifies on them. This package
+    -- does not offer them as CIDA strata, so they are emitted NULL —
+    -- the same convention already used for agegroup and sex on a level
+    -- that does not stratify, and it keeps the column set matching.
+    NULL::SMALLINT                         AS "month",
+    NULL::SMALLINT                         AS quarter,
+    NULL::VARCHAR                          AS zip3,
+    NULL::VARCHAR                          AS state,
+    NULL::VARCHAR                          AS hhs_reg,
+    NULL::VARCHAR                          AS cb_reg,
+    NULL::VARCHAR                          AS zip_uncertain,
     -- numerator metrics; zero where the stratum has no episodes
     coalesce(n.npts, 0)              AS npts,
     coalesce(n.episodes, 0)          AS episodes,

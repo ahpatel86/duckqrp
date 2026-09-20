@@ -164,9 +164,10 @@ def test_dose_restriction_actually_excludes(study, baseline):
 
 def test_attrition_is_monotonic(baseline):
     """Every attrition step must be a subset of the one before it."""
+    # `excluded` is the contract column; the records_dropped /
+    # patients_dropped extras were removed as non-contract.
     bad = baseline.con.execute("""
-    SELECT "group", level FROM attrition
-    WHERE records_dropped < 0 OR patients_dropped < 0
+    SELECT "group", level FROM attrition WHERE excluded < 0
     """).fetchall()
     assert bad == [], f"attrition increased at {bad}"
 
@@ -582,7 +583,7 @@ def test_show_lists_and_prints_tables(study, tmp_path):
 
     body = show(tmp_path, "attrition")
     assert "Exposure dispensings" in body
-    assert "records" in body
+    assert "remaining" in body
 
     # a partitioned table resolves too, and truncates
     big = show(tmp_path, "cohort_final", limit=5)
@@ -640,7 +641,7 @@ def test_csv_flag_writes_excel_copies(study, tmp_path):
     csv_dir = tmp_path / "csv"
     assert (csv_dir / "attrition.csv").exists()
     header = (csv_dir / "attrition.csv").read_text().splitlines()[0]
-    assert "group" in header and "records" in header
+    assert "group" in header and "remaining" in header
 
 
 # ---------------------------------------------------------------------
@@ -4446,12 +4447,18 @@ def test_output_column_names_match_the_sas_contract():
                          "distindexid"],
         "distindex": ["group", "distindextype", "distindexlist",
                       "episodes"],
-        # ms_attrition_cidacompute.sas:104-115
+        # ms_attrition_cidacompute.sas:125-134
         "attrition": ["group", "level", "descr", "claim_level",
                       "remaining", "excluded"],
-        # ms_createcensortable.sas:246-250
-        "censoring": ["group", "level", "censdays_value_cat", "episodes",
-                      "cens_elig", "cens_dth", "cens_qryend",
+        # ms_createcensortable.sas:246-250 — the keep is
+        # `group level <censorstrat> episodes <msocflaglist>`, and
+        # censorstrat is the USERSTRATA levelvars (ms_cidanum.sas:123),
+        # so agegroup and sex belong here.
+        # censorstrat is the full levelvars set, so every stratum
+        # column belongs here — not just agegroup and sex.
+        "censoring": ["group", "level", "censdays_value_cat",
+                      "agegroup", "sex", "race", "hispanic", "year",
+                      "episodes", "cens_elig", "cens_dth", "cens_qryend",
                       "cens_dpend"],
     }
 
@@ -4466,6 +4473,14 @@ def test_output_column_names_match_the_sas_contract():
             # and the contract columns lead, in SAS order
             lead = [c for c in cols if c in required]
             assert lead == required, f"{table} order: {lead} != {required}"
+
+            # EXACTLY the SAS columns — no extras. For an msoc output
+            # the column SET is the contract, not just the names. A data
+            # partner noticed four unexpected columns on attrition that
+            # had been kept on the reasoning that the values were
+            # already computed; that reasoning was wrong.
+            extra = [c for c in cols if c not in required]
+            assert not extra, f"{table} carries non-contract columns: {extra}"
     finally:
         eng.close()
 
@@ -5273,3 +5288,363 @@ def test_manifest_is_written_last_and_marks_completeness():
     # no table file may be newer than the manifest
     newest_table = max(f.stat().st_mtime for f in out.rglob("*.parquet"))
     assert manifest.stat().st_mtime >= newest_table - 0.01
+
+
+def test_t2_cida_supports_covariate_strata():
+    """USERSTRATA levelvars beginning with `covar` stratify the CIDA
+    table by a COVARIATE — SAS's `&covarstrat.`
+    (ms_cidatables.sas:403-412, 425).
+
+    They were parsed into levelvars and then ignored, so a study asking
+    to stratify by covar1 got the UNSTRATIFIED totals labelled as that
+    level. Silently wrong, which is worse than a missing column.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    s = load_study_dict({**base, "userstrata": [
+        {"tableid": "t2cida", "levelid": "1", "levelvars": ""},
+        {"tableid": "t2cida", "levelid": "2", "levelvars": "covar1"},
+        {"tableid": "t2cida", "levelid": "3", "levelvars": "covar12"},
+        {"tableid": "t2cida", "levelid": "4", "levelvars": "sex covar1"},
+    ]})
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM t2_cida LIMIT 0").description}
+        assert "covar1" in cols and "covar12" in cols, sorted(cols)
+
+        rows = eng.con.execute("""
+            SELECT level, sum(episodes),
+                   count(*) FILTER (WHERE covar1  IS NOT NULL),
+                   count(*) FILTER (WHERE covar12 IS NOT NULL)
+            FROM t2_cida GROUP BY 1 ORDER BY 1
+        """).fetchall()
+
+        # every level is a COMPLETE partition of the episodes
+        totals = {r[1] for r in rows}
+        assert len(totals) == 1, f"levels disagree on the total: {rows}"
+
+        by_level = {r[0]: r for r in rows}
+        # covar1 appears only where a level asks for it ...
+        assert by_level["1"][2] == 0
+        assert by_level["2"][2] > 0
+        assert by_level["4"][2] > 0
+        # ... and covar1 must NOT match covar12: the levelvars list is
+        # matched as a padded string for exactly this reason.
+        assert by_level["3"][2] == 0, "covar1 leaked onto the covar12 level"
+        assert by_level["3"][3] > 0
+        assert by_level["2"][3] == 0, "covar12 leaked onto the covar1 level"
+    finally:
+        eng.close()
+
+
+def test_baseline_carries_the_sas_dummy_groups():
+    """SAS sums patient, Age:, Sex_:, year_:, race_:, hispanic_: and
+    covar1..N (ms_createdistbaselinetable.sas:457-460).
+
+    `year_` was missing — an index-year distribution the study asked for
+    and did not get. Geography (cb_reg_, sdi_) and the continuous
+    utilization/risk means are gated on their optional stage, as SAS
+    gates them on `&geog = Y`.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        cols = [d[0] for d in eng.con.execute(
+            "SELECT * FROM baseline LIMIT 0").description]
+        for prefix in ("Sex_", "Race_", "Hispanic_", "Age_", "year_"):
+            assert any(c.startswith(prefix) for c in cols), (prefix, cols)
+
+        # each dummy group is a partition: it sums to n_episodes
+        years = [c for c in cols if c.startswith("year_")]
+        total = " + ".join(f'"{c}"' for c in years)
+        bad = eng.con.execute(
+            f"SELECT count(*) FROM baseline WHERE {total} <> n_episodes"
+        ).fetchone()[0]
+        assert bad == 0, "year dummies do not sum to n_episodes"
+    finally:
+        eng.close()
+
+
+def test_baseline_continuous_means_use_sas_names_and_the_right_population():
+    """SAS's baseline takes mean= and std= over the utilization counts
+    (ms_createdistbaselinetable.sas:474-500), named NumAV / NumOA /
+    NumIP / NumIS / NumED / NumGeneric / NumClass / NumRx.
+
+    Two things this pins:
+
+    * **The names.** The utilization stage calls its encounter counts
+      enc_av / enc_oa / ...; SAS calls them NumAV / NumOA / .... An
+      earlier version listed only the SAS names, and the "skip if
+      absent" branch silently dropped five of the eight.
+    * **The population.** `utilization` covers every master-list episode
+      (71,350 here); baseline averages over the episodes that survive
+      the follow-up washout (64,663). Averaging the wrong one gives a
+      plausible number that is quietly not the cohort's.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    s = load_study_dict({**base, "utilfile": [
+        {"group": g, "utiltype": "MED", "utilfrom": -183, "utilto": -1}
+        for g in ("lisinopril", "beta_blocker")]})
+
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM baseline LIMIT 0").description}
+        for sas in ("NumAV", "NumOA", "NumIP", "NumIS", "NumED",
+                    "NumGeneric", "NumClass", "NumRx"):
+            assert f"mean_{sas}" in cols, (sas, sorted(cols))
+            assert f"std_{sas}" in cols, (sas, sorted(cols))
+
+        # the mean must be over cohort_final, not over every master-list
+        # episode — the two differ, and both look plausible
+        want = dict(eng.con.execute("""
+            SELECT u.cohortgrp, round(avg(u.enc_ip), 4)
+            FROM utilization u
+            JOIN cohort_final c USING (cohortgrp, patid, indexdt)
+            GROUP BY 1
+        """).fetchall())
+        got = dict(eng.con.execute(
+            'SELECT "group", mean_NumIP FROM baseline').fetchall())
+        assert got == want, (got, want)
+    finally:
+        eng.close()
+
+
+@pytest.mark.parametrize("table,tableid", [
+    ("censoring", "t2cida"),
+    ("followuptime", "t2followuptime"),
+    ("t2_cida", "t2cida"),
+])
+def test_every_stratified_table_honours_all_levelvars(table, tableid):
+    """USERSTRATA levelvars stratify EVERY table that takes them, not
+    just the CIDA table.
+
+    `censorstrat` is the levelvars (ms_cidanum.sas:123), so race,
+    hispanic and year stratify `censoring` and `followuptime` exactly as
+    agegroup and sex do. Both honoured only agegroup and sex, so a level
+    asking for `year` received the UNSTRATIFIED totals labelled as that
+    level — every level came back with an identical row count. The
+    production study seen stratifies on `year`.
+
+    Parameterised across all three tables because the same defect was
+    found in t2_cida first and then, unfixed, in the other two.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    levels = [
+        {"tableid": tableid, "levelid": "1", "levelvars": ""},
+        {"tableid": tableid, "levelid": "2", "levelvars": "year"},
+        {"tableid": tableid, "levelid": "3", "levelvars": "race"},
+    ]
+    eng = Engine(verbose=False)
+    try:
+        run(load_study_dict({**base, "userstrata": levels}), DATA,
+            engine=eng, verbose=False)
+
+        rows = dict(eng.con.execute(
+            f"SELECT level, count(*) FROM {table} GROUP BY 1").fetchall())
+        # a stratified level must produce MORE rows than the
+        # unstratified one, or it is not stratifying
+        assert rows["2"] > rows["1"], (table, "year did not stratify", rows)
+        assert rows["3"] > rows["1"], (table, "race did not stratify", rows)
+
+        # and each level must remain a complete partition
+        totals = eng.con.execute(
+            f"SELECT level, sum(episodes) FROM {table} GROUP BY 1"
+        ).fetchall()
+        distinct = {t for _, t in totals}
+        assert len(distinct) == 1, (table, "levels disagree", totals)
+    finally:
+        eng.close()
+
+
+def test_numerators_and_denominators_reconcile_at_every_level():
+    """`t2_cida` is a merge of `numcounts` and `denomcounts` BY NAME, so
+    the three must agree at every stratification level — not just at the
+    unstratified one, which is the only place it had been checked.
+
+    Note what correct looks like: a year-stratified level reports MORE
+    patients than the unstratified one (262,140 against 154,300 here),
+    because a patient enrolled across two years counts in both. That is
+    a stratified count, not double counting, and a test asserting
+    equality across levels would be wrong.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    s = load_study_dict({**base, "userstrata": [
+        {"tableid": "t2cida", "levelid": "1", "levelvars": ""},
+        {"tableid": "t2cida", "levelid": "2", "levelvars": "year"},
+        {"tableid": "t2cida", "levelid": "3", "levelvars": "race"},
+    ]})
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        for level in ("1", "2", "3"):
+            cida_den, den = eng.con.execute("""
+                SELECT (SELECT sum(dennumpts) FROM t2_cida     WHERE level = ?),
+                       (SELECT sum(dennumpts) FROM denomcounts WHERE level = ?)
+            """, [level, level]).fetchone()
+            assert cida_den == den, (level, cida_den, den)
+
+            cida_num, num = eng.con.execute("""
+                SELECT (SELECT sum(npts) FROM t2_cida   WHERE level = ?),
+                       (SELECT sum(npts) FROM numcounts WHERE level = ?)
+            """, [level, level]).fetchone()
+            assert cida_num == num, (level, cida_num, num)
+
+            # every level must actually stratify, or the check above is
+            # comparing two copies of the same unstratified answer
+            rows = eng.con.execute(
+                "SELECT count(*) FROM denomcounts WHERE level = ?",
+                [level]).fetchone()[0]
+            assert rows > 0, (level, "denomcounts empty")
+    finally:
+        eng.close()
+
+
+def test_parity_dump_skips_optional_tables_that_were_not_produced():
+    """The dump must export what exists and skip the rest.
+
+    It raised on any table an optional stage did not produce, so a study
+    without USERSTRATA — the demo study, and the first thing anyone
+    would try — died with `Table with name t2_cida does not exist`. The
+    comparison being set up never ran.
+    """
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    dbg = Path(tempfile.mkdtemp())
+
+    # demo_full defines no USERSTRATA, so t2_cida/numcounts/denomcounts
+    # and followuptime are all absent. Driven through the Engine the way
+    # the CLI does, since --parity-dump is a CLI concern.
+    from qrp import Engine
+    from qrp.parity import ParityDumper
+
+    eng = Engine(verbose=False)
+    try:
+        _run(load_study(STUDY), DATA, engine=eng, output_dir=str(out),
+             verbose=False)
+        ParityDumper(dbg, "pt001", 0).dump(eng)
+    finally:
+        eng.close()
+
+    written = list(dbg.rglob("*.csv"))
+    assert written, "the dump produced nothing"
+    names = {p.stem for p in written}
+    # the tables that DO exist are dumped ...
+    assert "cohort_final" in names and "attrition" in names, sorted(names)
+    # ... and the absent optional ones are simply not there
+    assert "t2_cida" not in names, sorted(names)
+
+
+def test_plan_and_run_cannot_disagree_about_stages():
+    """`plan_stages()` and `run()` both derive from STAGES.
+
+    They used to be two parallel sequences, and `plan_stages()`'s
+    docstring claimed to be the single source of truth while `run()`
+    quietly went its own way. Three stages were added in one session and
+    each needed editing in both; one was missed, and only a UI test
+    comparing the two counts caught it.
+
+    This asserts the structural property rather than the symptom: every
+    stage the table declares has a real SQL file, and every stage the
+    plan reports is one the runner knows how to execute.
+    """
+    from qrp.pipeline import STAGES, _STAGE_BY_NAME, plan_stages
+
+    sql_dir = Path(__file__).resolve().parents[1] / "src" / "qrp" / "sql"
+    for st in STAGES:
+        assert (sql_dir / st.script).exists(), (st.name, st.script)
+        if st.gate is not None:
+            # the gate must name a real StudyConfig property, or the
+            # stage silently never runs
+            assert hasattr(load_study(STUDY), st.gate), (st.name, st.gate)
+
+    # no duplicate names: the runner looks stages up by name
+    names = [st.name for st in STAGES]
+    assert len(names) == len(set(names)), names
+    assert set(_STAGE_BY_NAME) == set(names)
+
+    # the plan is a subsequence of the table, in table order
+    planned = plan_stages(load_study(STUDY))
+    assert planned == [n for n in names if n in set(planned)], planned
+
+
+def test_every_sql_file_is_reachable_from_the_stage_table():
+    """A SQL file no stage references is dead code; a stage naming a
+    file that does not exist fails at runtime. Both are caught here."""
+    from qrp.pipeline import STAGES
+
+    sql_dir = Path(__file__).resolve().parents[1] / "src" / "qrp" / "sql"
+    # 00_macros.sql is loaded by the Engine at construction, not as a
+    # stage — it defines the shared vocabulary every stage uses.
+    on_disk = {p.name for p in sql_dir.glob("[0-9]*.sql")} - {"00_macros.sql"}
+    referenced = {st.script for st in STAGES}
+
+    orphans = sorted(on_disk - referenced)
+    assert not orphans, f"SQL files no stage runs: {orphans}"
+
+
+def test_every_output_is_declared_once_and_explains_itself():
+    """`OUTPUTS` is THE declaration; the six module-level dicts are
+    projections of it.
+
+    They used to be six independent dicts over the same 25 tables, held
+    in agreement by tests. That is what produced the two worst output
+    bugs: `mstr` named the wrong table, and `geography` claimed a SAS
+    name that does not exist anywhere in the macro library — because
+    `SAS_CONTRACT` was populated from what this package emitted rather
+    than from what SAS does.
+
+    The `Output` constructor now REFUSES a non-contract output with no
+    note, so an addition has to say what it is. Writing this found two
+    outputs (`lab_results`, `utilization`) that were neither verified
+    nor documented.
+    """
+    from qrp.pipeline import (DISCLOSURE, OUTPUT_TABLES, OUTPUTS,
+                              SAS_CONTRACT, SAS_NAMES)
+
+    names = [o.name for o in OUTPUTS]
+    assert len(names) == len(set(names)), "an output is declared twice"
+
+    for o in OUTPUTS:
+        assert o.library in ("msoc", "dplocal"), (o.name, o.library)
+        assert o.emit in ("always", "covariate", "gated"), (o.name, o.emit)
+        # the constructor enforces this, so it should be unreachable
+        assert o.contract or o.note, o.name
+
+    # the projections agree with the declaration by construction
+    assert set(OUTPUT_TABLES) == {o.name for o in OUTPUTS
+                                  if o.emit == "always"}
+    assert set(SAS_CONTRACT) == {o.name for o in OUTPUTS if o.contract}
+    assert set(DISCLOSURE) == set(names)
+    for o in OUTPUTS:
+        assert SAS_NAMES.get(o.name, o.name) == o.sas_name, o.name
+
+
+def test_an_undocumented_addition_is_rejected():
+    """The check has to actually fail, or it proves nothing."""
+    from qrp.pipeline import Output
+
+    # a contract output needs no note
+    Output("x", "x", "msoc", contract=True)
+    # an addition without one is refused
+    with pytest.raises(ValueError, match="no note"):
+        Output("x", "x", "msoc")

@@ -31,6 +31,9 @@ WITH censored AS (
         c.episode,
         c.agegroup,
         c.sex,
+        c.race,
+        c.hispanic,
+        year(c.indexdt)::VARCHAR AS index_year,
         cfg.blackout_per,
         cfg.at_risk_start,
         cfg.max_epis_dur,
@@ -105,8 +108,18 @@ SELECT
     b.fupdays_value_cat,
     -- Stratum values are NULL for a level that does not stratify on
     -- them — the same shape t2_cida produces.
+    -- ALL the USERSTRATA levelvars, not just two. `censorstrat` is
+    -- the levelvars (ms_cidanum.sas:123), so race, hispanic and year
+    -- stratify this table exactly as agegroup and sex do. Honouring
+    -- only agegroup and sex meant a level asking for `year` got the
+    -- UNSTRATIFIED totals labelled as that level — every level came
+    -- back with identical row counts. The production study seen
+    -- stratifies on `year`.
     CASE WHEN lv.has_agegroup THEN b.agegroup END AS agegroup,
     CASE WHEN lv.has_sex      THEN b.sex      END AS sex,
+    CASE WHEN lv.has_race     THEN b.race     END AS race,
+    CASE WHEN lv.has_hispanic THEN b.hispanic END AS hispanic,
+    CASE WHEN lv.has_year     THEN b.index_year END AS "year",
     count(*)                 AS episodes,
     -- msoc carries the cens_* names even for followuptime; the rename
     -- is in the macro call, not in the data.
@@ -123,9 +136,10 @@ FROM bucketed b
 -- the CROSS JOIN yields NOTHING for a study that defines no strata —
 -- an msoc output silently absent rather than unstratified.
 CROSS JOIN (
-    SELECT level_id, has_agegroup, has_sex FROM cfg_strata
+    SELECT level_id, has_agegroup, has_sex, has_race,
+           has_hispanic, has_year FROM cfg_strata
     UNION ALL
-    SELECT '1', FALSE, FALSE
+    SELECT '1', FALSE, FALSE, FALSE, FALSE, FALSE
     WHERE NOT EXISTS (SELECT 1 FROM cfg_strata)
 ) lv
 GROUP BY ALL

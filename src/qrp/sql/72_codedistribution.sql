@@ -90,8 +90,7 @@ SELECT
     cohortgrp        AS "group",
     'EXP'            AS distindextype,
     distindexlist,
-    count(*)         AS episodes,
-    count(DISTINCT patid) AS npts
+    count(*)         AS episodes
 FROM listed
 GROUP BY 1, 2, 3
 ORDER BY episodes DESC;

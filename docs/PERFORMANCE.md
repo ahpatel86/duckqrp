@@ -314,3 +314,47 @@ runtime, so a constant-factor improvement there is worth more than a
 scaling fix anywhere else, and the flag firing inconsistently across
 runs is itself the finding — a single measurement would have called it
 either linear or superlinear depending on when it was taken.
+
+
+---
+
+## After the architectural refactor
+
+Structural changes only — the stage table, one declaration per output,
+and the `outputs.py` split. Verified no behavioural change: every output
+count identical, and the full suite green (241 passed, 2 skipped, 0
+failed across all 243 tests).
+
+| study | dataset | best | rows/s | scaling |
+|---|---|--:|--:|--:|
+| production | 1x | 5.36 s | 6.6M | |
+| production | 4x | 17.31 s | 8.1M | **3.23x** |
+| simple | 1x | 3.64 s | 9.6M | |
+| simple | 4x | 13.38 s | 10.5M | **3.68x** |
+
+Both sub-linear, and unchanged from before the refactor (3.42x / 3.79x).
+**No stage grows faster than the data** — `cida denominators` measured
+4.80x, within the 4.06-4.89 range recorded earlier.
+
+The absolute times sit at the upper end of the ~10% run-to-run variance
+this document warns about (5.36 s against a best of 4.15 s recorded
+earlier). The machine had been running tests continuously for hours, so
+these are a contended reading. The scaling RATIOS are the figures a
+refactor could plausibly have moved, and they did not move.
+
+### Running the full suite
+
+It takes roughly 13 minutes, longer than a single command can be held
+open here, and background processes do not survive between commands. It
+was run in six deterministic chunks:
+
+```bash
+pytest tests/ -q --collect-only | grep "::" > all_tests.txt
+# split every Nth line into chunk0..chunk5, then per chunk:
+mapfile -t IDS < chunk0.txt && pytest "${IDS[@]}" -q
+```
+
+`mapfile` rather than word splitting, because parametrised test IDs
+contain commas and brackets. A check afterwards confirmed the six chunks
+partition the collected set exactly: 243 collected, 243 dispatched, 243
+unique.
