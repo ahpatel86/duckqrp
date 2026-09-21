@@ -1073,6 +1073,53 @@ def _bool_yn(v: Any, default: bool = False) -> bool:
     return str(v).strip().upper() in {"Y", "YES", "TRUE", "1"}
 
 
+# Scalar parameters SAS branches on that this package does not read.
+# Ignoring one silently gives a plausible answer computed under
+# different rules — the failure mode this package has been most prone
+# to — so the presence of any of them is reported rather than dropped.
+#
+# Found by grepping the macros for `%if "&param" = "Y"` and checking
+# each against what config.py reads. `outputdenom` was in this set
+# until it was implemented.
+UNREAD_SCALARS: dict[str, str] = {
+    "othersex": "forces sex='O' into the output shell even when no "
+                "patient has it (ms_cidacov.sas:114)",
+    "includelinkedonly": "restricts the cohort to linked members",
+    "calculate_adherence": "adds adherence metrics",
+    "datadrivenqueryperiod": "derives the query period from the data "
+                             "rather than the study dates",
+    "agegroup_out": "controls whether age groups appear in the output",
+    "geog_out": "controls whether geography appears in the output",
+    "psmatch": "propensity-score matching (comparator designs)",
+    "psstratification": "propensity-score stratification",
+    "psiptw": "inverse-probability weighting",
+}
+
+
+def _warn_unread_scalars(params: dict) -> None:
+    """Report scalar parameters the study sets and this package ignores.
+
+    A parameter set to "N" is not a problem: not doing something this
+    package already does not do is agreement, not divergence. Only an
+    active value is reported.
+    """
+    import warnings
+
+    active = [
+        f"{k} ({UNREAD_SCALARS[k]})"
+        for k, v in params.items()
+        if k in UNREAD_SCALARS
+        and str(v).strip().upper() not in ("", "N", "NO", "0", "NONE")
+    ]
+    if active:
+        warnings.warn(
+            "the study sets parameter(s) this implementation does not "
+            "read, so results are computed as if they were off: "
+            + "; ".join(sorted(active)),
+            stacklevel=3,
+        )
+
+
 def _warn_denominator_suppressed(study: StudyConfig) -> None:
     """SAS warns when minrxdays forces the denominator off; so do we.
 
@@ -1523,6 +1570,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     study.validate()
     _warn_unsupported_tables(study)
     _warn_denominator_suppressed(study)
+    _warn_unread_scalars(params)
     return study
 
 

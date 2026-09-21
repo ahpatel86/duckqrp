@@ -97,6 +97,8 @@ class RunLog:
     _was_spilling: bool = field(init=False, default=False)
     _closed: bool = field(init=False, default=False)
 
+    _spill_by_stmt: dict[str, int] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         d = Path(self.directory)
         d.mkdir(parents=True, exist_ok=True)
@@ -221,8 +223,22 @@ class RunLog:
                         shape += f"  ({ev.delta_rows:+,})"
                 else:
                     shape = f"{'view':>13}      x {ev.columns:>2} cols"
-                self.write(f"      {ev.seconds:7.3f}s  {ev.kind:<5} "
-                           f"{ev.target:<26}{shape}")
+                line = (f"      {ev.seconds:7.3f}s  {ev.kind:<5} "
+                        f"{ev.target:<26}{shape}")
+                # Spilling is attributed to the statement that caused
+                # it. The live MemoryStatus events say a run is
+                # spilling; this says WHICH step, which is the only
+                # question worth answering afterwards.
+                if ev.spilled_bytes:
+                    line += (f"   SPILLED {ev.spilled_bytes / 1e6:,.0f}MB"
+                             f" (peak {ev.peak_bytes / 1e6:,.0f}MB)")
+                elif ev.peak_bytes:
+                    line += f"   peak {ev.peak_bytes / 1e6:,.0f}MB"
+                self.write(line)
+                if ev.spilled_bytes:
+                    self._spill_by_stmt[ev.target] = (
+                        self._spill_by_stmt.get(ev.target, 0)
+                        + ev.spilled_bytes)
             elif isinstance(ev, StageSkipped):
                 self.write(f"  skipped: {ev.name} ({ev.reason})")
             elif isinstance(ev, LogMessage):
@@ -307,9 +323,25 @@ class RunLog:
 
     # ---------------- lifecycle -------------------------------------
 
+    def _write_spill_summary(self) -> None:
+        """Name the statements that spilled, largest first.
+
+        A run that spills is slow, and the log already shows 47
+        statements. Without this the operator has to scan for the word
+        SPILLED; with it the answer is the last thing they read.
+        """
+        if not self._spill_by_stmt:
+            return
+        self.write()
+        self.write("spilled to disk (raise --memory-limit to avoid):")
+        for target, nbytes in sorted(self._spill_by_stmt.items(),
+                                     key=lambda kv: -kv[1]):
+            self.write(f"  {target:<28}{nbytes / 1e6:>10,.0f} MB")
+
     def close(self) -> None:
         if self._closed:
             return
+        self._write_spill_summary()
         if self._handler is not None:
             logging.getLogger().removeHandler(self._handler)
             self._handler = None

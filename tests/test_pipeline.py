@@ -5831,3 +5831,172 @@ def test_minrxdays_forces_denominators_off():
     # and without minrxdays, every cohort keeps its denominator
     plain = load_study_dict(base)
     assert len(plain.denominator_cohorts()) == len(plain.cohorts)
+
+
+def test_spilling_is_attributed_to_the_statement_that_caused_it():
+    """A spilling run is slow, and the log has ~47 statements in it.
+
+    The live `MemoryStatus` events answer "is this run spilling"; they
+    do not answer "which step caused it", and after a long stage that
+    is the only question worth asking. Peak memory and spill are now
+    attributed per statement.
+    """
+    from qrp import Engine
+    from qrp.events import StatementFinished
+
+    seen: list[StatementFinished] = []
+
+    def sink(ev):
+        if isinstance(ev, StatementFinished):
+            seen.append(ev)
+
+    # a limit tight enough to force spilling on the real pipeline
+    eng = Engine(memory_limit="300MB", verbose=False,
+                 statement_detail=True, on_event=sink)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+    finally:
+        eng.close()
+
+    assert seen, "no statement events were emitted"
+    # peak is attributed per statement, not accumulated across the run
+    peaks = [s.peak_bytes for s in seen if s.peak_bytes]
+    assert peaks, "no statement reported a peak"
+
+    # The high-water mark must be RESET per statement, or every step
+    # reports the run's peak and the number points at nothing.
+    #
+    # Asserting the peaks are non-monotonic would be wrong: memory
+    # legitimately grows through the pipeline, and an early version of
+    # this test failed against correct behaviour for that reason. The
+    # property that actually distinguishes reset from not-reset is that
+    # most statements report LESS than the global peak.
+    assert sum(1 for p in peaks if p < eng.peak_memory_bytes) >= len(peaks) - 1, (
+        "every statement reports the global peak, so the high-water "
+        "mark is never reset", peaks, eng.peak_memory_bytes)
+
+    # spill is a DELTA, so it names a culprit rather than a total
+    for s in seen:
+        assert s.spilled_bytes >= 0
+        assert s.spilled == (s.spilled_bytes > 0)
+
+
+def test_spill_summary_names_the_statement_in_the_log():
+    """The log ends with the statements that spilled, largest first, so
+    the answer is the last thing an operator reads."""
+    import tempfile
+
+    from qrp import Engine
+    from qrp.runlog import RunLog
+
+    logdir = tempfile.mkdtemp()
+    rl = RunLog(directory=logdir, run_id="spill")
+    eng = Engine(memory_limit="300MB", verbose=False,
+                 statement_detail=True, on_event=rl.sink())
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+    finally:
+        eng.close()
+        rl.close()
+
+    text = rl.log_path.read_text()
+    if "SPILLED" in text:
+        assert "spilled to disk" in text, (
+            "a statement spilled but the summary did not report it")
+        # the summary must name a table, not just a total
+        tail = text[text.index("spilled to disk"):]
+        assert any(c.isalpha() for c in tail.split("\n")[1]), tail[:200]
+
+
+def test_outputdenom_M_reports_members_without_member_days():
+    """`OUTPUTDENOM='M'` is members only: SAS sets `DenNumMemDays` to
+    MISSING for those cohorts and 0 for the rest
+    (ms_cidadenom.sas:1346-1347).
+
+    NULL, not 0 — "we did not count this" and "we counted zero days"
+    are different statements, and a reader summing the column would
+    silently include the second.
+
+    The value was parsed and documented and NOT implemented: a cohort
+    set to M was getting member-days it had asked not to receive.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    t2 = [dict(r) for r in base["type2file"]]
+    t2[0]["outputdenom"] = "M"          # lisinopril
+    s = load_study_dict({
+        **base, "type2file": t2,
+        "userstrata": [{"tableid": "t2cida", "levelid": "1",
+                        "levelvars": ""}]})
+
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        rows = dict(eng.con.execute(
+            'SELECT "group", dennummemdays FROM denomcounts'
+        ).fetchall())
+        assert rows["lisinopril"] is None, (
+            "an M cohort reported member-days", rows)
+        assert rows["beta_blocker"] is not None, (
+            "a Y cohort lost its member-days", rows)
+
+        # members are still counted for both
+        pts = dict(eng.con.execute(
+            'SELECT "group", dennumpts FROM denomcounts').fetchall())
+        assert pts["lisinopril"] > 0 and pts["beta_blocker"] > 0, pts
+    finally:
+        eng.close()
+
+
+def test_unread_scalar_parameters_are_reported():
+    """SAS branches on scalar parameters this package does not read.
+
+    Ignoring one silently gives a plausible answer computed under
+    different rules — the failure mode this package has been most prone
+    to. `outputdenom` sat in that set until a question about USERSTRATA
+    surfaced it.
+
+    A parameter set to "N" is NOT reported: not doing something this
+    package already does not do is agreement, not divergence.
+    """
+    import warnings as w
+
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def warnings_for(**params):
+        p = dict(base["qrp_parameters"][0])
+        p.update(params)
+        with w.catch_warnings(record=True) as caught:
+            w.simplefilter("always")
+            load_study_dict({**base, "qrp_parameters": [p]})
+        return [str(x.message) for x in caught
+                if "does not read" in str(x.message)]
+
+    assert warnings_for(othersex="Y"), "an active unread parameter was silent"
+    assert not warnings_for(psmatch="N"), (
+        "a parameter set to N was reported; that is agreement, not "
+        "divergence, and crying wolf trains people to ignore the warning")
+    assert not warnings_for(), "a study setting none of them warned"
+
+
+def test_the_real_study_sets_no_unread_parameters():
+    """A guard on the production input: if a future revision starts
+    setting one of these, the warning should be the reason we find out,
+    not a discrepancy in someone's results."""
+    import warnings as w
+
+    real = Path("/mnt/user-data/uploads/"
+                "qrp_inputfiles_type2_pt001_01_1.json")
+    if not real.exists():
+        pytest.skip("the production input file is not available here")
+
+    with w.catch_warnings(record=True) as caught:
+        w.simplefilter("always")
+        load_study(real)
+    unread = [str(x.message) for x in caught
+              if "does not read" in str(x.message)]
+    assert not unread, unread

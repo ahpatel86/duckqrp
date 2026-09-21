@@ -98,6 +98,21 @@ class StatementFinished(Event):
     columns: int = -1
     seconds: float = 0.0
     delta_rows: int | None = None    # change vs the input it derives from
+    # Memory attributed to THIS statement. The watcher thread samples
+    # continuously and reports live status, which answers "are we
+    # spilling right now" but not "which statement caused it" — and
+    # after a 40-second stage that is the only question that matters.
+    #
+    # peak_bytes is the high-water mark observed while this statement
+    # ran; spilled_bytes is how much MORE went to disk during it, not
+    # the running total, so the figure points at a culprit rather than
+    # accumulating across the run.
+    peak_bytes: int = 0
+    spilled_bytes: int = 0
+
+    @property
+    def spilled(self) -> bool:
+        return self.spilled_bytes > 0
 
 
 @dataclass(frozen=True)

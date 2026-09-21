@@ -160,13 +160,18 @@ SELECT
     NULL::SMALLINT                                     AS "month",
     NULL::SMALLINT                                     AS quarter,
     count(DISTINCT s.patid)                            AS dennumpts,
-    sum(s.memberdays)                                  AS dennummemdays
+    -- OUTPUTDENOM='M' reports members only: SAS sets DenNumMemDays to
+    -- MISSING for those cohorts, and 0 for the rest
+    -- (ms_cidadenom.sas:1346-1347). NULL, not 0 — "we did not count
+    -- this" and "we counted zero days" are different statements.
+    CASE WHEN m.output_denom = 'M' THEN NULL
+         ELSE sum(s.memberdays) END                    AS dennummemdays
 FROM _denom_strat s
 -- one row per cohort sharing this config
 JOIN cfg_denom_map m ON m.denom_cfg_id = s.denom_cfg_id
 CROSS JOIN cfg_strata lv
 GROUP BY
-    lv.level_id, m.cohortgrp,
+    lv.level_id, m.cohortgrp, m.output_denom,
     CASE WHEN lv.has_agegroup THEN s.agegroup    END,
     CASE WHEN lv.has_agegroup THEN s.agegroupnum END,
     CASE WHEN lv.has_sex      THEN s.sex         END,

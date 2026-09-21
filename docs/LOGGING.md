@@ -126,3 +126,67 @@ with RunLog("logs", run_id=study.run_id).capture() as rl:
 
 `RunLog.sink()` is an ordinary `EventSink`, so it composes with any other
 via `multi_sink` — console, log file and a UI at once.
+
+
+---
+
+## Which step is consuming the memory
+
+The RAM line and the `MemoryStatus` events answer "is this run
+spilling". They do not answer "which step caused it" — and once a run
+is over, that is the only question worth asking.
+
+Peak memory and spill are now attributed **per statement**.
+
+### In the run log
+
+Each statement line carries its own peak, and a spilling one says so:
+
+```
+  0.877s  TABLE denomcounts    238 rows x 17 cols   SPILLED 25MB (peak 299MB)
+```
+
+and the log ends with a summary, so the answer is the last thing read
+rather than something to scan 47 lines for:
+
+```
+spilled to disk (raise --memory-limit to avoid):
+  denomcounts                         25 MB
+```
+
+### In the terminal UI
+
+The stages table gained `peak` and `spilled` columns, so a slow stage
+can be opened up without turning on statement detail.
+
+### Why peak is per statement, not cumulative
+
+The high-water mark is reset before each statement, so the number
+points at a step rather than at the run. Measured on the production
+study at a 300MB limit:
+
+| statement | peak |
+|---|--:|
+| `cdm_diagnosis` | 20 MB |
+| `exposure_claims` | 51 MB |
+| `stockpiled` | **49 MB** |
+| `_denom_demog` | 156 MB |
+| `_denom_strat` | **107 MB** |
+| `denomcounts` | 277 MB |
+
+`stockpiled` and `_denom_strat` report LESS than the statement before
+them, which is the observable proof the reset works.
+
+Spill is a **delta**, not a running total, for the same reason: the
+figure names a culprit instead of accumulating across the run.
+
+### A test that failed against correct behaviour
+
+The first version of the test asserted the peaks were non-monotonic,
+reasoning that a never-reset high-water mark could only increase. That
+failed — memory legitimately grows through the pipeline, and the peaks
+happened to be increasing on that run.
+
+The property that actually distinguishes reset from not-reset is that
+most statements report LESS than the global peak. Asserting the wrong
+invariant would have meant "fixing" working code.

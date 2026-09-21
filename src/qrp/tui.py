@@ -56,7 +56,7 @@ from .events import (
     StageStarted,
 )
 from .inputfile import describe, load as load_inputfile
-from .events import EmptyResult, MemoryStatus
+from .events import EmptyResult, MemoryStatus, StatementFinished
 from .runlog import RunLog
 from .runner import RunHandle
 from .scdm import format_report, probe
@@ -185,9 +185,19 @@ class QRPApp(App):
                 yield DataTable(id="results")
         yield Footer()
 
+    # per-stage peak/spill, filled from StatementFinished and consumed
+    # when the stage finishes
+    _stage_peak: dict[str, int] = {}
+    _stage_spill: dict[str, int] = {}
+
     def on_mount(self) -> None:
+        self._stage_peak = {}
+        self._stage_spill = {}
         st = self.query_one("#stages", DataTable)
-        st.add_columns("#", "stage", "rows", "seconds")
+        # peak and spill per STAGE. The RAM line shows live pressure,
+        # which says a run is spilling but not which step caused it —
+        # and that is the question once the run is over.
+        st.add_columns("#", "stage", "rows", "seconds", "peak", "spilled")
         rs = self.query_one("#results", DataTable)
         rs.add_columns("table", "rows")
         self.log_line("[dim]Set the study file and SCDM root, then "
@@ -427,6 +437,16 @@ class QRPApp(App):
             except Exception:
                 pass
 
+        elif isinstance(ev, StatementFinished):
+            # Attribute to the stage, so a slow stage can be opened up
+            # without turning on statement detail.
+            if ev.peak_bytes:
+                self._stage_peak[ev.stage] = max(
+                    self._stage_peak.get(ev.stage, 0), ev.peak_bytes)
+            if ev.spilled_bytes:
+                self._stage_spill[ev.stage] = (
+                    self._stage_spill.get(ev.stage, 0) + ev.spilled_bytes)
+
         elif isinstance(ev, MemoryStatus):
             line = self.query_one("#memline", Static)
             used = human(ev.used_bytes)
@@ -451,8 +471,12 @@ class QRPApp(App):
 
         elif isinstance(ev, StageFinished):
             rows = f"{ev.rows:,}" if ev.rows >= 0 else "—"
+            peak = self._stage_peak.pop(ev.name, 0)
+            spill = self._stage_spill.pop(ev.name, 0)
             self.query_one("#stages", DataTable).add_row(
-                str(ev.index), ev.name, rows, f"{ev.seconds:.3f}"
+                str(ev.index), ev.name, rows, f"{ev.seconds:.3f}",
+                human(peak) if peak else "—",
+                f"[red]{human(spill)}[/red]" if spill else "—",
             )
             self.log_line(
                 f"  [green]✓[/green] {ev.name} "

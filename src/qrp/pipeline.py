@@ -580,10 +580,15 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         "cfg_denom_map",
         # Only cohorts SAS would compute a denominator for: OUTPUTDENOM
         # is not "N", and no inclusion rule uses minrxdays > 1.
-        [{"denom_cfg_id": _denom_cfg_id(c), "cohortgrp": c.cohortgrp}
+        [{"denom_cfg_id": _denom_cfg_id(c), "cohortgrp": c.cohortgrp,
+          # "M" = members only: DenNumMemDays is blanked
+          # (ms_cidadenom.sas:1346). Carried per COHORT because two
+          # cohorts can share a denominator config and still differ on
+          # whether they report member-days.
+          "output_denom": c.output_denom}
          for c in cohorts
          if c.cohortgrp in set(study.denominator_cohorts())],
-        "denom_cfg_id VARCHAR, cohortgrp VARCHAR",
+        "denom_cfg_id VARCHAR, cohortgrp VARCHAR, output_denom VARCHAR",
     )
     eng.register(
         "cfg_denom_cohort",

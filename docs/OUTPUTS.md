@@ -596,7 +596,56 @@ This package emitted one regardless.
 Both gates are now applied, and both warn at load rather than silently
 dropping a deliverable.
 
+### `OUTPUTDENOM='M'` — documented, then not implemented
+
+The `M` case was written into the docs and the dataclass comment and
+**never implemented**. A cohort set to `M` kept getting member-days it
+had asked not to receive.
+
+SAS sets `DenNumMemDays` to MISSING for those cohorts and 0 for the
+rest (`ms_cidadenom.sas:1346-1347`). NULL, not 0 — "we did not count
+this" and "we counted zero days" are different statements, and a reader
+summing the column would silently include the second.
+
+Now implemented at the fan-out point, because two cohorts can share a
+denominator config and still differ on whether they report member-days.
+
+Worth naming the pattern: writing the documentation is not the same as
+writing the code, and the documentation looked complete.
+
 **The production study is unaffected**: all 14 cohorts are
 `OUTPUTDENOM=Y` and no inclusion rule uses `minrxdays`, so its output is
 unchanged at 238 rows. The divergence would only have appeared on a
 different study — which is exactly the kind that gets noticed late.
+
+
+---
+
+## Scalar parameters this package does not read
+
+SAS branches on a set of scalar parameters — `%if "&param" = "Y"`.
+Ignoring one silently gives a plausible answer computed under different
+rules, which is the failure mode this package has been most prone to.
+
+Found by grepping the macros for those branches and checking each
+against what `config.py` reads. `outputdenom` was in this set until a
+question about USERSTRATA surfaced it.
+
+The remaining ones are reported at load when a study sets them:
+
+| parameter | what it would change |
+|---|---|
+| `othersex` | forces `sex='O'` into the output shell even when no patient has it |
+| `includelinkedonly` | restricts the cohort to linked members |
+| `calculate_adherence` | adds adherence metrics |
+| `datadrivenqueryperiod` | derives the query period from the data |
+| `agegroup_out`, `geog_out` | control whether those dimensions appear |
+| `psmatch`, `psstratification`, `psiptw` | propensity-score designs |
+
+**A parameter set to `N` is not reported.** Not doing something this
+package already does not do is agreement, not divergence, and a warning
+that cries wolf trains people to ignore it.
+
+None of them appear in the production input file, and a test asserts
+that — so if a future revision starts setting one, the warning is how
+that is discovered rather than a discrepancy in someone's results.

@@ -124,6 +124,7 @@ class Engine:
     _monitor: duckdb.DuckDBPyConnection | None = field(default=None, init=False)
     _limit_bytes: int = field(default=0, init=False)
     peak_memory_bytes: int = field(default=0, init=False)
+    _stmt_peak: int = field(default=0, init=False)
     peak_spill_bytes: int = field(default=0, init=False)
     _shapes: dict[str, int] = field(default_factory=dict, init=False)
 
@@ -229,6 +230,23 @@ class Engine:
         except ValueError:
             return 0
 
+    def _spill_total(self) -> int:
+        """Bytes written to the temp directory so far, cumulative.
+
+        Read on the MONITOR cursor: the executing connection is blocked
+        while a statement runs, which is the whole reason spilling was
+        invisible per statement.
+        """
+        if self._monitor is None:
+            return 0
+        try:
+            row = self._monitor.execute(
+                "SELECT coalesce(sum(temporary_storage_bytes), 0) "
+                "FROM duckdb_memory()").fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
     def memory_status(self) -> MemoryStatus:
         """Current RAM use and bytes spilled to the temp directory."""
         used = spilled = 0
@@ -242,6 +260,8 @@ class Engine:
             except Exception:
                 pass
         self.peak_memory_bytes = max(self.peak_memory_bytes, int(used))
+        # per-statement high-water mark, reset by the statement loop
+        self._stmt_peak = max(getattr(self, "_stmt_peak", 0), int(used))
         self.peak_spill_bytes = max(self.peak_spill_bytes, int(spilled))
         return MemoryStatus(used_bytes=int(used), spilled_bytes=int(spilled),
                             limit_bytes=self._limit_bytes)
@@ -416,9 +436,14 @@ class Engine:
         def run_all() -> None:
             for stmt in split_statements(sql):
                 self.raise_if_cancelled()
+                # Reset the per-statement high-water mark so the peak
+                # is attributed to this statement, not the run.
+                before = self._spill_total()
+                self._stmt_peak = 0
                 s0 = time.perf_counter()
                 self.con.execute(stmt.sql)
                 sdt = time.perf_counter() - s0
+                spilled = max(0, self._spill_total() - before)
                 rows = cols = -1
                 if stmt.kind in ("TABLE", "VIEW") and stmt.target:
                     rows, cols = self.shape(stmt.target)
@@ -426,6 +451,8 @@ class Engine:
                     stage=name, target=stmt.target or "",
                     kind=stmt.kind or "", rows=rows, columns=cols,
                     seconds=sdt,
+                    peak_bytes=self._stmt_peak,
+                    spilled_bytes=spilled,
                 ))
                 if stmt.target:
                     self._shapes[stmt.target] = rows
