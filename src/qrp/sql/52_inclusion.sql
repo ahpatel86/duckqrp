@@ -2,7 +2,8 @@
 -- 52_inclusion.sql — INCLUSIONCODES: additional cohort criteria beyond
 --                    the exposure definition.
 --
--- Semantics, from ms_createmicohorts.sas:
+-- Semantics, from ms_createpov3.sas (the macro that builds the
+-- inclusion/exclusion sets; its exclusion rule is at 592-598):
 --
 --   * A row carries a code, a lookback window (condfrom/condto relative
 --     to the index date), and a direction (INC = must have,

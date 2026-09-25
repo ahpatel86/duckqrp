@@ -456,3 +456,86 @@ qrp serve                                       # same, in a browser
 ```
 
 Every command takes `--help`.
+
+
+---
+
+## How SCDM tables are found
+
+You point `--indata` at a folder. For each table the pipeline needs, it
+tries three strategies **in order of how much it trusts them**:
+
+| # | strategy | example |
+|---|---|---|
+| 1 | **your `--table-map`** — always wins | `--table-map dispensing=/other/rx.parquet` |
+| 2 | **the file name**, case-insensitively, incl. known aliases | `dispensing.parquet`, `DISPENSING/`, `dispensing/*.parquet` |
+| 3 | **the columns** — identifies the table by its schema | a file called `dp042_rx_2024q1.parquet` |
+
+Strategy 3 is what handles site-specific names. It is only used when
+the name gave nothing, so a correctly named file is never second-guessed.
+
+`qrp inspect --indata <folder>` shows what was found and where, before
+you commit to a run.
+
+### Reading one table from somewhere else
+
+```bash
+qrp run --study study.json --indata /data/scdm \
+        --table-map dispensing=/data/other_team/rx_extract_2024.parquet
+```
+
+* An **absolute** path is used exactly as given — it does not have to be
+  inside `--indata`.
+* A **relative** path is resolved against `--indata`.
+* A **folder** is read as every parquet file beneath it.
+* Repeat `--table-map` for more than one table.
+
+Verified: moving `dispensing` to a different directory under a
+different name and pointing `--table-map` at it gives results identical
+to the file sitting in the folder.
+
+### When the override is wrong
+
+Both mistakes stop the run with a message rather than guessing:
+
+```
+--table-map names 'dispensng', which is not an SCDM table this package
+reads. Did you mean 'dispensing'?
+```
+
+```
+error: --table-map dispensing=... points at '/data/WRONG.parquet',
+which does not exist.
+  Check the path. An absolute path is used as-is; a relative one is
+  resolved against --indata (/data/scdm).
+```
+
+**The misspelt name used to be silently ignored.** The override was
+dropped, the real table reported as missing, and nothing said the name
+had not been recognised — so it looked like a data problem, not a typo.
+The path error used to say the file was missing "under" the input
+folder even for an absolute path, which it never was.
+
+
+### In the terminal UI
+
+The UI now has the same two controls as the command line:
+
+| field | equivalent | notes |
+|---|---|---|
+| **Tables** | `--table-map` | `dispensing=/other/rx.parquet; diagnosis=/other/dx` |
+| **Debug** | `--debug` | also write the dplocal diagnostics |
+
+Separate several overrides with a **semicolon**, not a comma — commas
+turn up in real folder names and semicolons essentially never do.
+
+**Inspect honours the Tables field**, so what it checks is what Run will
+read. Inspecting the folder without the overrides would report a table
+as missing that the run will in fact find elsewhere.
+
+A misspelt table name is caught by the same check as the CLI, with the
+same "Did you mean ...?" suggestion, and stops before anything starts.
+
+Before this, the UI had neither control — `RunHandle` did not accept a
+table map at all — so a site keeping one table outside its SCDM folder
+could only run from the command line.

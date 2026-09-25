@@ -29,6 +29,9 @@ DuckDB specifics worth knowing
 
 from __future__ import annotations
 
+import contextlib
+import os
+
 import threading
 import time
 from dataclasses import dataclass, field
@@ -89,6 +92,15 @@ def sql_str(value: object) -> str:
     expects.
     """
     return "'" + str(value).replace("'", "''") + "'"
+
+
+# Row count above which config tables are bulk-loaded via CSV rather
+# than inserted row by row.
+_BULK_LOAD_ROWS = 5_000
+
+# Marks a Python None in the bulk-load CSV, so it stays distinct from a
+# genuine empty string. Chosen to be something no config value holds.
+_NULL_TOKEN = "\\N@qrp"
 
 
 @dataclass
@@ -390,12 +402,54 @@ class Engine:
         self.con.execute(f"CREATE OR REPLACE TABLE {name} ({schema})")
         if not rows:
             return
-        cols = [c.split()[0] for c in schema.split(",")]
-        placeholders = ", ".join("?" for _ in cols)
-        self.con.executemany(
-            f"INSERT INTO {name} VALUES ({placeholders})",
-            [[r.get(c) for c in cols] for r in rows],
-        )
+        parts = [c.strip() for c in schema.split(",") if c.strip()]
+        cols = [c.split()[0] for c in parts]
+        types = [" ".join(c.split()[1:]) or "VARCHAR" for c in parts]
+
+        # Per-row INSERTs are fine for a handful of rows and hopeless for
+        # a real study: a 40-cohort file registers ~300,000 config rows,
+        # and executemany spent 91 SECONDS on them — 79% of the whole
+        # run, against 17 seconds of actual SQL.
+        #
+        # DuckDB's bulk CSV reader does the same work in a fraction of
+        # the time (0.16s against 13.8s on a 200,000-row benchmark), so
+        # anything large goes through a temp file. Small tables keep the
+        # direct path, which avoids the file overhead and any question
+        # about how a value round-trips through text.
+        if len(rows) < _BULK_LOAD_ROWS:
+            placeholders = ", ".join("?" for _ in cols)
+            self.con.executemany(
+                f"INSERT INTO {name} VALUES ({placeholders})",
+                [[r.get(c) for c in cols] for r in rows],
+            )
+            return
+
+        import csv
+        import tempfile
+
+        spec = ", ".join(f"'{c}': '{t}'" for c, t in zip(cols, types))
+        fd, path = tempfile.mkstemp(suffix=".csv", prefix="qrp_cfg_")
+        try:
+            with os.fdopen(fd, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(cols)
+                w.writerows(
+                    [_NULL_TOKEN if r.get(c) is None else r.get(c)
+                     for c in cols]
+                    for r in rows)
+            # A sentinel, NOT nullstr=''. csv writes None as an empty
+            # field, so with nullstr='' a genuinely EMPTY STRING would
+            # also arrive as NULL — one risk-code value silently did
+            # exactly that, and an empty string and a NULL behave
+            # differently in a join.
+            self.con.execute(
+                f"INSERT INTO {name} SELECT * FROM read_csv("
+                f"{sql_str(path)}, header=true, columns={{{spec}}}, "
+                f"nullstr={sql_str(_NULL_TOKEN)})"
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
 
     # ---------------- stage boundary --------------------------------
 

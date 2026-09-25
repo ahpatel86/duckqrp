@@ -262,6 +262,7 @@ def _run_metadata(eng: Engine, study: StudyConfig, seconds: float) -> None:
 
 def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
                         tables: list[str], csv: bool = False,
+                        text: bool = True,
                         names: str = "sas") -> None:
     """Write outputs under dplocal/ and msoc/.
 
@@ -314,6 +315,18 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
         name = f"{run}_{suffix}"
         part = "cohortgrp" if tbl in ("cohort_final", "ptsmasterlist") else None
         dest = target_dir / name if part else target_dir / f"{name}.parquet"
+        # A plain-text view of every msoc table, written just before its
+        # parquet, so an output can be read without a parquet viewer —
+        # which most of the people reading these do not have.
+        #
+        # msoc ONLY. Those are aggregates, cleared for sharing, and the
+        # text copy changes nothing about what leaves the site. dplocal
+        # is patient-level; a plain-text copy of it would be one more
+        # unencrypted, greppable file holding patient rows.
+        if text and lib == "msoc":
+            from .show import table_text
+            (target_dir / f"{name}.txt").write_text(
+                table_text(eng.con, tbl, name))
         eng.write_parquet(tbl, dest, partition_by=part)
         if csv:
             csv_dir = out / lib / "csv"
@@ -359,7 +372,7 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
     (out / "manifest.json").write_text(_json.dumps(manifest, indent=1))
 
 
-def tables_for(study: StudyConfig) -> list[str]:
+def tables_for(study: StudyConfig, debug: bool = False) -> list[str]:
     """Which outputs this study writes.
 
     The gating lives here rather than inside `run()` because it is an
@@ -388,4 +401,22 @@ def tables_for(study: StudyConfig) -> list[str]:
         tables += ["risk_scores", "risk_score_summary"]
     if study.any_utilization:
         tables += ["utilization", "utilization_summary"]
+
+    # Mirrors SAS's QRP_DEBUG. Without it, write only what SAS writes
+    # to dplocal: the contract outputs (mstr, denomcounts, numcounts).
+    # The patient-level ADDITIONS — covariates_long, inclusion_excluded,
+    # mstr_episodes and the rest — are diagnostics, the same role SAS's
+    # per-step exclusion lists play under QRP_DEBUG
+    # (ms_attrition.sas:201-209).
+    #
+    # Scoped to dplocal deliberately. msoc additions are small
+    # aggregates a data partner may be asked for; dplocal additions are
+    # patient-level files that sit at the site, cost disk, and were
+    # never part of the request.
+    if not debug:
+        by_name = {o.name: o for o in OUTPUTS}
+        tables = [t for t in tables
+                  if not (t in by_name
+                          and by_name[t].library == "dplocal"
+                          and not by_name[t].contract)]
     return tables

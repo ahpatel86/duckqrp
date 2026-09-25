@@ -358,15 +358,26 @@ class CohortConfig:
     output_denom: str = "Y"
     # (code, codecat) pairs. codecat is one of RX / PX / DX and decides
     # which claim domain the code is extracted from.
-    # (code, codecat, code_supply). code_supply overrides the claim's
+    # (code, codecat, codetype, code_supply).
+    #
+    # codetype is the CODE SYSTEM — ICD-10 ("10"), HCPCS ("HC"), NDC
+    # ("ND") and so on. One cohort's codes routinely span several: the
+    # real study seen has DX/10, PX/10, PX/HC, PX/ND and RX/ND under a
+    # single cohort. The same code STRING can exist in two systems, so
+    # matching on (code, codecat) alone over-matches — it found 1,171
+    # members where SAS found 1,113.
+    #
+    # code_supply overrides the claim's
     # RxSup when set; None means use the claim's own value.
-    exposure_codes: tuple[tuple[str, str, int | None], ...] = ()
-    event_codes: tuple[tuple[str, str, int | None], ...] = ()
+    exposure_codes: tuple[tuple[str, str, str, int | None], ...] = ()
+    event_codes: tuple[tuple[str, str, str, int | None], ...] = ()
     # fupcriteria='IOC' codes: the follow-up washout is evaluated
     # against these as well as against the event codes
-    # (ms_createmicohorts.sas:1685 -> _FUPWash, consumed by
+    # (ms_cidanum.sas:1664 -> _FUPWash, consumed by
     # _WashEventsInFupWash in ms_createpov56.sas).
-    ioc_codes: tuple[tuple[str, str, int | None], ...] = ()
+    ioc_codes: tuple[tuple[str, str, str, int | None], ...] = ()
+    # FUT: a claim inside an episode truncates it to that date.
+    trunc_codes: tuple[tuple[str, str, str, int | None], ...] = ()
     # (code, stockgroup) for DEF codes. SAS stockpiles WITHIN a
     # stockgroup (ms_stockpiling.sas passes GROUPING=StockGroup ...), so
     # two drugs in one cohort are pushed forward independently. Absent a
@@ -444,7 +455,7 @@ class CohortConfig:
         # CODESUPPLY passed validation, and a study where only the first
         # did failed it. CODESUPPLY is per code — 150 of 1,124 rows
         # carry it in the real study file.
-        if any(sup is not None for _, _, sup in self.exposure_codes) and (
+        if any(sup is not None for _, _, _, sup in self.exposure_codes) and (
             self.min_cfdd is not None or self.max_cfdd is not None
         ):
             errs.append(
@@ -700,7 +711,7 @@ class StudyConfig:
                 if c.needs_dose
                 # exposure_codes is (code, codecat) pairs; dose applies
                 # to dispensings, so only RX codes need a strength.
-                for code, codecat, _supply in c.exposure_codes
+                for code, codecat, _ctype, _supply in c.exposure_codes
                 if codecat == "RX" and code not in known
             }
             if missing:
@@ -991,7 +1002,9 @@ class StudyConfig:
         #
         # INDEXDT_EXP anchors on `indexdt_exp`: the date exposure
         # actually BEGAN inside a pregnancy's exposure window, clamped
-        # to the start of that window (ms_createmicohorts.sas:764). It
+        # to the start of that window (ms_createmicohorts.sas:764 —
+        # the comparator/Type 4 macro, which is the right source HERE
+        # precisely because this is Type 4 logic). It
         # is distinct from `indexdt`, which for a pregnancy cohort is
         # usually the pregnancy start date. Every use in the macros is
         # gated on `type = 4`, so it is not reachable from Type 2 — but
@@ -1215,6 +1228,243 @@ def load_study(path: str | Path, lookup: str | Path | None = None) -> StudyConfi
     return study
 
 
+def _parse_inclusions(
+    incl_rows: list[dict[str, Any]],
+) -> list["InclusionRule"]:
+    """Build the inclusion rules from INCLUSIONCODES.
+
+    The most intricate of the parsers: three levels of nesting derived
+    from character columns, per-rule code lists, and the cond/subcond
+    keys that a review found were being collapsed.
+    """
+    _incl_rows = incl_rows
+    _cond_no: dict[tuple, int] = {}
+    _sub_no: dict[tuple, int] = {}
+    inclusions_list: list[InclusionRule] = []
+    for r in _incl_rows:
+        grp = str(r.get("group") or r.get("cohortgrp") or "")
+        # Real input files come in two shapes. Some carry an
+        # `indexcriteria` column saying INC/EXC outright; others carry
+        # `condinclusion`, where 0 means EXCLUDE and 1 means INCLUDE
+        # (SAS reads CondInclusion directly — ms_cidadenom.sas:159).
+        #
+        # Defaulting to "INC" when neither is present turned every
+        # EXCLUSION rule into an inclusion REQUIREMENT. On the real
+        # 40-cohort study that meant patients had to HAVE the
+        # splenectomy codes they were supposed to be excluded for:
+        # 42,708 episodes became 58.
+        crit = str(r.get("indexcriteria") or "").upper()
+        if not crit:
+            ci = r.get("condinclusion")
+            if ci is not None and str(ci).strip() != "":
+                crit = "INC" if _int(ci, 1) else "EXC"
+            else:
+                crit = "INC"
+        clvl = str(r.get("condlevel") or "1").upper()
+        slvl = str(r.get("subcondlevel") or "1").upper()
+
+        ckey = (grp, crit, clvl)
+        if ckey not in _cond_no:
+            _cond_no[ckey] = 1 + len({k for k in _cond_no if k[:2] == (grp, crit)})
+        cond = _cond_no[ckey]
+
+        skey = (grp, crit, clvl, slvl)
+        if skey not in _sub_no:
+            _sub_no[skey] = 1 + len({k for k in _sub_no if k[:3] == ckey})
+        subcond = _sub_no[skey]
+
+        inclusions_list.append(InclusionRule(
+            cohortgrp=grp,
+            cond=cond,
+            subcond=subcond,
+            condlevel=_int(r.get("condlevel"), 1) if str(
+                r.get("condlevel") or "").isdigit() else cond,
+            criteria=crit,
+            codecat=str(r.get("codecat") or "DX").upper(),
+            condfrom=_int(r.get("condfrom"), -365),
+            condto=_int(r.get("condto"), -1),
+            condfromanchor=(str(r.get("condfromanchor") or "").strip().upper()
+                            or "INDEXDT"),
+            condtoanchor=(str(r.get("condtoanchor") or "").strip().upper()
+                          or "INDEXDT"),
+            codedays=max(1, _int(r.get("codedays"), 1) or 1),
+            minrxdays=max(1, _int(r.get("minrxdays"), 1) or 1),
+            mincumdose=_float(r.get("mincumdose")),
+            minafdd=_float(r.get("minafdd")),
+            maxafdd=_float(r.get("maxafdd")),
+            subcondlevel=slvl,
+            # `or "1"` would be wrong here: an integer 0 is falsy, so
+            # `0 or "1"` yields "1" and a sub-EXCLUSION silently becomes
+            # a sub-inclusion. Check for absence explicitly.
+            subcond_inclusion=(
+                str(r["subcondinclusion"]).strip().upper()
+                not in ("0", "N", "NO", "FALSE")
+                if r.get("subcondinclusion") is not None
+                and str(r.get("subcondinclusion")).strip() != ""
+                else True
+            ),
+            codes=tuple(str(c) for c in (r.get("codes") or []))
+                  or ((str(r["code"]),) if r.get("code") else ()),
+        ))
+
+    return inclusions_list
+
+
+def _parse_cohort_codes(
+    code_rows: list[dict[str, Any]],
+) -> tuple[dict, dict, dict]:
+    """Split COHORTCODES into (codes, stockgroups, care settings) by group.
+
+    Extracted from `load_study_dict`, which was 356 lines of one block
+    per input table. Each block is independently readable; together they
+    were not.
+
+    Returns three maps keyed by cohort group:
+      codes_by_group  role -> [(code, codecat, codetype, code_supply)]
+      stock_by_group  code -> stockgroup
+      care_by_group   [(code, enctype, pdx)] for EVENT codes
+    """
+    codes_by_group: dict[str, dict[str, list[tuple[str, str, str, int | None]]]] = {}
+    stock_by_group: dict[str, dict[str, str]] = {}
+    care_by_group: dict[str, list[tuple[str, str, str]]] = {}
+
+    for r in code_rows:
+        g = r.get("group") or r.get("cohortgrp")
+        if not g:
+            continue
+        # (code, codecat) — NOT code alone. A real study defines
+        # exposure across RX, PX and DX simultaneously (960/150/14 in the
+        # file seen), and two of its cohorts are defined purely by HCPCS
+        # procedure codes. Dropping codecat made those cohorts extract
+        # from dispensing only, so they came out EMPTY. Reported in
+        # review.
+        bucket = codes_by_group.setdefault(
+            str(g), {"DEF": [], "EVENT": [], "IOC": [], "TRUNK": []})
+        codecat = str(r.get("codecat") or "RX").upper()
+        crit = str(r.get("indexcriteria") or "").upper()
+        fup = str(r.get("fupcriteria") or "").upper()
+        # fupcriteria='IOC' marks a washout-only code: it never defines
+        # an index or an outcome, only disqualifies an episode whose
+        # washout window contains it.
+        if fup == "IOC":
+            key = "IOC"
+        elif fup == "DEF" or crit == "EVENT":
+            # The OUTCOME. SAS routes on FUPCRITERIA, not indexcriteria:
+            # `if fupcriteria in('DEF') then output _FUPEvent`
+            # (ms_cidanum.sas:1684 — the TYPE 2 path;
+            # ms_createmicohorts.sas is the comparator/Type 4 macro and
+            # is not authoritative here).
+            #
+            # `indexcriteria = 'EVENT'` is not a value SAS writes, but
+            # it is unambiguous and some hand-built study files use it,
+            # so it is honoured too.
+            key = "EVENT"
+        elif crit == "DEF":
+            key = "DEF"
+        elif crit == "FUT":
+            # TRUNCATION codes. A FUT claim inside an episode ENDS it:
+            #
+            #   if fut and trunkdt and trunkdt <= EpisodeEndDt
+            #       then EpisodeEndDt = trunkdt;
+            #   (ms_createptsmasterlist.sas:152)
+            #
+            # where trunkdt is the earliest FUT claim overlapping
+            # [EpisodeStartDt, EpisodeEndDt] (ms_createpov4.sas:155-167,
+            # commented "Truncate (potentially extended using Episode
+            # Extension) episodes with FUT").
+            #
+            # Skipping them left every affected episode too long: on the
+            # study compared, 3,077 of 31,440 episodes ran past SAS's
+            # end date and NOT ONE was shorter.
+            key = "TRUNK"
+        else:
+            # INDEXCRITERIA = 'NOT' with no follow-up role.
+            # FUT goes to SAS's washout-for-truncation set
+            # (`_GroupWashForTrunk`, ms_cidanum.sas:1766), which this
+            # package does not model.
+            #
+            # These used to fall through to EVENT, and they dominate a
+            # real file: one cohort of the study compared has 54 DEF
+            # codes, ONE outcome code, and 4,957 FUT codes. Treating
+            # FUT as outcomes gave 4,958 event codes instead of 1, and
+            # 11,196 events against SAS's 3 — which then dropped 58
+            # episodes through the blackout-event rule.
+            continue
+        if r.get("code"):
+            # CODESUPPLY overrides the claim's own RxSup
+            # (SAS's CODESUPPLY handling (exact line unverified) — `if not missing(codesupply)
+            # then RxSup = CodeSupply`). It is per CODE, not per cohort:
+            # 150 of 1,124 rows carry it in the real study file, all of
+            # them PX, because a procedure claim has no days-supply.
+            bucket[key].append((
+                str(r["code"]), codecat,
+                # "" when the file does not say; the SQL treats an
+                # empty codetype as "match any", so a file without the
+                # column behaves as it did before.
+                str(r.get("codetype") or "").strip().upper(),
+                _int(r.get("codesupply"), 0) or None))
+            if key in ("DEF", "TRUNK"):
+                # TRUNK codes carry a stockgroup and stockpile within
+                # it, exactly as exposure codes do. Capturing it only
+                # for DEF left every truncation code in `_default`, so
+                # unrelated drugs chained together and pushed dates far
+                # past where SAS puts them.
+                stock_by_group.setdefault(str(g), {})[str(r["code"])] = (
+                    str(r.get("stockgroup") or "").strip() or "_default"
+                )
+            else:
+                for enctype, pdx in parse_care_setting(
+                    r.get("caresettingprincipal")
+                ):
+                    care_by_group.setdefault(str(g), []).append(
+                        (str(r["code"]), enctype, pdx)
+                    )
+
+
+    return codes_by_group, stock_by_group, care_by_group
+
+
+def _query_period(params: dict[str, Any],
+                  monitoring: list[dict[str, Any]]) -> tuple[date, date, date | None]:
+    """(start, end, censor) for the query period.
+
+    A study states its period in ONE of two places, and both occur in
+    real input files:
+
+      * `startdate` / `enddate` scalars in QRP_PARAMETERS, or
+      * the MONITORING file — `startdate`, `indenddate`, `fupenddate`
+
+    Only the scalars were read, and a study using the monitoring file
+    silently fell back to a hardcoded 2010-2015. On the real 40-cohort
+    study seen, whose period is 2016-2025, that meant the query period
+    did not overlap the data at all: SAS found 31,464 episodes and this
+    package found 6. A wrong answer, with no error.
+
+    MONITORING's end date follows ms_processinputfiles.sas:996-1010:
+    `indenddate` when given, otherwise FUPDRIVEN takes `fupenddate`.
+    """
+    start = _as_date(params.get("startdate"))
+    end = _as_date(params.get("enddate"))
+    censor = _as_date(params.get("censordate"))
+
+    if monitoring and not (start and end):
+        row = monitoring[0]
+        start = start or _as_date(row.get("startdate"))
+        fup = _as_date(row.get("fupenddate"))
+        end = end or _as_date(row.get("indenddate")) or fup
+        censor = censor or fup
+
+    if not start or not end:
+        raise ValueError(
+            "the study does not state a query period. Give startdate and "
+            "enddate in QRP_PARAMETERS, or a monitoring file with "
+            "startdate and indenddate/fupenddate.\n  This used to fall "
+            "back to 2010-2015, which silently produced a cohort from "
+            "the wrong years rather than an error."
+        )
+    return start, end, censor
+
+
 def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     def rows(name: str) -> list[dict[str, Any]]:
         return [
@@ -1233,53 +1483,8 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     cohortfile = {r["cohortgrp"]: r for r in rows("cohortfile")}
     type2file = {r.get("group", r.get("cohortgrp")): r for r in rows("type2file")}
 
-    # (code, codecat) pairs per role — codecat decides which claim
-    # domain each code is extracted from.
-    codes_by_group: dict[str, dict[str, list[tuple[str, str, int | None]]]] = {}
-    stock_by_group: dict[str, dict[str, str]] = {}
-    care_by_group: dict[str, list[tuple[str, str, str]]] = {}
-    for r in rows("cohortcodes"):
-        g = r.get("group") or r.get("cohortgrp")
-        if not g:
-            continue
-        # (code, codecat) — NOT code alone. A real study defines
-        # exposure across RX, PX and DX simultaneously (960/150/14 in the
-        # file seen), and two of its cohorts are defined purely by HCPCS
-        # procedure codes. Dropping codecat made those cohorts extract
-        # from dispensing only, so they came out EMPTY. Reported in
-        # review.
-        bucket = codes_by_group.setdefault(
-            str(g), {"DEF": [], "EVENT": [], "IOC": []})
-        codecat = str(r.get("codecat") or "RX").upper()
-        crit = str(r.get("indexcriteria") or "").upper()
-        fup = str(r.get("fupcriteria") or "").upper()
-        # fupcriteria='IOC' marks a washout-only code: it never defines
-        # an index or an outcome, only disqualifies an episode whose
-        # washout window contains it.
-        if fup == "IOC":
-            key = "IOC"
-        else:
-            key = "DEF" if crit == "DEF" else "EVENT"
-        if r.get("code"):
-            # CODESUPPLY overrides the claim's own RxSup
-            # (ms_createmicohorts.sas:571 — `if not missing(codesupply)
-            # then RxSup = CodeSupply`). It is per CODE, not per cohort:
-            # 150 of 1,124 rows carry it in the real study file, all of
-            # them PX, because a procedure claim has no days-supply.
-            bucket[key].append((str(r["code"]), codecat,
-                                _int(r.get("codesupply"), 0) or None))
-            if key == "DEF":
-                stock_by_group.setdefault(str(g), {})[str(r["code"])] = (
-                    str(r.get("stockgroup") or "").strip() or "_default"
-                )
-            else:
-                for enctype, pdx in parse_care_setting(
-                    r.get("caresettingprincipal")
-                ):
-                    care_by_group.setdefault(str(g), []).append(
-                        (str(r["code"]), enctype, pdx)
-                    )
-
+    (codes_by_group, stock_by_group,
+     care_by_group) = _parse_cohort_codes(rows("cohortcodes"))
     cohorts: list[CohortConfig] = []
     for grp, cf in cohortfile.items():
         t2 = type2file.get(grp, {})
@@ -1337,8 +1542,11 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
                 event_care_settings=tuple(care_by_group.get(str(grp), ())),
                 event_codes=tuple(codes.get("EVENT", ())),
                 ioc_codes=tuple(codes.get("IOC", ())),
+                trunc_codes=tuple(codes.get("TRUNK", ())),
             )
         )
+
+    _period = _query_period(params, rows("monitoringfile"))
 
     strata = tuple(StratumLevel.parse(r) for r in rows("userstrata"))
 
@@ -1439,59 +1647,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     # order. Reading a numeric `cond` column straight from the input is
     # wrong — it does not exist there, so every rule would land in
     # condition 1 and be ORed instead of ANDed.
-    _incl_rows = rows("inclusioncodes")
-    _cond_no: dict[tuple, int] = {}
-    _sub_no: dict[tuple, int] = {}
-    inclusions_list: list[InclusionRule] = []
-    for r in _incl_rows:
-        grp = str(r.get("group") or r.get("cohortgrp") or "")
-        crit = str(r.get("indexcriteria") or "INC").upper()
-        clvl = str(r.get("condlevel") or "1").upper()
-        slvl = str(r.get("subcondlevel") or "1").upper()
-
-        ckey = (grp, crit, clvl)
-        if ckey not in _cond_no:
-            _cond_no[ckey] = 1 + len({k for k in _cond_no if k[:2] == (grp, crit)})
-        cond = _cond_no[ckey]
-
-        skey = (grp, crit, clvl, slvl)
-        if skey not in _sub_no:
-            _sub_no[skey] = 1 + len({k for k in _sub_no if k[:3] == ckey})
-        subcond = _sub_no[skey]
-
-        inclusions_list.append(InclusionRule(
-            cohortgrp=grp,
-            cond=cond,
-            subcond=subcond,
-            condlevel=_int(r.get("condlevel"), 1) if str(
-                r.get("condlevel") or "").isdigit() else cond,
-            criteria=crit,
-            codecat=str(r.get("codecat") or "DX").upper(),
-            condfrom=_int(r.get("condfrom"), -365),
-            condto=_int(r.get("condto"), -1),
-            condfromanchor=(str(r.get("condfromanchor") or "").strip().upper()
-                            or "INDEXDT"),
-            condtoanchor=(str(r.get("condtoanchor") or "").strip().upper()
-                          or "INDEXDT"),
-            codedays=max(1, _int(r.get("codedays"), 1) or 1),
-            minrxdays=max(1, _int(r.get("minrxdays"), 1) or 1),
-            mincumdose=_float(r.get("mincumdose")),
-            minafdd=_float(r.get("minafdd")),
-            maxafdd=_float(r.get("maxafdd")),
-            subcondlevel=slvl,
-            # `or "1"` would be wrong here: an integer 0 is falsy, so
-            # `0 or "1"` yields "1" and a sub-EXCLUSION silently becomes
-            # a sub-inclusion. Check for absence explicitly.
-            subcond_inclusion=(
-                str(r["subcondinclusion"]).strip().upper()
-                not in ("0", "N", "NO", "FALSE")
-                if r.get("subcondinclusion") is not None
-                and str(r.get("subcondinclusion")).strip() != ""
-                else True
-            ),
-            codes=tuple(str(c) for c in (r.get("codes") or []))
-                  or ((str(r["code"]),) if r.get("code") else ()),
-        ))
+    inclusions_list = _parse_inclusions(rows("inclusioncodes"))
     inclusions = tuple(inclusions_list)
 
     # COVARIATECODES carries ONE ROW PER CODE with covarnum repeated —
@@ -1561,9 +1717,9 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         lab_codes=lab_codes,
         mfu=mfu,
         code_strength=code_strength,
-        start_date=_as_date(params.get("startdate")) or date(2010, 1, 1),
-        end_date=_as_date(params.get("enddate")) or date(2015, 12, 31),
-        censor_date=_as_date(params.get("censordate")),
+        start_date=_period[0],
+        end_date=_period[1],
+        censor_date=_period[2],
         run_id=safe_run_id(params.get("runid")),
         cohorts=tuple(cohorts),
     )

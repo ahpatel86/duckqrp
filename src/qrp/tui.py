@@ -30,6 +30,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import (
+    Checkbox,
     Button,
     DataTable,
     Footer,
@@ -165,6 +166,20 @@ class QRPApp(App):
                 yield Label("Log dir")
                 yield Input(value="logs", id="logdir",
                             placeholder="writes <run>_<time>.log and .jsonl")
+            with Horizontal(classes="row"):
+                # Same TABLE=PATH syntax as the CLI's --table-map, for a
+                # table kept outside the SCDM folder. Semicolon-separated
+                # rather than comma, because commas turn up in real
+                # folder names and semicolons essentially never do.
+                yield Label("Tables")
+                yield Input(value="", id="tablemap",
+                            placeholder="optional: dispensing=/other/rx.parquet; "
+                                        "diagnosis=/other/dx")
+            with Horizontal(classes="row"):
+                yield Label("Debug")
+                yield Checkbox("also write dplocal diagnostics "
+                               "(exclusion lists, pre-washout list, ...)",
+                               value=False, id="debug")
         with Horizontal(id="actions"):
             yield Button("Inspect", id="btn_inspect", variant="default")
             yield Button("Run", id="btn_run", variant="success")
@@ -260,6 +275,33 @@ class QRPApp(App):
     def _cancel_pressed(self) -> None:
         self.action_cancel()
 
+    def _table_map(self) -> dict[str, str] | None:
+        """Parse the Tables field: `table=path; table=path`.
+
+        Validated with the same check the CLI uses, so a misspelt table
+        name fails the same way in both — with a suggestion, rather than
+        being silently dropped and reported as a missing table.
+        Raises ValueError with an operator-facing message.
+        """
+        from .scdm import check_table_map
+
+        raw = self._field("tablemap")
+        if not raw:
+            return None
+        out: dict[str, str] = {}
+        for item in raw.split(";"):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError(
+                    f"Tables: expected table=path, got {item!r}. "
+                    f"Separate several with ';'.")
+            key, path = item.split("=", 1)
+            out[key.strip().lower()] = path.strip()
+        check_table_map(out)
+        return out
+
     def action_inspect(self) -> None:
         """Check inputs before committing to a run.
 
@@ -277,9 +319,14 @@ class QRPApp(App):
         if indata:
             try:
                 log.write("[bold]— scdm —[/bold]")
-                log.write(format_report(probe(indata)))
+                # Honour the Tables overrides. Inspecting the folder
+                # WITHOUT them would report a table missing that Run
+                # will in fact read from elsewhere — checking something
+                # other than what is about to run.
+                log.write(format_report(
+                    probe(indata, table_map=self._table_map())))
             except Exception as exc:
-                log.write(f"[red]scdm: {type(exc).__name__}: {exc}[/red]")
+                log.write(f"[red]scdm: {exc}[/red]")
         if not study and not indata:
             log.write("[yellow]nothing to inspect[/yellow]")
 
@@ -290,6 +337,11 @@ class QRPApp(App):
         if not study_path or not indata:
             self.log_line("[yellow]study file and SCDM root are both "
                           "required[/yellow]")
+            return
+        try:
+            table_map = self._table_map()
+        except ValueError as exc:
+            self.log_line(f"[red]{exc}[/red]")
             return
 
         # Warnings from load_study (unimplemented tables, unresolved
@@ -357,6 +409,8 @@ class QRPApp(App):
             memory_limit=mem,
             temp_directory=tempdir,
             database=database,
+            table_map=table_map,
+            debug=self.query_one("#debug", Checkbox).value,
             extra_sink=self._runlog.sink() if self._runlog else None,
         ).start()
         self.running = True

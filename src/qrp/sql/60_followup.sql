@@ -15,7 +15,7 @@
 
 -- Claims that disqualify an episode if they fall in the washout window:
 -- the outcome codes themselves, plus any `fupcriteria='IOC'` codes
--- (ms_createmicohorts.sas:1685 -> _FUPWash, consumed by
+-- (ms_cidanum.sas:1664 -> _FUPWash, consumed by
 -- _WashEventsInFupWash). IOC codes never define an index or an outcome;
 -- they only disqualify.
 CREATE OR REPLACE VIEW washout_claims AS
@@ -75,7 +75,7 @@ JOIN event_claims e
  AND e.adate BETWEEN m.atriskindexdt AND m.episodeenddt;
 
 -- IEV / EEV: inclusion and exclusion criteria anchored on the EVENT
--- date rather than the index date (ms_createmicohorts.sas:1388 routes
+-- date rather than the index date (ms_cidanum.sas:1683 routes
 -- these to _InclExclHOI; ms_createpov56.sas:186-196 evaluates them
 -- against unique (patid, eventdt) pairs and keeps only passing events).
 --

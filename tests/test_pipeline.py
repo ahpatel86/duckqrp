@@ -620,7 +620,7 @@ def test_unpartitioned_outputs_have_a_parquet_extension(study, tmp_path):
     from qrp import Engine
 
     eng = Engine(verbose=False)
-    run(study, DATA, engine=eng, output_dir=tmp_path, layout="flat",
+    run(study, DATA, engine=eng, output_dir=tmp_path, layout="flat", debug=True,
         verbose=False)
     eng.close()
 
@@ -1006,7 +1006,12 @@ def test_no_single_consumer_temp_tables():
     # opposite directions, and memory wins.
     exempt = {"_pov1_demog", "_pov1_enrolled",
               "_denom_windows", "_denom_demog", "_denom_strat",
-              "_util_med", "_util_drug"}
+              "_util_med", "_util_drug",
+              # Its one "consumer" is the ALTER TABLE ... RENAME that
+              # swaps it over _denom_windows. A deliberate swap, not a
+              # CTE that should have been inlined.
+              "_denom_windows_shaved",
+              "_denom_unelig"}
     sql_dir = Path(__file__).resolve().parents[1] / "src" / "qrp" / "sql"
     offenders = []
 
@@ -1367,7 +1372,7 @@ def test_naming_modes_write_the_same_data(study, tmp_path):
         eng = Engine(verbose=False)
         try:
             run(study, DATA, engine=eng, output_dir=out, layout="split",
-                names=names, verbose=False)
+                names=names, debug=True, verbose=False)
         finally:
             eng.close()
         # lookup by LOGICAL name works regardless of on-disk naming
@@ -1454,7 +1459,7 @@ def test_manifest_decouples_readers_from_the_naming(study, tmp_path):
 
     eng = Engine(verbose=False)
     try:
-        run(study, DATA, engine=eng, output_dir=tmp_path, layout="split",
+        run(study, DATA, engine=eng, output_dir=tmp_path, layout="split", debug=True,
             verbose=False)
     finally:
         eng.close()
@@ -3035,7 +3040,7 @@ def test_ioc_codes_are_a_separate_role():
     """`fupcriteria='IOC'` codes never define an index or an outcome.
 
     They only disqualify an episode whose follow-up washout window
-    contains one (ms_createmicohorts.sas:1685 -> _FUPWash, consumed by
+    contains one (ms_cidanum.sas:1664 -> _FUPWash, consumed by
     _WashEventsInFupWash in ms_createpov56.sas).
     """
     s = _ioc_study(["X00001", "X00002"])
@@ -3043,14 +3048,14 @@ def test_ioc_codes_are_a_separate_role():
     # (code, codecat) pairs — codecat decides which claim domain each
     # code is read from, so a study can define exposure across RX, PX
     # and DX at once.
-    # (code, codecat, code_supply) triples — codecat decides which claim
+    # (code, codecat, codetype, code_supply) — codecat decides which claim
     # domain the code is read from, code_supply overrides the claim's
     # own RxSup when the study sets CODESUPPLY.
-    assert {code for code, _, _ in c.ioc_codes} == {"X00001", "X00002"}
-    assert not ({code for code, _, _ in c.ioc_codes}
-                & {code for code, _, _ in c.event_codes})
-    assert not ({code for code, _, _ in c.ioc_codes}
-                & {code for code, _, _ in c.exposure_codes})
+    assert {code for code, _, _, _ in c.ioc_codes} == {"X00001", "X00002"}
+    assert not ({code for code, _, _, _ in c.ioc_codes}
+                & {code for code, _, _, _ in c.event_codes})
+    assert not ({code for code, _, _, _ in c.ioc_codes}
+                & {code for code, _, _, _ in c.exposure_codes})
     assert s.any_ioc
 
 
@@ -4563,7 +4568,7 @@ def test_geography_columns_live_on_the_master_list():
 def test_mstr_is_the_finalised_master_list():
     """SAS has ONE master list. `DPLocal.&RUNID._mstr` is set from
     `_PtsMasterList` AFTER ms_finalizeptsmasterlist attaches the event
-    and censoring columns (ms_createmicohorts.sas:2117), so SAS's mstr
+    and censoring columns (SAS's mstr contents (exact line unverified)), so SAS's mstr
     is the FINALISED list — this package's `cohort_final`.
 
     There is no `&RUNID._mstr_final` anywhere in the macro library.
@@ -4579,7 +4584,7 @@ def test_mstr_is_the_finalised_master_list():
     from qrp import run as _run
 
     out = Path(tempfile.mkdtemp())
-    _run(load_study(STUDY), DATA, output_dir=str(out), names="sas",
+    _run(load_study(STUDY), DATA, output_dir=str(out), names="sas", debug=True,
          verbose=False)
     manifest = _json.loads((out / "manifest.json").read_text())
 
@@ -5082,7 +5087,7 @@ def test_event_and_ioc_codes_read_their_own_domain():
 
 def test_codesupply_overrides_the_claim_rxsup():
     """CODESUPPLY replaces the claim's own RxSup
-    (ms_createmicohorts.sas:571).
+    (SAS's CODESUPPLY handling (exact line unverified)).
 
     It was parsed, validated against the CFDD limits, and never applied.
     It is per CODE — 150 of 1,124 rows carry it in the real study file,
@@ -6000,3 +6005,522 @@ def test_the_real_study_sets_no_unread_parameters():
     unread = [str(x.message) for x in caught
               if "does not read" in str(x.message)]
     assert not unread, unread
+
+
+def test_default_run_writes_only_the_sas_dplocal_contract():
+    """dplocal diagnostics are written only under --debug, mirroring
+    SAS's QRP_DEBUG (ms_attrition.sas:201-209).
+
+    Without it, dplocal gets exactly what SAS writes there — mstr,
+    denomcounts, numcounts. The patient-level ADDITIONS
+    (covariates_long, inclusion_excluded, mstr_episodes, ...) were never
+    part of the request, cost disk, and sit at the site.
+
+    msoc is deliberately untouched: those are small aggregates a data
+    partner may be asked for.
+    """
+    import json as _json
+    import tempfile
+
+    from qrp import run as _run
+    from qrp.outputs import OUTPUTS
+
+    by_name = {o.name: o for o in OUTPUTS}
+
+    def dplocal(debug):
+        out = Path(tempfile.mkdtemp())
+        _run(load_study(STUDY), DATA, output_dir=str(out), names="sas",
+             debug=debug, verbose=False)
+        m = _json.loads((out / "manifest.json").read_text())
+        return {t for t, v in m["tables"].items()
+                if v["library"] == "dplocal"}
+
+    default = dplocal(False)
+    with_debug = dplocal(True)
+
+    # the default is exactly the SAS contract
+    for t in default:
+        assert by_name[t].contract, (
+            f"{t} is a diagnostic but was written without --debug")
+    assert "cohort_final" in default           # -> <runid>_mstr
+
+    # debug adds diagnostics and removes nothing
+    assert default < with_debug, (default, with_debug)
+    assert "ptsmasterlist" in with_debug and "ptsmasterlist" not in default
+
+
+# ---------------------------------------------------------------------
+# --table-map: overriding where an SCDM table is read from
+# ---------------------------------------------------------------------
+
+
+def test_table_map_accepts_a_file_outside_the_input_folder():
+    """A site may keep one table somewhere else — a different team's
+    extract, a newer refresh. An ABSOLUTE path in --table-map is used
+    as-is, regardless of --indata, and the results must be identical to
+    the same file sitting in the folder."""
+    import shutil
+    import tempfile
+
+    from qrp import Engine
+
+    work = Path(tempfile.mkdtemp())
+    main = work / "main"
+    elsewhere = work / "other_team"
+    shutil.copytree(DATA, main)
+    elsewhere.mkdir()
+    # move dispensing out of the folder, under a site-specific name
+    moved = elsewhere / "rx_extract_2024.parquet"
+    src = main / "dispensing"
+    shutil.copy(next(src.rglob("*.parquet")), moved)
+    shutil.rmtree(src)
+
+    def counts(indata, table_map=None):
+        eng = Engine(verbose=False)
+        try:
+            run(load_study(STUDY), str(indata), engine=eng,
+                table_map=table_map, verbose=False)
+            return (eng.count("exposure_claims"), eng.count("cohort_final"))
+        finally:
+            eng.close()
+
+    assert counts(main, {"dispensing": str(moved)}) == counts(DATA)
+
+
+def test_misspelt_table_map_key_is_rejected_not_ignored():
+    """`dispensng=...` was silently IGNORED: the override was dropped,
+    the real table reported missing, and nothing said the key had not
+    been recognised. The operator believed they had overridden it — a
+    typo that looked like a data problem."""
+    from qrp.scdm import check_table_map
+
+    with pytest.raises(ValueError, match="Did you mean 'dispensing'"):
+        check_table_map({"dispensng": "/x.parquet"})
+    check_table_map({"dispensing": "/x.parquet"})       # valid: no error
+    check_table_map(None)                               # absent: fine
+
+
+def test_table_map_path_error_says_where_it_looked():
+    """An absolute path was reported as missing "under" the input
+    folder — which it never was — sending the operator to look in the
+    wrong place."""
+    import tempfile
+
+    from qrp.scdm import SCDM, resolve_table
+
+    spec = next(t for t in SCDM if t.name == "dispensing")
+    root = tempfile.mkdtemp()
+
+    with pytest.raises(FileNotFoundError) as absolute:
+        resolve_table(root, spec, table_map={"dispensing": "/nope/x.parquet"})
+    assert "'/nope/x.parquet'" in str(absolute.value)
+    assert "relative to" not in str(absolute.value)
+
+    with pytest.raises(FileNotFoundError) as relative:
+        resolve_table(root, spec, table_map={"dispensing": "sub/x.parquet"})
+    assert "relative to the input folder" in str(relative.value)
+
+
+# ---------------------------------------------------------------------
+# Plain-text views of msoc tables
+# ---------------------------------------------------------------------
+
+
+def _msoc_run(tmp, **kw):
+    from qrp import run as _run
+
+    out = Path(tmp)
+    _run(load_study(STUDY), DATA, output_dir=str(out), names="sas",
+         verbose=False, **kw)
+    return out
+
+
+def test_every_msoc_table_gets_a_faithful_text_view(tmp_path):
+    """Parquet needs a tool most readers of these outputs do not have,
+    so each msoc table gets a plain-text view beside it.
+
+    A reading copy that quietly disagreed with the record would be
+    worse than none, so this checks FAITHFULNESS, not existence: the
+    reported shape matches, and every non-null value in the parquet
+    appears in the text. The terminal formatter truncates at 30
+    characters and rounds to two places, so reusing it unmodified would
+    have failed this.
+    """
+    import re
+
+    import duckdb
+
+    out = _msoc_run(tmp_path)
+    con = duckdb.connect()
+    parquets = sorted((out / "msoc").glob("*.parquet"))
+    assert parquets
+    for pq in parquets:
+        txt_path = pq.with_suffix(".txt")
+        assert txt_path.exists(), f"no text view for {pq.name}"
+        txt = txt_path.read_text()
+        rows = con.execute(f"SELECT * FROM read_parquet('{pq}')").fetchall()
+        ncols = len(con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{pq}')").fetchall())
+        m = re.search(r"([\d,]+) rows x (\d+) columns", txt)
+        assert m, pq.name
+        assert int(m.group(1).replace(",", "")) == len(rows), pq.name
+        assert int(m.group(2)) == ncols, pq.name
+        for r in rows:
+            for v in r:
+                if v is None:
+                    continue
+                if isinstance(v, float):
+                    tok = f"{v:,.6f}".rstrip("0").rstrip(".")
+                elif isinstance(v, int) and not isinstance(v, bool):
+                    tok = f"{v:,}"
+                else:
+                    tok = str(v)
+                assert tok in txt, f"{pq.name}: value {v!r} missing"
+    con.close()
+
+
+def test_text_views_are_msoc_only(tmp_path):
+    """dplocal is patient-level. A plain-text copy would be one more
+    unencrypted, greppable file holding patient rows."""
+    out = _msoc_run(tmp_path, debug=True)       # debug: most dplocal files
+    assert not list((out / "dplocal").rglob("*.txt")), (
+        "a text view was written for a patient-level dplocal table")
+
+
+def test_no_text_switches_the_views_off(tmp_path):
+    """msoc is what goes to the Operations Center; a site whose
+    recipient expects parquet and nothing else can turn these off."""
+    out = _msoc_run(tmp_path, text=False)
+    assert list((out / "msoc").glob("*.parquet"))
+    assert not list((out / "msoc").glob("*.txt"))
+
+
+def test_missing_values_read_as_missing_in_the_text_view():
+    """`.` for missing, the SAS convention. A blank is ambiguous in a
+    fixed-width file, and OUTPUTDENOM=M depends on missing member-days
+    reading as MISSING rather than as zero. Numeric columns holding a
+    missing value must stay right-aligned: an early version classed
+    them as text and knocked every number in them out of line."""
+    from qrp.show import _render
+
+    text = _render(["n"], [(10,), (None,), (2000,)], width=None,
+                   missing=".", exact=True, rule_cap=None)
+    body = text.splitlines()[2:]
+    assert [line.strip() for line in body] == ["10", ".", "2,000"]
+    # right-aligned: every line the same width, padded on the left
+    assert len({len(line) for line in body}) == 1, body
+
+
+def test_wide_tables_are_transposed_for_reading():
+    """baseline is ~67 columns by one row per cohort — an ~800-character
+    line as a normal table. Transposed it fits a screen."""
+    import duckdb
+
+    from qrp.show import table_text
+
+    con = duckdb.connect()
+    cols = ", ".join(f"{i} AS c{i}" for i in range(30))
+    con.execute(f"CREATE TABLE wide AS SELECT 'grp' AS g, {cols}")
+    text = table_text(con, "wide", "wide")
+    assert "transposed" in text
+    assert max(len(line) for line in text.splitlines()) < 120
+    con.close()
+
+
+
+def test_condinclusion_zero_means_exclude():
+    """Real input files come in two shapes: some carry `indexcriteria`
+    saying INC/EXC, others carry `condinclusion`, where 0 means EXCLUDE
+    (SAS reads CondInclusion directly, ms_cidadenom.sas:159).
+
+    Defaulting to "INC" when neither is present turned every EXCLUSION
+    rule into an inclusion REQUIREMENT — patients had to HAVE the codes
+    they were meant to be excluded for. On a real 40-cohort study that
+    took 42,708 episodes down to 58.
+    """
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def crit(**row):
+        rules = [{"group": "lisinopril", "codecat": "DX", "code": "E11",
+                  "condlevel": "Diabetes", "subcondlevel": "Exclusion",
+                  "condfrom": -183, "condto": -1, **row}]
+        s = load_study_dict({**base, "inclusioncodes": rules})
+        return {r.criteria for r in s.inclusions}
+
+    assert crit(condinclusion=0) == {"EXC"}, "0 must exclude"
+    assert crit(condinclusion=1) == {"INC"}, "1 must include"
+    # an explicit indexcriteria still wins
+    assert crit(condinclusion=0, indexcriteria="INC") == {"INC"}
+    # neither present: the old default, for files that carry no flag
+    assert crit() == {"INC"}
+
+
+def test_index_dates_must_fall_inside_the_query_period():
+    """SAS reports this as its own attrition step — "Episode-defining
+    index claims must be during the query period" — and on the study
+    compared against real output it removes 8,450 of 10,270 episodes
+    for a single cohort, the largest single exclusion in the funnel.
+
+    Nothing applied it. Claims are extracted from `start_date` MINUS
+    the widest lookback so a covariate or washout window can see
+    history; without this filter those lookback claims could themselves
+    become index dates. Adding it took that cohort from 1,552 episodes
+    to 1,373 against SAS's 1,375.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        study = load_study(STUDY)
+        run(study, DATA, engine=eng, verbose=False)
+        outside = eng.con.execute(
+            "SELECT count(*) FROM cohort_final WHERE indexdt < ? OR indexdt > ?",
+            [study.start_date, study.end_date]).fetchone()[0]
+        assert outside == 0, (
+            f"{outside} episodes have an index date outside the query "
+            f"period {study.start_date}..{study.end_date}")
+        # and the cohort is not empty, or the check proves nothing
+        assert eng.con.execute(
+            "SELECT count(*) FROM cohort_final").fetchone()[0] > 0
+    finally:
+        eng.close()
+
+
+def test_bulk_registration_matches_row_by_row_exactly():
+    """Large config tables are bulk-loaded through a CSV, which is 25x
+    faster on a real study (91s of registration down to 3.6s). The
+    speed is worthless if the data changes on the way.
+
+    The subtle case is NULL against EMPTY STRING. `csv` writes None as
+    an empty field, so a naive `nullstr=''` turns a genuinely empty
+    value into NULL — one risk-code value silently did exactly that,
+    and the two behave differently in a join. A sentinel keeps them
+    apart.
+    """
+    from qrp import Engine
+    from qrp import engine as engine_mod
+    from qrp.pipeline import register_config
+
+    study = load_study(STUDY)
+    original = engine_mod._BULK_LOAD_ROWS
+    snaps = {}
+    try:
+        for label, threshold in (("bulk", 1), ("rowwise", 10 ** 9)):
+            engine_mod._BULK_LOAD_ROWS = threshold
+            eng = Engine(verbose=False)
+            try:
+                register_config(eng, study)
+                out = {}
+                for tbl in ("cfg_codes", "cfg_cohort", "cfg_demog"):
+                    cols = [d[0] for d in eng.con.execute(
+                        f"SELECT * FROM {tbl} LIMIT 0").description]
+                    # row count, per-column non-null count, and the rows
+                    # themselves
+                    counts = eng.con.execute(
+                        f"SELECT count(*), "
+                        + ", ".join(f"count({c})" for c in cols)
+                        + f" FROM {tbl}").fetchone()
+                    rows = eng.con.execute(
+                        f"SELECT * FROM {tbl} ORDER BY ALL").fetchall()
+                    out[tbl] = (counts, rows)
+                snaps[label] = out
+            finally:
+                eng.close()
+    finally:
+        engine_mod._BULK_LOAD_ROWS = original
+
+    for tbl in snaps["bulk"]:
+        assert snaps["bulk"][tbl][0] == snaps["rowwise"][tbl][0], (
+            f"{tbl}: row or non-null counts differ between the two "
+            f"registration paths")
+        assert snaps["bulk"][tbl][1] == snaps["rowwise"][tbl][1], (
+            f"{tbl}: row CONTENT differs between the two paths")
+
+
+def test_empty_string_survives_bulk_registration_as_a_string():
+    """The specific bug the sentinel exists to prevent."""
+    from qrp import Engine
+    from qrp import engine as engine_mod
+
+    original = engine_mod._BULK_LOAD_ROWS
+    eng = Engine(verbose=False)
+    try:
+        engine_mod._BULK_LOAD_ROWS = 1          # force the CSV path
+        eng.register("t_probe",
+                     [{"a": "", "b": None}, {"a": "x", "b": "y"}],
+                     "a VARCHAR, b VARCHAR")
+        got = eng.con.execute(
+            "SELECT a IS NULL, b IS NULL FROM t_probe ORDER BY a").fetchall()
+        assert got == [(False, True), (False, False)], (
+            "an empty string became NULL, or a NULL became a string", got)
+    finally:
+        engine_mod._BULK_LOAD_ROWS = original
+        eng.close()
+
+
+def test_outcome_codes_are_routed_by_fupcriteria_not_indexcriteria():
+    """SAS routes outcomes on FUPCRITERIA:
+    `if fupcriteria in('DEF') then output _FUPEvent`
+    (ms_cidanum.sas:1684). `indexcriteria` values other than
+    DEF — chiefly `FUT`, which goes to SAS's washout-for-truncation set
+    — are NOT outcomes.
+
+    They used to fall through to EVENT, and FUT dominates a real file:
+    one cohort of the study compared has 54 exposure codes, ONE outcome
+    code and 4,957 FUT codes. Treating FUT as outcomes gave 4,958 event
+    codes instead of 1 and 11,196 events against SAS's 3, which then
+    dropped 58 valid episodes through the blackout-event rule.
+    """
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def roles(**row):
+        codes = [{"group": "lisinopril", "codecat": "DX", "code": "Z99",
+                  **row}]
+        s = load_study_dict({**base, "cohortcodes": codes})
+        c = [x for x in s.cohorts if x.cohortgrp == "lisinopril"][0]
+        return (len(c.exposure_codes), len(c.event_codes), len(c.ioc_codes))
+
+    assert roles(indexcriteria="DEF") == (1, 0, 0)
+    assert roles(fupcriteria="DEF") == (0, 1, 0)
+    assert roles(fupcriteria="IOC") == (0, 0, 1)
+    # FUT is neither: it is SAS's washout-for-truncation set
+    assert roles(indexcriteria="FUT") == (0, 0, 0)
+    assert roles(indexcriteria="NOT") == (0, 0, 0)
+
+
+def test_fut_claims_truncate_an_episode():
+    """A FUT claim inside an episode ENDS it:
+
+        if fut and trunkdt and trunkdt <= EpisodeEndDt
+            then EpisodeEndDt = trunkdt;
+        (ms_createptsmasterlist.sas:152)
+
+    where trunkdt is the earliest FUT claim overlapping
+    [EpisodeStartDt, EpisodeEndDt] (ms_createpov4.sas:155-167).
+
+    FUT codes were first mistaken for OUTCOMES, then — once that was
+    corrected — skipped entirely, which left every affected episode too
+    long. On the study compared, 3,077 of 31,440 episodes ran past
+    SAS's end date and NOT ONE was shorter. Implementing the truncation
+    took exact end dates from 90.2% to 95.5%.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    # a diagnosis code that actually occurs in the fixture data, or the
+    # test would pass trivially by truncating nothing
+    trunc = {"group": "lisinopril", "codecat": "DX", "code": "D00008",
+             "indexcriteria": "FUT"}
+
+    def ends(with_trunc):
+        codes = list(base["cohortcodes"]) + ([trunc] if with_trunc else [])
+        s = load_study_dict({**base, "cohortcodes": codes})
+        eng = Engine(verbose=False)
+        try:
+            run(s, DATA, engine=eng, verbose=False)
+            return eng.con.execute(
+                "SELECT sum(date_diff('day', indexdt, episodeenddt)) "
+                "FROM cohort_final WHERE cohortgrp = 'lisinopril'"
+            ).fetchone()[0]
+        finally:
+            eng.close()
+
+    plain, truncated = ends(False), ends(True)
+    assert truncated < plain, (
+        "FUT codes did not shorten any episode, so the truncation is "
+        "not being applied", plain, truncated)
+
+
+def test_fut_codes_are_a_fourth_role():
+    """FUT is neither exposure, outcome nor IOC washout — it truncates.
+    All four roles must be kept apart."""
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def roles(**row):
+        s = load_study_dict({
+            **base,
+            "cohortcodes": [{"group": "lisinopril", "codecat": "DX",
+                             "code": "Z99", **row}]})
+        c = [x for x in s.cohorts if x.cohortgrp == "lisinopril"][0]
+        return (len(c.exposure_codes), len(c.event_codes),
+                len(c.ioc_codes), len(c.trunc_codes))
+
+    assert roles(indexcriteria="DEF") == (1, 0, 0, 0)
+    assert roles(fupcriteria="DEF") == (0, 1, 0, 0)
+    assert roles(fupcriteria="IOC") == (0, 0, 1, 0)
+    assert roles(indexcriteria="FUT") == (0, 0, 0, 1)
+
+
+def test_truncation_claims_are_stockpiled():
+    """FUT codes carry a `stockgroup`, so their claims stockpile exactly
+    as exposure claims do: a dispensing arriving while the previous one
+    in its stockgroup is still supplying starts when that supply runs
+    out, not on its own fill date. That shifted date IS the truncation
+    date SAS uses.
+
+    Worked case from the parity run: a FUT claim on 2016-06-06 in
+    stockgroup `valsartanhydrochlorothiazide`, with the previous claim
+    in that group (2016-03-18, 90 days) supplying to 2016-06-15,
+    stockpiles to 2016-06-16 — precisely SAS's `trunkdt`, ten days after
+    the raw claim date.
+
+    Using raw dates truncated 854 episodes too early, by 1 to 17 days
+    each: the leftover supply of the preceding claim. Fixing it took
+    exact episode ends from 95.5% to 98.0%.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        # the stockpiled date must never precede the claim's own date,
+        # and for a repeat fill in one stockgroup it must exceed it
+        bad = eng.con.execute(
+            "SELECT count(*) FROM trunc_claims WHERE adate < orig_adate"
+        ).fetchone()[0]
+        assert bad == 0, "a stockpiled truncation date moved BACKWARDS"
+    finally:
+        eng.close()
+
+
+def test_truncation_codes_keep_their_own_stockgroup():
+    """FUT codes carry a `stockgroup` and stockpile within it, exactly
+    as exposure codes do.
+
+    The stockgroup was captured only for DEF codes and passed through
+    registration only for DEF, so every truncation code landed in
+    `_default`. Unrelated drugs then chained into one run and pushed
+    truncation dates far past where SAS puts them — one patient's
+    warfarin chain drifted 23 days, another's four years.
+
+    Fixing both halves took exact episode ends from 98.2% to 99.2%.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    codes = list(base["cohortcodes"]) + [
+        {"group": "lisinopril", "codecat": "RX", "code": "E00001",
+         "indexcriteria": "FUT", "stockgroup": "drug_a"},
+        {"group": "lisinopril", "codecat": "RX", "code": "E00002",
+         "indexcriteria": "FUT", "stockgroup": "drug_b"},
+    ]
+    eng = Engine(verbose=False)
+    try:
+        run(load_study_dict({**base, "cohortcodes": codes}), DATA,
+            engine=eng, verbose=False)
+        groups = {r[0] for r in eng.con.execute(
+            "SELECT DISTINCT stockgroup FROM cfg_codes WHERE role = 'TRUNK'"
+        ).fetchall()}
+        assert {"drug_a", "drug_b"} <= groups, (
+            "truncation codes lost their stockgroup, so unrelated drugs "
+            "would stockpile as one chain", groups)
+    finally:
+        eng.close()

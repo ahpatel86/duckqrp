@@ -75,6 +75,7 @@ SELECT
     CAST(patid AS BIGINT)          AS patid,
     CAST(rxdate AS DATE)           AS adate,
     CAST({dispensing_code} AS VARCHAR) AS code,
+    CAST({dispensing_codetype} AS VARCHAR) AS codetype,
     CAST(rxsup AS INTEGER)         AS rxsup,
     CAST(rxamt AS DOUBLE)          AS rxamt
 FROM {read_dispensing}

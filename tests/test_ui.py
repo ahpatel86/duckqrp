@@ -694,3 +694,175 @@ def test_browse_hides_non_matching_files():
     paths = [SMALL / "a.json", SMALL / "b.parquet", SMALL / ".hidden.json"]
     kept = {p.name for p in _Tree.filter_paths(tree, paths)}
     assert kept == {"a.json"}
+
+
+# ---------------------------------------------------------------------
+# Tables field (--table-map) and Debug checkbox in the UI
+# ---------------------------------------------------------------------
+
+
+def _split_scdm(tmp: Path) -> tuple[Path, Path]:
+    """SMALL with dispensing moved out, under a site-specific name."""
+    import shutil
+
+    main = tmp / "main"
+    shutil.copytree(SMALL, main)
+    elsewhere = tmp / "other_team"
+    elsewhere.mkdir()
+    moved = elsewhere / "rx_extract_2024.parquet"
+    src = main / "dispensing"
+    shutil.copy(next(src.rglob("*.parquet")), moved)
+    shutil.rmtree(src)
+    return main, moved
+
+
+def _log_text(app) -> str:
+    from textual.widgets import RichLog
+
+    return "\n".join(str(line.text) if hasattr(line, "text") else str(line)
+                     for line in app.query_one("#log", RichLog).lines)
+
+
+def test_tui_inspect_honours_the_tables_field(tmp_path):
+    """The UI had no way to point at a table outside the SCDM folder —
+    `RunHandle` did not accept a table map at all. And Inspect must
+    check what Run will actually read: inspecting the folder without
+    the overrides would report a table missing that the run will in
+    fact find elsewhere."""
+    from textual.widgets import Input
+
+    from qrp.tui import QRPApp
+
+    main, moved = _split_scdm(tmp_path)
+
+    async def scenario():
+        app = QRPApp(str(STUDY), str(main))
+        async with app.run_test(size=(120, 45)) as pilot:
+            await pilot.pause()
+            # without the override: dispensing is missing
+            app.action_inspect()
+            await pilot.pause()
+            without = _log_text(app)
+
+            app.query_one("#tablemap", Input).value = f"dispensing={moved}"
+            app.query_one("#log").clear()
+            app.action_inspect()
+            await pilot.pause()
+            with_it = _log_text(app)
+            return without, with_it
+
+    without, with_it = _run_app(scenario)
+    assert "MISSING" in without and "dispensing" in without
+    assert "rx_extract_2024" in with_it, with_it[-600:]
+    assert "compatible" in with_it
+
+
+def test_tui_rejects_a_misspelt_table_name_before_running(tmp_path):
+    """Same check as the CLI, so a typo fails the same way in both —
+    with a suggestion — instead of being silently dropped."""
+    from textual.widgets import Input
+
+    from qrp.tui import QRPApp
+
+    main, moved = _split_scdm(tmp_path)
+
+    async def scenario():
+        app = QRPApp(str(STUDY), str(main))
+        async with app.run_test(size=(120, 45)) as pilot:
+            await pilot.pause()
+            app.query_one("#tablemap", Input).value = f"dispensng={moved}"
+            app.action_run()
+            await pilot.pause()
+            return app.running, _log_text(app)
+
+    running, text = _run_app(scenario)
+    assert not running, "a run started despite an invalid Tables field"
+    assert "Did you mean 'dispensing'" in text, text[-400:]
+
+
+def test_tui_run_reads_the_overridden_table_and_honours_debug(tmp_path):
+    """A full run from the UI, not just Inspect: the Tables override
+    must reach the pipeline, and the Debug checkbox must decide whether
+    dplocal diagnostics are written."""
+    import json
+
+    from textual.widgets import Checkbox, DataTable, Input
+
+    from qrp.tui import QRPApp
+
+    main, moved = _split_scdm(tmp_path)
+
+    def run_ui(out: Path, debug: bool) -> set[str]:
+        async def scenario():
+            app = QRPApp(str(STUDY), str(main))
+            async with app.run_test(size=(120, 45)) as pilot:
+                await pilot.pause()
+                app.query_one("#tablemap", Input).value = f"dispensing={moved}"
+                app.query_one("#output", Input).value = str(out)
+                app.query_one("#debug", Checkbox).value = debug
+                await pilot.press("ctrl+r")
+                for _ in range(300):
+                    await pilot.pause()
+                    await asyncio.sleep(0.2)
+                    if not app.running and app.query_one(
+                            "#stages", DataTable).row_count:
+                        break
+                assert not app.running
+        _run_app(scenario)
+        m = json.loads((out / "manifest.json").read_text())
+        return {t for t, v in m["tables"].items() if v["library"] == "dplocal"}
+
+    plain = run_ui(tmp_path / "plain", debug=False)
+    diag = run_ui(tmp_path / "diag", debug=True)
+
+    # the override worked: there is a cohort at all, which there could
+    # not be without dispensing
+    assert "cohort_final" in plain
+    # the checkbox reached the pipeline
+    assert plain < diag, (plain, diag)
+    assert "ptsmasterlist" in diag and "ptsmasterlist" not in plain
+
+
+# CLI `run` options that deliberately have no RunHandle counterpart, and
+# why. Adding a CLI flag now forces one of two choices: give RunHandle
+# the field, or add it here with a reason. What it may not do is land in
+# the CLI alone and go unnoticed — which is what happened to both
+# --table-map and --debug.
+CLI_ONLY = {
+    "quiet": "console verbosity; the UI renders its own progress",
+    "log_dir": "the UI has its own Log dir field and owns the RunLog",
+    "no_jsonl": "a log-format choice made where the RunLog is built",
+    "parity_dump": "developer parity harness, not an operator feature",
+    "pt": "parity harness: request id in the dump path",
+    "iteration": "parity harness: iteration in the dump path",
+}
+# CLI dest -> RunHandle field, where the names differ.
+RENAMED = {"out": "output_dir", "temp_dir": "temp_directory",
+           "db": "database"}
+
+
+def test_every_cli_run_option_reaches_the_ui_or_is_exempted():
+    """Features kept landing in the CLI and not the UI: --table-map and
+    --debug both did, and a data partner using the UI simply could not
+    use them. This compares the parser against RunHandle so the next one
+    is caught at test time rather than by a user."""
+    from qrp.cli import build_parser
+    from qrp.runner import RunHandle
+
+    sub = next(a for a in build_parser()._actions if a.dest == "cmd")
+    run_opts = {a.dest for a in sub.choices["run"]._actions
+                if a.dest != "help"}
+    fields = set(RunHandle.__dataclass_fields__)
+
+    missing = sorted(
+        opt for opt in run_opts
+        if opt not in CLI_ONLY and RENAMED.get(opt, opt) not in fields)
+    assert not missing, (
+        f"CLI run option(s) {missing} have no RunHandle field, so the UI "
+        f"cannot use them. Add the field, or exempt them in CLI_ONLY "
+        f"with a reason.")
+
+    # and the exemption list must not rot: an exempted option that no
+    # longer exists is a stale excuse
+    stale = sorted(set(CLI_ONLY) - run_opts)
+    assert not stale, f"CLI_ONLY names options that no longer exist: {stale}"

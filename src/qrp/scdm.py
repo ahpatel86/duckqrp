@@ -144,6 +144,31 @@ _PATTERNS = (
 )
 
 
+def check_table_map(table_map: Mapping[str, str] | None) -> None:
+    """Reject a --table-map key that names no SCDM table.
+
+    A misspelt key — `dispensng=...` — was silently IGNORED: the
+    override was dropped, the real table was reported missing, and
+    nothing said the key had not been recognised. The operator believed
+    they had overridden it. That is worse than an error, because it
+    looks like a data problem rather than a typo.
+    """
+    if not table_map:
+        return
+    import difflib
+
+    known = {t.name for t in SCDM}
+    for key in table_map:
+        if key in known:
+            continue
+        near = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.6)
+        hint = f" Did you mean '{near[0]}'?" if near else ""
+        raise ValueError(
+            f"--table-map names '{key}', which is not an SCDM table this "
+            f"package reads.{hint}\n  Valid names: {', '.join(sorted(known))}"
+        )
+
+
 def resolve_table(root: str | Path, spec: "TableSpec | str",
                   table_map: dict[str, str] | None = None,
                   by_columns: dict[str, list[tuple[str, str]]] | None = None,
@@ -173,9 +198,14 @@ def resolve_table(root: str | Path, spec: "TableSpec | str",
             return str(path / "**" / "*.parquet")
         if path.exists() or "*" in given:
             return str(path)
+        # Say WHERE it looked. An absolute path was never "under" the
+        # input folder, and saying so sent people to the wrong place.
+        where = (f"'{path}'" if Path(given).is_absolute()
+                 else f"'{given}' relative to the input folder, i.e. '{path}'")
         raise FileNotFoundError(
-            f"table_map points '{name_key}' at '{given}', which does not "
-            f"exist under {root}"
+            f"--table-map {name_key}=... points at {where}, which does not "
+            f"exist.\n  Check the path. An absolute path is used as-is; a "
+            f"relative one is resolved against --indata ({root})."
         )
     if isinstance(spec, str):
         names = [spec]

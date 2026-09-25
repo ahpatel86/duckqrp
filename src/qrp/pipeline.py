@@ -20,6 +20,7 @@ import re as _re
 from datetime import date, timedelta
 import time
 from dataclasses import dataclass
+import hashlib
 import shutil as _shutil
 import warnings
 from pathlib import Path
@@ -43,7 +44,7 @@ from .outputs import (  # noqa: F401
     _write_split_layout,
 )
 from .events import EmptyResult, LogMessage, Level, RunFinished, RunStarted
-from .scdm import SCDM, columns_of, identify_by_columns, reader, resolve_table
+from .scdm import check_table_map, SCDM, columns_of, identify_by_columns, reader, resolve_table
 
 # Stages that produce a table the caller may want on disk.
 
@@ -501,9 +502,22 @@ def _denom_cfg_id(c) -> str:
     strata = ",".join(
         f"{lv.lo}-{lv.hi}-{lv.unit}"
         for lv in (c.age_strata.strata if c.age_strata else ()))
+    # wash_per and the exposure codes belong here because the
+    # denominator SHAVES OUT exposed-plus-washout time: two cohorts
+    # with different washouts, or different defining codes, have
+    # different eligible members.
+    #
+    # They were missing, and the key-completeness test did not catch it
+    # because that test checked the key against what THIS package's SQL
+    # read — and the SQL was itself missing the washout. Validating an
+    # optimisation against the implementation it optimises is circular;
+    # only the SAS output showed it, as an identical denominator for all
+    # 40 cohorts.
+    codes = ",".join(sorted(code for code, _, _, _ in c.exposure_codes))
     return "|".join(str(x) for x in (
         _enr_cfg_id(c), c.enr_days, c.min_days_supp, c.min_epis_dur,
         c.req_days_aft_epi, c.req_days_aft_ind, c.blackout_per,
+        c.wash_per, hashlib.sha1(codes.encode()).hexdigest()[:12],
         strata, demog))
 
 
@@ -891,17 +905,28 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
              # by HCPCS procedure codes.
              "codecat": codecat,
              # CODESUPPLY: overrides the claim's RxSup when set.
+             "codetype": codetype,
              "code_supply": code_supply,
-             "stockgroup": dict(c.exposure_stockgroups).get(code, "_default")
-                           if role == "DEF" else "_default"}
+             # TRUNK codes stockpile within their own stockgroup too,
+             # so they need the real value, not "_default" — which
+             # chained unrelated drugs into one run.
+             # `sg` is built ONCE per cohort below. Calling
+             # dict(c.exposure_stockgroups) here instead rebuilt it for
+             # every one of 200,480 codes and took registration from
+             # 3.6s to 46s.
+             "stockgroup": (sg.get(code, "_default")
+                            if role in ("DEF", "TRUNK") else "_default")}
             for c in cohorts
-            for role, codes in (("DEF", c.exposure_codes),
+            for sg in (dict(c.exposure_stockgroups),)
+            for role, codes in (("TRUNK", c.trunc_codes),
+                                ("DEF", c.exposure_codes),
                                 ("EVENT", c.event_codes),
                                 ("IOC", c.ioc_codes))
-            for code, codecat, code_supply in codes
+            for code, codecat, codetype, code_supply in codes
         ],
         """cohortgrp VARCHAR, role VARCHAR, code VARCHAR,
-           codecat VARCHAR, code_supply INTEGER, stockgroup VARCHAR""",
+           codecat VARCHAR, codetype VARCHAR,
+           code_supply INTEGER, stockgroup VARCHAR""",
     )
 
 
@@ -919,6 +944,8 @@ def run(
     csv: bool = False,
     layout: str = "split",
     names: str = "sas",
+    debug: bool = False,
+    text: bool = True,
     table_map: dict[str, str] | None = None,
     threads: int | None = None,
     memory_limit: str | None = None,
@@ -968,6 +995,7 @@ def run(
             _fingerprints = identify_by_columns(indata)
         return _fingerprints
 
+    check_table_map(table_map)
     for spec in SCDM:
         if not spec.used:
             continue
@@ -1016,10 +1044,19 @@ def run(
         )}
     code_col = next((c for c in ("rx", "ndc", "rxcode", "code")
                      if c in disp_cols), "rx")
+    # The dispensing codetype column, when the extract has one. A study
+    # can restrict its RX codes to a code SYSTEM (NDC vs anything else),
+    # and without this the view has nothing to match against. Resolved
+    # like the code column rather than assumed, since SCDM extracts vary.
+    ct_col = next((c for c in ("rx_codetype", "codetype", "ndc_codetype")
+                   if c in disp_cols), None)
 
     fmt = {
         **reads,
         "dispensing_code": code_col,
+        # NULL when the extract has no codetype: the exposure join
+        # treats that as "match any", which is the old behaviour.
+        "dispensing_codetype": ct_col or "NULL",
         "indata": str(Path(indata)).rstrip("/"),
         "start_date": study.start_date.isoformat(),
         "end_date": study.end_date.isoformat(),
@@ -1238,10 +1275,11 @@ def run(
 
     if output_dir:
         out = Path(output_dir)
-        tables = tables_for(study)
+        tables = tables_for(study, debug=debug)
 
         if layout == "split":
             _write_split_layout(eng, study, out, tables, csv=csv,
+                                text=text,
                                 names=names)
             if verbose:
                 print(f"\n  outputs -> {out}"

@@ -649,3 +649,120 @@ that cries wolf trains people to ignore it.
 None of them appear in the production input file, and a test asserts
 that — so if a future revision starts setting one, the warning is how
 that is discovered rather than a discrepancy in someone's results.
+
+
+---
+
+## `--debug`: diagnostics are not written by default
+
+SAS has `QRP_DEBUG`, and under it saves per-step exclusion lists
+(`ms_attrition.sas:201-209`). This package now draws the same line.
+
+**Without `--debug`, dplocal gets exactly what SAS writes there:**
+
+| written by default | SAS name |
+|---|---|
+| `cohort_final` | `<runid>_mstr` |
+| `denomcounts` | `<runid>_denomcounts` |
+| `numcounts` | `<runid>_numcounts` |
+
+**With `--debug`, add the diagnostics** — `covariates_long`,
+`inclusion_excluded`, `ptsmasterlist` (the pre-washout list), the
+denominator strata, and the per-stage lab, risk-score, utilization and
+geography detail. These are patient-level files that were never part of
+the request.
+
+msoc is untouched either way. Its additions are small aggregates a data
+partner may be asked for; dplocal's are patient-level and sit at the
+site.
+
+### What this saves, honestly
+
+Not much compute. Every one of these tables is materialised regardless,
+because later stages read them, so the only saving is the parquet write.
+Measured on a 64,000-episode cohort: **0.19 s and 3.5 MB**, about 5% of
+the run.
+
+The case for it is not speed. It is that a production run leaves behind
+exactly what it was asked for, and nothing a site has to account for,
+secure or delete that nobody requested. The saving grows with cohort
+size — the patient-level tables scale with episodes — but the principle
+holds at any size.
+
+### Why not make `mstr` debug-only too
+
+Because SAS writes it unconditionally and data partners rely on it: it
+is what a site consults when the Operations Center asks why a count is
+what it is, and it is an input to follow-up requests. Moving it behind a
+flag would save disk and remove the one file that answers the most
+common question about a result.
+
+
+---
+
+## Reading outputs without a parquet tool
+
+Every msoc table gets a plain-text view beside it, written just before
+its parquet:
+
+```
+msoc/r01_attrition.parquet     <- the output of record
+msoc/r01_attrition.txt         <- open in any text editor
+```
+
+```
+r01_attrition  --  70 rows x 6 columns
+A plain-text view for reading. The .parquet beside it is the output of record.
+
+group            level  descr                          claim_level  remaining  excluded
+---------------------------------------------------------------------------------------
+gender_dys_dx_f      1  Exposure dispensings           Claim                6         .
+gender_dys_dx_f      2  After stockpiling              Claim                5         1
+```
+
+### Choices made, and why
+
+* **Nothing truncated or rounded.** The terminal view (`qrp show`)
+  clips cells at 30 characters and rounds to two places, which is fine
+  for a glance. A file someone reads as the record must not turn
+  `57.1079` into `57.11`, or cut a description short.
+* **Missing is `.`**, the SAS convention. A blank is ambiguous in a
+  fixed-width file, and `OUTPUTDENOM=M` relies on missing member-days
+  reading as missing rather than zero.
+* **Wide tables are transposed.** `baseline` is ~67 columns by one row
+  per cohort; as a normal table that is an ~800-character line. Written
+  one line per column, it fits a screen.
+* **msoc only.** Those are aggregates cleared for sharing, so the text
+  copy changes nothing about what leaves the site. dplocal is
+  patient-level, and a plain-text copy would be one more unencrypted,
+  greppable file holding patient rows.
+
+### Verified faithful
+
+A reading copy that quietly disagreed with the record would be worse
+than none. On the production study, for all nine msoc tables: the
+reported shape matches the parquet, and **every non-null value in the
+parquet appears in the text**. A test keeps that true.
+
+Cost: none measurable (5.41 s with, 5.50 s without — noise), 816 KB of
+text on the production study. Reruns clear old views along with old
+parquets, so a stale `.txt` can never sit beside a newer table.
+
+### Turning them off
+
+`--no-text` on the command line, or `RunHandle(text=False)` from
+code. The terminal UI always writes them — it has no toggle for this,
+since reading without extra tools is the reason the UI exists. msoc is
+what goes to the Operations Center; a site whose recipient expects
+parquet and nothing else can switch them off from the CLI.
+
+`--csv` still exists for anyone who wants the tables in Excel.
+
+### Two formatting bugs caught on the way
+
+* Using `.` for missing made the numeric-column check class any column
+  with a missing value as TEXT, left-aligning every number in it.
+* Transposing kept the group row, which both duplicated the header and,
+  being text, left-aligned every cohort column.
+
+Both were visible only by reading the output.

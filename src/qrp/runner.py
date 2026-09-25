@@ -60,6 +60,17 @@ class RunHandle:
     memory_limit: str | None = None
     temp_directory: str | None = None
     database: str = ":memory:"
+    # Parity with the CLI. The UI had neither, so a table kept outside
+    # --indata could not be pointed at, and diagnostics could not be
+    # requested, from the interface a non-programmer is most likely to
+    # use.
+    table_map: dict[str, str] | None = None
+    debug: bool = False
+    # Output shaping, also previously CLI-only.
+    csv: bool = False
+    layout: str = "split"
+    names: str = "sas"
+    text: bool = True
     extra_sink: EventSink | None = None
 
     engine: Engine | None = field(default=None, init=False)
@@ -110,7 +121,9 @@ class RunHandle:
             # the CLI and the UI observe an identical stream. Nothing to
             # emit here on the happy path.
             run(self.study, self.indata, engine=self.engine,
-                output_dir=self.output_dir, verbose=False)
+                output_dir=self.output_dir, table_map=self.table_map,
+                debug=self.debug, csv=self.csv, layout=self.layout,
+                names=self.names, text=self.text, verbose=False)
             self.seconds = time.perf_counter() - t0
         except Exception as exc:
             self.seconds = time.perf_counter() - t0

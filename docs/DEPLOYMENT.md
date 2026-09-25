@@ -5,6 +5,55 @@ help them when it goes wrong.
 
 ---
 
+## Three ways to get it running
+
+| route | needs at the site | size | verified here |
+|---|---|--:|---|
+| **single executable** | nothing — not even Python | ~120 MB | **yes** |
+| offline bundle | Python 3.11+ | ~22 MB | yes |
+| Docker image | a container runtime | ~200 MB | **no** — no runtime was available |
+
+### Single executable — the least to ask of a site
+
+```bash
+./tools/build_executable.sh        # on a machine with Python
+# -> dist/qrp, one file
+```
+
+Copy that one file to the site. Nothing to install, no Python, no
+admin rights:
+
+```bash
+./qrp doctor
+./qrp run --study study.json --indata /path/to/scdm --out results/
+```
+
+**Verified with `PATH` pointed at an empty directory**, so that no
+Python could possibly be found: `qrp doctor` passed 11/11 and the
+production study ran end to end in 6.8 s, writing all 19 outputs.
+
+Two costs to know about:
+
+* **About 2 s slower per run** than a Python install (6.8 s against
+  ~4 s on the production study). The executable unpacks itself to a
+  temp directory on every launch. Irrelevant for a real study; visible
+  on the demo.
+* **One build per platform.** DuckDB's engine is a 60 MB compiled
+  library, so a Linux build will not run on Windows. Build once for
+  each OS the data partners use.
+
+Why this over Docker for most sites: many data partners run locked-down
+Windows servers where a container runtime needs admin rights, WSL2 or
+Hyper-V, and a security review of its own. A single signed executable
+is a much smaller ask.
+
+### Docker
+
+A `Dockerfile` is included, running as a non-root user with the SCDM
+mounted read-only. **It has not been built or run** — no container
+runtime was available where it was written. The executable route is
+the verified one.
+
 ## The short version
 
 ```bash

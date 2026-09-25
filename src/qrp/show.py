@@ -130,28 +130,54 @@ def show(out: str | Path, table: str | None = None, limit: int = 50,
     return head + "\n" + _render(headers, rows)
 
 
-def _fmt(v: object) -> str:
+def _fmt(v: object, missing: str = "", exact: bool = False) -> str:
+    """Format one cell.
+
+    `exact` keeps full float precision. The terminal view rounds to two
+    places, which is fine for a glance; a text file someone reads as the
+    record must not turn 57.1079 into 57.11.
+    """
     if v is None:
-        return ""
+        return missing
     if isinstance(v, bool):
         return "Y" if v else "N"
     if isinstance(v, int):
         return f"{v:,}"
     if isinstance(v, float):
+        if v != v:                      # NaN
+            return missing
+        if exact:
+            # enough digits to be faithful, trailing zeros dropped
+            text = f"{v:,.6f}".rstrip("0").rstrip(".")
+            return text or "0"
         return f"{v:,.2f}"
     return str(v)
 
 
-def _render(headers: list[str], rows: list[tuple], width: int = 30) -> str:
-    """Plain-text table. Deliberately dependency-free."""
-    cells = [[_fmt(v)[:width] for v in r] for r in rows]
+def _render(headers: list[str], rows: list[tuple], width: int | None = 30,
+            missing: str = "", exact: bool = False,
+            rule_cap: int | None = 160) -> str:
+    """Plain-text table. Deliberately dependency-free.
+
+    `width=None` disables cell truncation, for a file where a clipped
+    value would be silently wrong rather than merely abbreviated.
+    """
+    cells = [[_fmt(v, missing, exact)[:width] if width
+              else _fmt(v, missing, exact) for v in r] for r in rows]
     widths = [
         max(len(h), *(len(c[i]) for c in cells)) if cells else len(h)
         for i, h in enumerate(headers)
     ]
+    # A column is numeric if every NON-MISSING cell is a number. The
+    # missing marker must not count against it: with `.` for missing, a
+    # numeric column holding one missing value was being classed as text
+    # and left-aligned, which knocked every number in it out of line.
+    def _is_num(text: str) -> bool:
+        body = text.replace(",", "").replace("-", "")
+        return bool(body) and body.replace(".", "", 1).isdigit()
+
     numeric = [
-        all(not c[i] or c[i].replace(",", "").replace(".", "")
-            .replace("-", "").isdigit() for c in cells)
+        all(not c[i] or c[i] == missing or _is_num(c[i]) for c in cells)
         for i in range(len(headers))
     ]
 
@@ -161,7 +187,8 @@ def _render(headers: list[str], rows: list[tuple], width: int = 30) -> str:
             for i, (v, w) in enumerate(zip(vals, widths, strict=True))
         ).rstrip()
 
-    out = [line(headers), "-" * min(sum(widths) + 2 * len(widths), 160)]
+    rule = sum(widths) + 2 * len(widths)
+    out = [line(headers), "-" * (min(rule, rule_cap) if rule_cap else rule)]
     out += [line(c) for c in cells]
     return "\n".join(out)
 
@@ -187,3 +214,45 @@ def to_csv(out: str | Path, dest: str | Path,
     finally:
         con.close()
     return written
+
+
+# A table wider than this, with no more rows than it has columns, is
+# written transposed. `baseline` is ~38 columns by one row per cohort;
+# as a normal table that is a 400-character line nobody can read, and
+# transposed it is a tall table that fits a screen.
+_TRANSPOSE_ABOVE = 12
+
+
+def table_text(con, source: str, title: str) -> str:
+    """Render a whole table as plain text for a sidecar file.
+
+    Nothing is truncated or rounded, and missing values show as `.` —
+    the SAS convention, and the one the people reading these expect. A
+    blank would be ambiguous in a fixed-width file, and `OUTPUTDENOM=M`
+    in particular relies on missing reading as missing, not zero.
+    """
+    rel = con.sql(f"SELECT * FROM {source}")
+    headers = [str(c) for c in rel.columns]
+    rows = rel.fetchall()
+
+    note = (f"{title}  --  {len(rows):,} rows x {len(headers)} columns\n"
+            f"A plain-text view for reading. The .parquet beside it is the "
+            f"output of record.\n")
+
+    if len(headers) > _TRANSPOSE_ABOVE and len(rows) <= len(headers):
+        # one row per column, one column per original row, labelled by
+        # the first column (the group) where there is one
+        labels = [str(r[0]) for r in rows] if rows else []
+        t_headers = [headers[0], *labels]
+        # Skip the first column: it is the label row, already the
+        # header. Leaving it in both repeated it and, being text, made
+        # every cohort column read as text and left-align its numbers.
+        t_rows = [(h, *(r[i] for r in rows))
+                  for i, h in enumerate(headers) if i > 0]
+        body = _render(t_headers, t_rows, width=None, missing=".",
+                       exact=True, rule_cap=None)
+        return note + "(transposed: one line per column)\n\n" + body + "\n"
+
+    body = _render(headers, rows, width=None, missing=".", exact=True,
+                   rule_cap=None)
+    return note + "\n" + body + "\n"

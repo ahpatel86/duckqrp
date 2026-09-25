@@ -290,11 +290,49 @@ always written, and the complement would have made every covariate study
 try to write all twenty optional tables. `emit` is `"always"`,
 `"covariate"` or `"gated"`.
 
-### Remaining debt
+## Parsers split out of `load_study_dict`
 
-`run()` is still long (~385 lines), and `pipeline.py` still mixes
-orchestration with output naming and disclosure routing. The output
-contract — SAS name, library, column list — is declared across
-`SAS_NAMES`, `DISCLOSURE` and `SAS_CONTRACT` with tests holding them in
-agreement, where one declaration per output would make the mismatch
-unrepresentable. Both are known and neither is fixed.
+`load_study_dict` was 356 lines: one block per input table. Each block
+was readable; together they were not.
+
+The two largest are now module-level functions — `_parse_cohort_codes`
+(COHORTCODES, the most consequential parser, and the one a review found
+was dropping `codecat`) and `_parse_inclusions` (three levels of
+nesting derived from character columns). The function is down to 259
+lines and the remaining blocks are 5-20 lines each, which is about the
+size at which a block stops being worth a name.
+
+## Debt ledger
+
+| debt | status |
+|---|---|
+| stage list duplicated between `plan_stages()` and `run()` | **fixed** — one `STAGES` table, `plan_stages()` 40 lines to 8 |
+| output contract spread across six dicts | **fixed** — one `Output` per table, the dicts are projections |
+| `pipeline.py` mixing orchestration with output concerns | **fixed** — `outputs.py`, 1,518 to 1,184 lines |
+| `load_study_dict` at 356 lines | **fixed** — 259, two parsers extracted |
+| `run()` at ~365 lines | open — mostly the side-effect stages, which resist a table |
+| `config.py` at ~1,600 lines | open — but it is now a flat list of parsers and dataclasses, not a tangle |
+
+Every refactor was verified the same way: outputs compared before and
+after on the production study, and the full suite run. The one that
+nearly went wrong — deriving `OPTIONAL_OUTPUT_TABLES` as the complement
+of "always" — was caught by diffing the projections against a snapshot,
+not by the tests.
+
+
+## CLI and UI parity is tested
+
+`build_parser()` constructs the CLI outside `main()` so it can be
+inspected. `test_every_cli_run_option_reaches_the_ui_or_is_exempted`
+compares every `run` option against `RunHandle`'s fields — `RunHandle`
+being what the terminal UI drives.
+
+Each option must either have a `RunHandle` field or appear in
+`CLI_ONLY` **with a reason**. A second assertion rejects exemptions for
+options that no longer exist, so the excuse list cannot rot.
+
+It exists because `--table-map` and `--debug` both landed in the CLI
+alone, and a data partner using the UI simply could not use them.
+Writing it surfaced three more (`--csv`, `--layout`, `--names`). And it
+caught `--no-text` the moment that flag was added, before `RunHandle`
+had the field — which is the case it was built for.

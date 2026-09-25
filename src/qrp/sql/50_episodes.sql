@@ -142,7 +142,10 @@ WITH joined AS (
         c.blackout_per,
         c.req_days_aft_ind,
         c.req_days_aft_epi,
-        c.censor_death
+        c.censor_death,
+        -- needed to reconstruct the UNEXTENDED episode end, which is
+        -- the window SAS computes trunkdt over
+        c.exp_ext_per
     FROM pov1 p
     JOIN episodes e
       ON e.cohortgrp = p.cohortgrp
@@ -151,30 +154,55 @@ WITH joined AS (
     JOIN cfg_cohort c
       ON c.cohortgrp = p.cohortgrp
 ),
+-- FUT claims truncate an episode to the date of the earliest one
+-- inside it:
+--
+--   if fut and trunkdt and trunkdt <= EpisodeEndDt
+--       then EpisodeEndDt = trunkdt;
+--   (ms_createptsmasterlist.sas:152)
+--
+-- trunkdt is the earliest FUT claim overlapping
+-- [EpisodeStartDt, EpisodeEndDt] (ms_createpov4.sas:155-167).
+-- Skipping this left every affected episode too long: 3,077 of 31,440
+-- ran past SAS's end date, and NOT ONE was shorter.
+truncated AS (
+    SELECT
+        j.cohortgrp, j.patid, j.indexdt,
+        min(t.adate) AS trunkdt
+    FROM joined j
+    JOIN trunc_claims t
+      ON t.cohortgrp = j.cohortgrp AND t.patid = j.patid
+    WHERE t.adate BETWEEN j.indexdt AND j.raw_episodeenddt
+    GROUP BY 1, 2, 3
+),
 censored AS (
     SELECT
-        *,
-        raw_episodeenddt AS origepisenddt,
+        j.*,
+        j.raw_episodeenddt AS origepisenddt,
         -- Censoring precedence, innermost first:
         --   study censor date, death (when censoring on death),
         --   end of enrollment, max episode duration.
         least(
-            raw_episodeenddt,
+            coalesce(tr.trunkdt, j.raw_episodeenddt),
+            j.raw_episodeenddt,
             DATE '{censor_date}',
-            enr_end,
-            CASE WHEN censor_death THEN COALESCE(deathdt, DATE '9999-12-31')
+            j.enr_end,
+            CASE WHEN j.censor_death THEN COALESCE(j.deathdt, DATE '9999-12-31')
                  ELSE DATE '9999-12-31' END,
-            CASE WHEN max_epis_dur > 0 THEN indexdt + (max_epis_dur - 1)
+            CASE WHEN j.max_epis_dur > 0 THEN j.indexdt + (j.max_epis_dur - 1)
                  ELSE DATE '9999-12-31' END
         ) AS episodeenddt,
         -- the last date on which data is available for this patient
         least(
-            enr_end,
+            j.enr_end,
             DATE '{censor_date}',
-            CASE WHEN censor_death THEN COALESCE(deathdt, DATE '9999-12-31')
+            CASE WHEN j.censor_death THEN COALESCE(j.deathdt, DATE '9999-12-31')
                  ELSE DATE '9999-12-31' END
         ) AS dataavail_dt
-    FROM joined
+    FROM joined j
+    LEFT JOIN truncated tr
+           ON tr.cohortgrp = j.cohortgrp AND tr.patid = j.patid
+          AND tr.indexdt   = j.indexdt
 )
 SELECT
     cohortgrp, patid, indexdt, episode,
@@ -205,4 +233,15 @@ WHERE
          OR date_diff('day', indexdt, episodeenddt) - blackout_per >= 0)
     -- minimum days of supply within the episode
     AND (min_days_supp <= 0 OR episode_rxsup >= min_days_supp)
-    AND indexdt <= episodeenddt;
+    AND indexdt <= episodeenddt
+    -- The index claim must fall INSIDE the query period. SAS reports
+    -- this as its own attrition step — "Episode-defining index claims
+    -- must be during the query period" — and on the study compared it
+    -- removes 8,450 of 10,270 episodes for a single cohort, by far the
+    -- largest single exclusion.
+    --
+    -- Nothing here applied it. Claims are extracted from
+    -- start_date MINUS the widest lookback, so that a covariate or
+    -- washout window can see history; without this filter those
+    -- lookback claims could themselves become index dates.
+    AND indexdt BETWEEN DATE '{start_date}' AND DATE '{end_date}';

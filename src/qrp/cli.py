@@ -35,10 +35,23 @@ def _parse_table_map(values: list[str] | None) -> dict[str, str] | None:
             )
         key, path = item.split("=", 1)
         out[key.strip().lower()] = path.strip()
+    # Validate here, where every command parses it, so a misspelt table
+    # name fails fast instead of being silently ignored.
+    from .scdm import check_table_map
+    try:
+        check_table_map(out)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     return out
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser, built outside `main()` so it can be inspected.
+
+    A test compares the `run` options against `RunHandle` — the
+    object the UI drives — because features kept landing in the CLI
+    and not the UI: `--table-map` and `--debug` both did.
+    """
     ap = argparse.ArgumentParser(prog="qrp", description="Sentinel QRP Type 2")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -91,6 +104,18 @@ def main(argv: list[str] | None = None) -> int:
                         "with existing SOPs and tooling. logical: this "
                         "pipeline's table names. Either way a manifest "
                         "maps logical names to files.")
+    r.add_argument(
+        "--debug", action="store_true",
+        help=("also write the patient-level DIAGNOSTIC tables to dplocal "
+              "(the covariates, exclusion lists, pre-washout master list "
+              "and the rest). Off by default: SAS writes these only under "
+              "QRP_DEBUG, and they were never part of the request."))
+    r.add_argument(
+        "--no-text", dest="text", action="store_false",
+        help=("do not write the plain-text .txt view beside each msoc "
+              "table. The views are for reading without a parquet tool; "
+              "turn them off if whoever receives msoc should get parquet "
+              "and nothing else."))
     r.add_argument("--csv", action="store_true",
                    help="also write CSV copies under <out>/csv for Excel")
     r.add_argument("--no-jsonl", action="store_true",
@@ -134,7 +159,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="map a table explicitly; repeatable")
     i.add_argument("--no-count", action="store_true",
                    help="skip row counts (faster on large data)")
+    return ap
 
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     a = ap.parse_args(argv)
 
     # Dispatched first: these take no run arguments, and anything below
@@ -190,9 +219,15 @@ def main(argv: list[str] | None = None) -> int:
             print()
         if a.indata:
             print(f"scdm root: {a.indata}\n")
-            print(scdm.format_report(
-                scdm.probe(a.indata, sample_rows=not a.no_count,
-                           table_map=_parse_table_map(a.table_map))))
+            try:
+                report = scdm.probe(a.indata, sample_rows=not a.no_count,
+                                    table_map=_parse_table_map(a.table_map))
+            except FileNotFoundError as exc:
+                # A bad --table-map path is the operator's to fix, and a
+                # traceback buries the one line that says how.
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            print(scdm.format_report(report))
         return 0
 
     if a.cmd == "validate":
@@ -245,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                 "output_dir": a.out,
             })
         run(study, a.indata, engine=eng, output_dir=a.out,
-            csv=a.csv, layout=a.layout, names=a.names,
+            csv=a.csv, layout=a.layout, names=a.names, debug=a.debug, text=a.text,
             table_map=_parse_table_map(a.table_map),
             verbose=not a.quiet)
 

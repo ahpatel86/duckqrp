@@ -418,3 +418,86 @@ The first profile of this work blamed `exposure_claims` at 9.00 s, 73%
 of runtime. It was the first touch of the parquet files. Warm, the same
 statement is 0.52 s. Profile a warmed run, or the answer is about the
 filesystem.
+
+
+---
+
+## Benchmark with parity-corrected results
+
+Earlier figures in this document were measured against a cohort built
+over the WRONG YEARS — the query period defaulted to 2010-2015 (see
+PARITY_FINDINGS.md). These are measured on the corrected pipeline.
+
+| study | cohorts | codes | best | episodes |
+|---|--:|--:|--:|--:|
+| simple | 2 | 80 | 3.34 s | 55,406 |
+| wp322 production | 14 | 1,124 | 4.88 s | 2,720 |
+| wp307 | 40 | 12,488 | **22.7 s** | 31,408 |
+
+## Config registration was 79% of a large run
+
+Profiling wp307 showed something the smaller studies had hidden: of
+115 seconds, the SQL stages accounted for **17**. The other 98 were
+Python-side — 22 s parsing the input file and **91 s registering**
+about 300,000 config rows.
+
+`Engine.register` inserted row by row through `executemany`. DuckDB's
+bulk CSV reader does the same work in a fraction of the time — 0.16 s
+against 13.8 s on a 200,000-row benchmark — so tables above
+`_BULK_LOAD_ROWS` now go through a temp file.
+
+| | before | after |
+|---|--:|--:|
+| register config | 91.1 s | **3.6 s** |
+| wp307 end to end | 117.9 s | **22.7 s** |
+
+Results are byte-identical: 19,712 patients, 31,408 episodes,
+2,503,074 denominator members before and after.
+
+### The correctness trap in this change
+
+`csv` writes `None` as an empty field. With the obvious
+`nullstr=''`, a genuinely EMPTY STRING also arrives as NULL — and an
+empty string and a NULL behave differently in a join.
+
+Comparing the two registration paths column by column caught exactly
+one instance: a single `cfg_risk_codes` value out of 103,503. A
+sentinel token keeps the two apart, and two tests now pin it — one
+comparing full row CONTENT between the paths, one probing the empty
+string directly.
+
+Worth noting the speedup was measured before the correctness check.
+Had the comparison not been run, this would have shipped as a 25x win
+that silently altered one value.
+
+
+---
+
+## Parity-fix benchmark, and a regression caught by it
+
+After the truncation and stockgroup fixes:
+
+| study | cohorts | best | episodes |
+|---|--:|--:|--:|
+| wp322 production | 14 | 4.84 s | 2,720 |
+| wp307 | 40 | **22.5 s** | 31,444 |
+
+Running the benchmark caught a regression the test suite could not:
+wp307 had gone from 22.7 s to **65.3 s**.
+
+The cause was in the parity work itself. Registration reads a cohort's
+stockgroup map per code:
+
+```python
+"stockgroup": dict(c.exposure_stockgroups).get(code, "_default")
+```
+
+That rebuilt the dict for every one of 200,480 codes. Hoisting it to
+once per cohort took registration from **46.2 s back to 2.9 s** and the
+run from 65.3 s to 22.5 s, with byte-identical output — 31,444
+episodes, 206 stockgroups.
+
+Worth noting the shape: the defect was introduced by adding TRUNK codes
+to a comprehension that had been fine at 12,488 codes and was quadratic
+at 200,480. No test failed, and correctness was unaffected. Only the
+benchmark showed it.

@@ -42,6 +42,15 @@
 -- PX and DX claims carry no supply: rxsup is 1 (a point event, so the
 -- episode is one day) and rxamt is NULL. That is what SAS gets too,
 -- since those columns do not exist on those tables.
+-- Exposure extraction.
+ -- codetype is the CODE SYSTEM, and it must MATCH, not merely be
+ -- carried along. One cohort's codes span several systems (DX/10,
+ -- PX/10, PX/HC, PX/ND, RX/ND in the real study), and the same code
+ -- string can exist in two of them. Matching on (code, codecat) alone
+ -- found 1,171 members where SAS found 1,113.
+ --
+ -- An empty codetype means the input file did not say, and matches
+ -- anything — so a file without the column behaves as before.
 CREATE OR REPLACE TABLE exposure_claims AS
 SELECT
     k.cohortgrp,
@@ -50,7 +59,7 @@ SELECT
     d.adate,
     d.code,
     -- CODESUPPLY overrides the claim's own RxSup when the study sets
-    -- it (ms_createmicohorts.sas:571). It was parsed, validated against
+    -- it (SAS's CODESUPPLY handling (exact line unverified)). It was parsed, validated against
     -- the CFDD limits, and never applied.
     COALESCE(k.code_supply, d.rxsup) AS rxsup,
     d.rxamt
@@ -59,6 +68,8 @@ JOIN cfg_codes k
   ON k.code    = d.code
  AND k.role    = 'DEF'
  AND k.codecat = 'RX'
+ AND (k.codetype = '' OR k.codetype IS NULL
+      OR upper(d.codetype) = k.codetype)
 WHERE d.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
 
 UNION ALL
@@ -77,6 +88,8 @@ JOIN cfg_codes k
   ON k.code    = x.code
  AND k.role    = 'DEF'
  AND k.codecat = 'PX'
+ AND (k.codetype = '' OR k.codetype IS NULL
+      OR upper(x.codetype) = k.codetype)
 WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
 
 UNION ALL
@@ -90,6 +103,8 @@ JOIN cfg_codes k
   ON k.code    = x.code
  AND k.role    = 'DEF'
  AND k.codecat = 'DX'
+ AND (k.codetype = '' OR k.codetype IS NULL
+      OR upper(x.codetype) = k.codetype)
 WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}';
 
 -- Closed-form stockpiling.
@@ -247,3 +262,82 @@ FROM (
     WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
 )
 WHERE event_count = 0 OR rn = 1;
+
+
+-- ---------------------------------------------------------------
+-- FUT (truncation) claims, STOCKPILED.
+--
+-- FUT codes carry a `stockgroup` exactly as exposure codes do, so
+-- their claims stockpile the same way: a dispensing that arrives while
+-- the previous one in its stockgroup is still supplying starts when
+-- that supply runs out, not on its own fill date.
+--
+-- That shift IS the truncation date. Worked case: a FUT claim on
+-- 2016-06-06 in stockgroup `valsartanhydrochlorothiazide`, with the
+-- previous claim in that group (2016-03-18, 90 days) supplying until
+-- 2016-06-15, stockpiles to 2016-06-16 — which is precisely the
+-- `trunkdt` SAS used, and ten days later than the raw claim date.
+--
+-- Using raw claim dates truncated 854 episodes too early, by 1 to 17
+-- days each: the leftover supply of the preceding claim.
+-- ---------------------------------------------------------------
+CREATE OR REPLACE TABLE trunc_claims AS
+WITH raw AS (
+    -- DISPENSINGS ONLY. SAS stockpiles `_ITDrugs`
+    -- (ms_cidanum.sas:1545) — diagnosis and procedure claims never
+    -- pass through it. Stockpiling them here, with a notional one-day
+    -- supply, chained same-day codes into long artificial runs and
+    -- pushed truncation dates years past the claim.
+    SELECT k.cohortgrp, k.stockgroup, t.patid, t.adate, t.rxsup
+    FROM (
+        SELECT patid, adate, code, 'RX' AS codecat, codetype, rxsup
+          FROM cdm_dispensing
+         -- Same extraction window as the exposure claims. Without it
+         -- the stockpile chain starts from the beginning of time and
+         -- accumulates drift SAS never has: SAS builds `_ITDrugs` from
+         -- the extracted claims, not the whole table.
+         WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+    ) t
+    JOIN cfg_codes k
+      ON k.role = 'TRUNK' AND k.code = t.code AND k.codecat = t.codecat
+     AND (k.codetype = '' OR k.codetype IS NULL
+          OR upper(t.codetype) = k.codetype)
+),
+sameday AS (
+    SELECT cohortgrp, stockgroup, patid, adate,
+           sum(rxsup)::INTEGER AS rxsup
+    FROM raw GROUP BY 1, 2, 3, 4
+),
+running AS (
+    SELECT *, sum(rxsup) OVER w AS cum_sup,
+           day_num(adate) - (sum(rxsup) OVER w - rxsup) AS anchor
+    FROM sameday
+    WINDOW w AS (PARTITION BY cohortgrp, stockgroup, patid
+                 ORDER BY adate ROWS UNBOUNDED PRECEDING)
+),
+solved AS (
+    SELECT *, max(anchor) OVER (
+                 PARTITION BY cohortgrp, stockgroup, patid
+                 ORDER BY adate ROWS UNBOUNDED PRECEDING) AS running_anchor
+    FROM running
+)
+SELECT cohortgrp, patid,
+       from_day_num(cum_sup - 1 + running_anchor - rxsup + 1) AS adate,
+       adate AS orig_adate
+FROM solved
+
+UNION ALL
+
+-- Non-drug truncation claims keep their own dates.
+SELECT DISTINCT k.cohortgrp, t.patid, t.adate, t.adate AS orig_adate
+FROM (
+    SELECT patid, adate, code, 'DX' AS codecat, codetype FROM cdm_diagnosis
+     WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+    UNION ALL
+    SELECT patid, adate, code, 'PX', codetype FROM cdm_procedure
+     WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+) t
+JOIN cfg_codes k
+  ON k.role = 'TRUNK' AND k.code = t.code AND k.codecat = t.codecat
+ AND (k.codetype = '' OR k.codetype IS NULL
+      OR upper(t.codetype) = k.codetype);
