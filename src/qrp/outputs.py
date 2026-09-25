@@ -291,15 +291,21 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
     # partner may legitimately keep several runs' outputs together, and
     # wiping a sibling run's results would be worse than the staleness
     # this fixes.
+    # Both the library directory AND its csv/ subdirectory. `--csv`
+    # writes copies under {lib}/csv/, which the library-level glob
+    # never reached: a rerun that switched naming mode left
+    # `<run>_censor_cida.csv` sitting beside the current
+    # `<run>_censoring.csv`, where it reads as a second result rather
+    # than a leftover.
     for lib in ("dplocal", "msoc"):
-        d = out / lib
-        if not d.is_dir():
-            continue
-        for existing in d.glob(f"{run}_*"):
-            if existing.is_dir():
-                _shutil.rmtree(existing)
-            else:
-                existing.unlink()
+        for d in (out / lib, out / lib / "csv"):
+            if not d.is_dir():
+                continue
+            for existing in d.glob(f"{run}_*"):
+                if existing.is_dir():
+                    _shutil.rmtree(existing)
+                else:
+                    existing.unlink()
 
     for tbl in [*tables, "signature", "runtimes"]:
         # Default to dplocal for anything unmapped: a new output should

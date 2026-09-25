@@ -142,7 +142,19 @@ WITH raw AS (
         s2.patid,
         s2.adate - r.condto                           AS unelig_start,
         s2.adate - r.condfrom                         AS unelig_end
-    FROM cohort_claims s2
+    -- NOT cohort_claims: that is materialised from the master list
+    -- when the numerator is a small share of the extract, so it holds
+    -- only patients who reached an episode. Denominator eligibility
+    -- covers every enrolled member, and shaving it with a
+    -- numerator-filtered claim source leaves excluded time in the
+    -- denominator for everyone outside the cohort.
+    FROM (
+        SELECT patid, adate, code, 'DX' AS codecat FROM cdm_diagnosis
+        UNION ALL
+        SELECT patid, adate, code, 'PX' FROM cdm_procedure
+        UNION ALL
+        SELECT patid, adate, code, 'RX' FROM cdm_dispensing
+    ) s2
     JOIN cfg_inclusion_codes k ON k.code = s2.code
     JOIN cfg_inclusion r
       ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
@@ -306,7 +318,8 @@ SELECT
 FROM _denom_strat s
 -- one row per cohort sharing this config
 JOIN cfg_denom_map m ON m.denom_cfg_id = s.denom_cfg_id
-CROSS JOIN cfg_strata lv
+CROSS JOIN (SELECT * FROM cfg_strata
+            WHERE tableid = 't2cida') lv
 GROUP BY
     lv.level_id, m.cohortgrp, m.output_denom,
     CASE WHEN lv.has_agegroup THEN s.agegroup    END,

@@ -710,6 +710,26 @@ Every one was invisible to a test suite that passed throughout.
 * Config registration moved to a bulk path: 91s to 3.6s on a
   40-cohort study, results byte-identical.
 
+## Verified state
+
+Full suite **275 passed, 2 skipped, 0 failed** across 277 tests. mypy
+clean apart from 10 third-party stubs; ruff clean. A clean install from
+the packaged zip passes `qrp doctor` 11/11.
+
+| study | best | episodes |
+|---|--:|--:|
+| wp322 production | 5.14 s | 2,720 |
+| wp307 (40 cohorts) | 22.20 s | 31,444 |
+
+| metric | this package | SAS | gap |
+|---|--:|--:|--:|
+| episode END dates | **99.61% identical** | | 122 of 31,440 |
+| outcomes | 3 | 3 | **exact** |
+| patients | 19,722 | 19,738 | -0.08% |
+| episodes | 31,444 | 31,464 | -0.06% |
+| denominator members | 2,503,074 | 2,502,986 | +0.0035% |
+| denominator member-days | 2,268,871,418 | 2,268,962,961 | -0.004% |
+
 ## Final parity position
 
 | metric | this package | SAS | gap |
@@ -1521,3 +1541,100 @@ uploaded file itself); only the macro reference was unfounded.
 **The underlying behaviours appear sound** — the ones that mattered
 were validated against SAS output, not just read. But a precise-looking
 line reference is a claim, and several of these did not hold up.
+
+
+---
+
+## Second review: four High findings addressed
+
+| finding | status | effect |
+|---|---|---|
+| shared denominator ids merge different cohort definitions | **fixed** | the key now includes each cohort's EXCLUSION rules and the full exposure code identity (domain, vocabulary, supply), not just the code strings |
+| denominator exclusions use numerator-filtered claims | **fixed** | the shave reads the domain tables directly; `cohort_claims` is materialised from the master list and holds only patients who reached an episode |
+| missing source RX codetype silently removes exposures | **fixed** | a NULL SOURCE codetype cannot contradict the configured one — rejecting it removed every claim for an extract without the column |
+| follow-up time uses the CIDA strata | **fixed** | `cfg_strata` is tagged by `tableid` and each consumer filters to its own; it was `cida_levels() or followuptime_levels()` |
+
+The codetype finding was a defect introduced by this parity work itself
+— the vocabulary predicate added two rounds earlier. It changes nothing
+on the study compared, whose extract populates codetype everywhere,
+which is exactly why only a review caught it.
+
+Effect on parity: denominator member-days move from **383,417 OVER** to
+**91,543 UNDER** SAS (0.004%). Episodes and patients are unchanged at
+31,444 and 19,722.
+
+### Three Medium findings, also addressed
+
+| finding | fix |
+|---|---|
+| `t2_cida` coalesced intentionally NULL member-days to 0 | a MISSING denominator row still means zero, but a PRESENT row with NULL days stays NULL — `OUTPUTDENOM='M'` asks for members only, and `denomcounts` already wrote NULL. The two outputs now agree. |
+| `eventcount=1` dedup omitted `codecat` | added to the partition key, matching SAS's `(PatId, Adate, codecat, codetype, code)`. Events are drawn from DX, PX and RX now, so a same-day diagnosis and procedure sharing a code collapsed into one. |
+| rerun cleanup missed CSV copies | the sweep covers `{lib}/csv/` as well as `{lib}/`. A naming-mode switch left `<run>_censor_cida.csv` beside `<run>_censoring.csv`. |
+
+Verified no regression: outcomes remain exactly 3, episodes 31,444,
+denominator members 2,503,074.
+
+### The three carried-over items, now fixed
+
+| item | fix |
+|---|---|
+| enrolment file lacking the optional `chart` column | the column is resolved from the extract, like the dispensing code and codetype, and falls back to NULL. Referencing it unconditionally made a file carrying every REQUIRED column fail with a binder error — a valid extract could not be read at all. Verified by stripping `chart` from the fixture: same 61,723 episodes. |
+| numeric lab criterion of `0` read as absence | `str(spec or "")` made a falsy 0 blank, so "result = 0" became "no criterion" and widened the extraction. Only None and blank mean absent now. |
+| run-log collision race | the file is created EXCLUSIVELY (`open(..., "x")`) in a retry loop. Check-then-open let two runs in the same second both see the name free and both open it `"w"`, so one silently overwrote the other — the loss the suffix exists to prevent. |
+
+None came from the parity work; all three were long-standing.
+
+Also flagged and NOT actioned, correctly in the reviewers' judgement:
+`92_cidadenom.sql` recomputes age at each shaved segment's start, so one
+member can span two age bands. Whether that is right depends on SAS's
+age-anchor semantics, which are not determinable from the material
+here. It should be verified against a SAS reference before anyone
+changes it.
+
+
+---
+
+## Residual after the review fixes: 122 episode ends
+
+122 of 31,440 ends differ (82 long, 40 short), spread evenly at about
+three per cohort across all 40 — no concentration to exploit.
+
+Classified by whether truncation was involved:
+
+| | count | mine truncated | SAS's end IS a truncation date |
+|---|--:|--:|--:|
+| long | 82 | 58 | **0** |
+| short | 40 | 40 | 12 |
+
+For the 82 long cases SAS's end is **never** a truncation date. Nor is
+it any of:
+
+| candidate | matches |
+|---|--:|
+| enrolment end | 0 |
+| death date | 0 |
+| censor date | 0 |
+| uncensored episode end | 0 |
+| an exposure expiry | 0 |
+| an exposure expiry + `expextper` | 0 |
+| a raw (unstockpiled) truncation date | 0 |
+| a truncation date minus one day | 4 |
+
+A worked case shows the shape: the truncation chain pushes a claim 60
+days in this package and 58 in SAS, so the ends land two days apart.
+The chains agree at the start and separate as they accumulate — the
+same signature as the stockgroup and windowing defects already fixed,
+but smaller and no longer explained by either.
+
+One further hypothesis was implemented and measured:
+`ms_cidanum.sas:617` keeps a dispensing when its SUPPLY reaches the
+study start (`rxdate + rxsup - 1 >= studystartdate`), not when its fill
+date does. Applying that to the truncation claims is
+**output-identical** here — no chain in this study is affected by the
+claims it excludes. It is kept because it matches the documented
+extraction, not because it changed anything.
+
+At 0.39% of episode ends, with patients and episodes both within 0.08%,
+this is the point where the remaining explanations are cheaper to get
+from a SAS-side `QRP_DEBUG=Y` run — which writes the intermediate
+datasets directly — than from further inference.

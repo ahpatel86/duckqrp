@@ -23,7 +23,7 @@ SELECT
     CAST(enr_end   AS DATE)    AS enr_end,
     upper(CAST(medcov  AS VARCHAR)) AS medcov,
     upper(CAST(drugcov AS VARCHAR)) AS drugcov,
-    upper(COALESCE(CAST(chart AS VARCHAR), 'N')) AS chart
+    upper(COALESCE(CAST({enrollment_chart} AS VARCHAR), 'N')) AS chart
 FROM {read_enrollment}
 WHERE enr_start IS NOT NULL
   AND enr_end   IS NOT NULL
@@ -81,6 +81,11 @@ SELECT
 FROM {read_dispensing}
 WHERE rxdate IS NOT NULL
   AND rxsup IS NOT NULL AND rxsup > 0;
+-- NOTE: ms_cidanum.sas:617 filters `rxsup > 0 and rxamt > 0` on ITS
+-- dispensing extraction, so requiring a positive amount here looked
+-- right. MEASURED it is worse — episodes moved from 31,444 to 31,404
+-- against SAS's 31,464, and ends too long rose from 82 to 94. That
+-- filter evidently guards a different dataset, so it is not applied.
 
 CREATE OR REPLACE VIEW cdm_diagnosis AS
 SELECT

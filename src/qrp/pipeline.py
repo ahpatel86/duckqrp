@@ -480,7 +480,21 @@ def _enr_cfg_id(c) -> str:
     return f"{c.coverage}|{c.enrol_gap}|{int(c.chart_required)}"
 
 
-def _denom_cfg_id(c) -> str:
+def _exclusion_key(c, study: StudyConfig) -> str:
+    """Every exclusion rule that shapes this cohort's denominator."""
+    parts = []
+    for r in study.inclusions:
+        if r.cohortgrp != c.cohortgrp or r.criteria != "EXC":
+            continue
+        parts.append("|".join(str(x) for x in (
+            r.cond, r.subcond, r.codecat, ",".join(sorted(r.codes)),
+            r.condfrom, r.condto,
+            getattr(r, "condfromanchor", ""),
+            getattr(r, "condtoanchor", ""))))
+    return ";".join(sorted(parts))
+
+
+def _denom_cfg_id(c, study: StudyConfig) -> str:
     """Cohorts agreeing on this produce IDENTICAL denominators.
 
     `92_cidadenom.sql` builds one enrolled-member window per cohort per
@@ -513,11 +527,19 @@ def _denom_cfg_id(c) -> str:
     # optimisation against the implementation it optimises is circular;
     # only the SAS output showed it, as an identical denominator for all
     # 40 cohorts.
-    codes = ",".join(sorted(code for code, _, _, _ in c.exposure_codes))
+    codes = ",".join(sorted(
+        f"{code}|{codecat}|{codetype}|{supply}"
+        for code, codecat, codetype, supply in c.exposure_codes))
     return "|".join(str(x) for x in (
         _enr_cfg_id(c), c.enr_days, c.min_days_supp, c.min_epis_dur,
         c.req_days_aft_epi, c.req_days_aft_ind, c.blackout_per,
         c.wash_per, hashlib.sha1(codes.encode()).hexdigest()[:12],
+        # The EXCLUSION rules belong here too: the denominator is
+        # shaved by them (ms_cidadenom.sas:145), so two cohorts with
+        # different exclusions have different eligible time. Omitting
+        # them let one cohort's exclusions be applied to another's
+        # denominator through the shared config id.
+        hashlib.sha1(_exclusion_key(c, study).encode()).hexdigest()[:12],
         strata, demog))
 
 
@@ -594,7 +616,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         "cfg_denom_map",
         # Only cohorts SAS would compute a denominator for: OUTPUTDENOM
         # is not "N", and no inclusion rule uses minrxdays > 1.
-        [{"denom_cfg_id": _denom_cfg_id(c), "cohortgrp": c.cohortgrp,
+        [{"denom_cfg_id": _denom_cfg_id(c, study), "cohortgrp": c.cohortgrp,
           # "M" = members only: DenNumMemDays is blanked
           # (ms_cidadenom.sas:1346). Carried per COHORT because two
           # cohorts can share a denominator config and still differ on
@@ -607,8 +629,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_denom_cohort",
         list({
-            _denom_cfg_id(c): {
-                "denom_cfg_id": _denom_cfg_id(c),
+            _denom_cfg_id(c, study): {
+                "denom_cfg_id": _denom_cfg_id(c, study),
                 "enr_cfg_id": _enr_cfg_id(c),
                 "enr_days": c.enr_days,
                 "min_days_supp": c.min_days_supp,
@@ -626,8 +648,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_denom_demog",
         list({
-            (_denom_cfg_id(c), dim, v): {
-                "denom_cfg_id": _denom_cfg_id(c), "dimension": dim,
+            (_denom_cfg_id(c, study), dim, v): {
+                "denom_cfg_id": _denom_cfg_id(c, study), "dimension": dim,
                 "value": v}
             for c in cohorts
             for dim, vals in (("sex", c.sex), ("race", c.race),
@@ -639,8 +661,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_denom_strata",
         list({
-            (_denom_cfg_id(c), lv.ordinal): {
-                "denom_cfg_id": _denom_cfg_id(c), "ordinal": lv.ordinal,
+            (_denom_cfg_id(c, study), lv.ordinal): {
+                "denom_cfg_id": _denom_cfg_id(c, study), "ordinal": lv.ordinal,
                 "label": lv.label, "lo": lv.lo, "hi": lv.hi,
                 "unit": lv.unit}
             for c in cohorts
@@ -770,6 +792,11 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
            is_intercept BOOLEAN""",
     )
 
+    # cfg_strata carries BOTH tables' levels, tagged by tableid. It
+    # used to hold only the CIDA levels, so a study requesting both
+    # t2cida and t2followuptime got the CIDA strata applied to the
+    # follow-up-time table — levels it never asked for, stratified by
+    # dimensions it never named.
     eng.register(
         "cfg_strata",
         [
@@ -788,15 +815,20 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 # completely.
                 "covarstrat": " ".join(
                     v for v in lv.levelvars if v.lower().startswith("covar")),
+                "tableid": tid,
             }
-            # Both output tables share the level shape; each is filtered
-            # to its own tableid at registration time.
-            for i, lv in enumerate(study.cida_levels()
-                                   or study.followuptime_levels())
+            # BOTH tables' levels, each tagged with its own tableid.
+            # `cida_levels() or followuptime_levels()` silently gave the
+            # CIDA levels to the follow-up-time table whenever a study
+            # asked for both.
+            for tid, levels in (("t2cida", study.cida_levels()),
+                                ("t2followuptime",
+                                 study.followuptime_levels()))
+            for i, lv in enumerate(levels)
         ],
         """level_id VARCHAR, has_agegroup BOOLEAN, has_sex BOOLEAN,
            has_race BOOLEAN, has_hispanic BOOLEAN, has_year BOOLEAN,
-           covarstrat VARCHAR""",
+           covarstrat VARCHAR, tableid VARCHAR""",
     )
 
     eng.register(
@@ -1051,12 +1083,23 @@ def run(
     ct_col = next((c for c in ("rx_codetype", "codetype", "ndc_codetype")
                    if c in disp_cols), None)
 
+    # `chart` is OPTIONAL in SCDM. Referencing it unconditionally made
+    # an enrolment file that carries every REQUIRED column fail with a
+    # binder error, so a valid extract could not be read at all.
+    enr = reads.get("read_enrollment", "")
+    enr_cols: set[str] = set()
+    if enr and not enr.startswith("("):
+        enr_cols = {c.lower() for c in columns_of(
+            enr.split("('", 1)[1].rsplit("')", 1)[0])}
+    chart_col = "chart" if "chart" in enr_cols else "NULL"
+
     fmt = {
         **reads,
         "dispensing_code": code_col,
         # NULL when the extract has no codetype: the exposure join
         # treats that as "match any", which is the old behaviour.
         "dispensing_codetype": ct_col or "NULL",
+        "enrollment_chart": chart_col,
         "indata": str(Path(indata)).rstrip("/"),
         "start_date": study.start_date.isoformat(),
         "end_date": study.end_date.isoformat(),

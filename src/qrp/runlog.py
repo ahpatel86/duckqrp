@@ -109,13 +109,20 @@ class RunLog:
         # overwrote the first run's log. Losing the log of a run that
         # already happened is worse than an ugly filename, so add a
         # suffix rather than clobber. Reported in review.
-        if (d / f"{base}.log").exists():
-            n = 2
-            while (d / f"{base}_{n}.log").exists():
+        # Create EXCLUSIVELY rather than checking then opening. Two
+        # runs starting in the same second both saw the name free and
+        # both opened it "w", so one silently overwrote the other —
+        # exactly the loss the suffix exists to prevent.
+        stem, n = base, 1
+        while True:
+            try:
+                self._fh = open(d / f"{base}.log", "x",
+                                buffering=1, encoding="utf-8")
+                break
+            except FileExistsError:
                 n += 1
-            base = f"{base}_{n}"
+                base = f"{stem}_{n}"
         self.log_path = d / f"{base}.log"
-        self._fh = open(self.log_path, "w", buffering=1, encoding="utf-8")
         if self.write_jsonl:
             self.jsonl_path = d / f"{base}.jsonl"
             self._jfh = open(self.jsonl_path, "w", buffering=1, encoding="utf-8")

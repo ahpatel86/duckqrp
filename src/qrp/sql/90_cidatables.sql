@@ -73,7 +73,8 @@ SELECT
     sum(b.followuptime)                                AS followuptime,
     sum(b.timetocensor)                                AS timetocensor
 FROM base b
-CROSS JOIN cfg_strata lv
+CROSS JOIN (SELECT * FROM cfg_strata
+            WHERE tableid = 't2cida') lv
 GROUP BY
     lv.level_id, b."group",
     CASE WHEN lv.has_agegroup THEN b.agegroup    END,
@@ -137,7 +138,13 @@ SELECT
     -- times each). They were `eligible_members`/`memberdays` here —
     -- descriptive, but not what a downstream merge references.
     coalesce(d.dennumpts, 0)         AS dennumpts,
-    coalesce(d.dennummemdays, 0)     AS dennummemdays
+    -- A MISSING denominator row means zero; a PRESENT row with NULL
+    -- member-days means "not counted" — OUTPUTDENOM='M' asks for
+    -- members only, and `denomcounts` already writes NULL there.
+    -- Coalescing both to 0 turned "not counted" into "counted zero",
+    -- which is the one distinction that column carries.
+    CASE WHEN d.level IS NULL THEN 0 ELSE d.dennummemdays END
+                                     AS dennummemdays
 FROM _t2_num n
 FULL JOIN denomcounts d
   ON  d.level      = n.level

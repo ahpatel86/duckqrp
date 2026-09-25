@@ -69,6 +69,11 @@ JOIN cfg_codes k
  AND k.role    = 'DEF'
  AND k.codecat = 'RX'
  AND (k.codetype = '' OR k.codetype IS NULL
+      -- A NULL SOURCE codetype cannot contradict the configured one.
+      -- SCDM extracts may omit the column entirely, in which case the
+      -- normalised view supplies NULL; rejecting those rows silently
+      -- removed EVERY claim for a study that names a vocabulary.
+      OR d.codetype IS NULL
       OR upper(d.codetype) = k.codetype)
 WHERE d.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
 
@@ -89,6 +94,11 @@ JOIN cfg_codes k
  AND k.role    = 'DEF'
  AND k.codecat = 'PX'
  AND (k.codetype = '' OR k.codetype IS NULL
+      -- A NULL SOURCE codetype cannot contradict the configured one.
+      -- SCDM extracts may omit the column entirely, in which case the
+      -- normalised view supplies NULL; rejecting those rows silently
+      -- removed EVERY claim for a study that names a vocabulary.
+      OR x.codetype IS NULL
       OR upper(x.codetype) = k.codetype)
 WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
 
@@ -104,6 +114,11 @@ JOIN cfg_codes k
  AND k.role    = 'DEF'
  AND k.codecat = 'DX'
  AND (k.codetype = '' OR k.codetype IS NULL
+      -- A NULL SOURCE codetype cannot contradict the configured one.
+      -- SCDM extracts may omit the column entirely, in which case the
+      -- normalised view supplies NULL; rejecting those rows silently
+      -- removed EVERY claim for a study that names a vocabulary.
+      OR x.codetype IS NULL
       OR upper(x.codetype) = k.codetype)
 WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}';
 
@@ -226,7 +241,15 @@ FROM (
                          CASE WHEN c.event_count = 2 THEN NULL
                               ELSE x.code END,
                          CASE WHEN c.event_count = 2 THEN NULL
-                              ELSE x.codetype END
+                              ELSE x.codetype END,
+                         -- codecat too: SAS's key is
+                         -- (PatId, Adate, codecat, codetype, code).
+                         -- Events are now drawn from DX, PX and RX, so
+                         -- a same-day diagnosis and procedure sharing a
+                         -- code and vocabulary collapsed into ONE
+                         -- event instead of two.
+                         CASE WHEN c.event_count = 2 THEN NULL
+                              ELSE x.codecat END
             ORDER BY x.code
         ) AS rn
     -- Events come from the code's OWN domain, not from diagnosis alone.
@@ -301,6 +324,7 @@ WITH raw AS (
     JOIN cfg_codes k
       ON k.role = 'TRUNK' AND k.code = t.code AND k.codecat = t.codecat
      AND (k.codetype = '' OR k.codetype IS NULL
+          OR t.codetype IS NULL
           OR upper(t.codetype) = k.codetype)
 ),
 sameday AS (

@@ -141,7 +141,10 @@ def parse_lab_result(spec: Any) -> tuple[str | None, float | None, float | None]
     Order matters: '<=' must be tested before '<', or '<=7' parses as
     '<' with a bound of '=7'.
     """
-    raw = str(spec or "").strip()
+    # NOT `str(spec or "")`: a numeric criterion of 0 is falsy, so that
+    # turned "result = 0" into "no criterion at all" and silently
+    # widened the extraction. Only None and blank mean absent.
+    raw = "" if spec is None else str(spec).strip()
     if not raw:
         return (None, None, None)
 

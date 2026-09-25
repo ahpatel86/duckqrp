@@ -189,7 +189,7 @@ FROM flagged f
 -- an msoc output silently absent rather than unstratified.
 CROSS JOIN (
     SELECT level_id, has_agegroup, has_sex, has_race,
-           has_hispanic, has_year FROM cfg_strata
+           has_hispanic, has_year FROM cfg_strata WHERE tableid = 't2cida'
     UNION ALL
     SELECT '1', FALSE, FALSE, FALSE, FALSE, FALSE
     WHERE NOT EXISTS (SELECT 1 FROM cfg_strata)

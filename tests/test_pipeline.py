@@ -5723,7 +5723,7 @@ def test_denominator_config_key_is_complete():
         assert changed, (
             f"{field}: the override never reached the parsed cohort, so "
             f"this case proves nothing")
-        assert len({_denom_cfg_id(a), _denom_cfg_id(b)}) == 2, (
+        assert len({_denom_cfg_id(a, s), _denom_cfg_id(b, s)}) == 2, (
             f"{field} differs ({changed}) but the cohorts share a "
             f"denominator config — they would be merged and both get "
             f"the wrong denominator")
@@ -5741,7 +5741,7 @@ def test_shared_denominator_config_gives_identical_results():
 
     # identical cohorts -> one config, identical denominators
     same = _two_cohort_study()
-    assert len({_denom_cfg_id(c) for c in same.cohorts}) == 1
+    assert len({_denom_cfg_id(c, same) for c in same.cohorts}) == 1
 
     eng = Engine(verbose=False)
     try:
@@ -5758,7 +5758,7 @@ def test_shared_denominator_config_gives_identical_results():
 
     # a differing cohort -> two configs, and the denominators differ
     diff = _two_cohort_study(sex="F")
-    assert len({_denom_cfg_id(c) for c in diff.cohorts}) == 2
+    assert len({_denom_cfg_id(c, diff) for c in diff.cohorts}) == 2
     eng = Engine(verbose=False)
     try:
         run(diff, DATA, engine=eng, verbose=False)
@@ -6524,3 +6524,157 @@ def test_truncation_codes_keep_their_own_stockgroup():
             "would stockpile as one chain", groups)
     finally:
         eng.close()
+
+
+def test_strata_are_registered_per_table():
+    """`cfg_strata` carries both tables' levels, tagged by tableid.
+
+    It used to be `cida_levels() or followuptime_levels()`, so a study
+    asking for BOTH got the CIDA levels applied to the follow-up-time
+    table — levels it never requested, stratified by dimensions it
+    never named.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    s = load_study_dict({**base, "userstrata": [
+        {"tableid": "t2cida", "levelid": "1", "levelvars": ""},
+        {"tableid": "t2cida", "levelid": "2", "levelvars": "agegroup"},
+        {"tableid": "t2followuptime", "levelid": "7", "levelvars": "sex"},
+    ]})
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        got = dict(eng.con.execute(
+            "SELECT tableid, count(*) FROM cfg_strata GROUP BY 1").fetchall())
+        assert got == {"t2cida": 2, "t2followuptime": 1}, got
+
+        # the follow-up table must carry only ITS level
+        levels = {r[0] for r in eng.con.execute(
+            "SELECT DISTINCT level FROM followuptime").fetchall()}
+        assert levels == {"7"}, (
+            "follow-up time used the CIDA levels", levels)
+    finally:
+        eng.close()
+
+
+def test_denominator_key_separates_different_exclusions():
+    """The denominator is SHAVED by the exclusion conditions, so two
+    cohorts with different exclusions have different eligible time.
+
+    The shared-config key omitted them, which let one cohort's
+    exclusions be applied to another's denominator.
+    """
+    from qrp.config import load_study_dict
+    from qrp.pipeline import _denom_cfg_id
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    rules = [{"group": "lisinopril", "condinclusion": 0, "codecat": "DX",
+              "code": "E11", "condlevel": "X", "subcondlevel": "Y",
+              "condfrom": -183, "condto": -1}]
+    s = load_study_dict({**base, "inclusioncodes": rules})
+    ids = {c.cohortgrp: _denom_cfg_id(c, s) for c in s.cohorts}
+    assert ids["lisinopril"] != ids["beta_blocker"], (
+        "cohorts with different exclusion rules shared a denominator "
+        "config, so one cohort's exclusions shaved the other's time")
+
+
+def test_rerun_clears_stale_csv_copies():
+    """`--csv` writes copies under {lib}/csv/, which the run-scoped
+    cleanup did not reach. Switching naming mode left the old name's
+    CSV beside the new one's, where it reads as a second result rather
+    than a leftover.
+    """
+    import tempfile
+
+    from qrp import run as _run
+
+    out = Path(tempfile.mkdtemp())
+    study = load_study(STUDY)
+
+    _run(study, DATA, output_dir=str(out), names="sas", csv=True,
+         verbose=False)
+    first = {p.name for p in out.rglob("csv/*.csv")}
+    assert first, "no CSV copies were written"
+
+    _run(study, DATA, output_dir=str(out), names="logical", csv=True,
+         verbose=False)
+    second = {p.name for p in out.rglob("csv/*.csv")}
+
+    # the two modes must actually differ, or this proves nothing
+    assert first != second, "both naming modes produced the same names"
+    # and nothing from the first run may survive
+    assert not (first - second) & second
+    assert second.isdisjoint(first - second)
+    leftover = {p.name for p in out.rglob("csv/*.csv")} - second
+    assert not leftover, ("stale CSV files survived the rerun", leftover)
+
+
+def test_enrollment_without_the_optional_chart_column():
+    """`chart` is OPTIONAL in SCDM. Referencing it unconditionally made
+    an enrolment file carrying every REQUIRED column fail with a binder
+    error, so a valid extract could not be read at all."""
+    import shutil
+    import tempfile
+
+    import duckdb
+
+    from qrp import Engine
+
+    work = Path(tempfile.mkdtemp())
+    con = duckdb.connect()
+    for d in Path(DATA).iterdir():
+        if not d.is_dir():
+            continue
+        dest = work / d.name
+        if d.name == "enrollment":
+            dest.mkdir(parents=True)
+            cols = [c[0] for c in con.execute(
+                f"SELECT * FROM read_parquet('{d}/*.parquet') LIMIT 0"
+            ).description]
+            keep = ", ".join(c for c in cols if c != "chart")
+            con.execute(
+                f"COPY (SELECT {keep} FROM read_parquet('{d}/*.parquet')) "
+                f"TO '{dest}/data.parquet' (FORMAT PARQUET)")
+        else:
+            shutil.copytree(d, dest)
+    con.close()
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), str(work), engine=eng, verbose=False)
+        assert eng.count("cohort_final") > 0
+    finally:
+        eng.close()
+
+
+def test_a_numeric_lab_criterion_of_zero_is_not_absence():
+    """`str(spec or "")` turned a numeric 0 into "", so "result = 0"
+    became "no criterion" and silently widened the extraction."""
+    from qrp.config import parse_lab_result
+
+    assert parse_lab_result(0)[:2] == ("=", 0.0)
+    assert parse_lab_result(0.0)[:2] == ("=", 0.0)
+    assert parse_lab_result("0")[:2] == ("=", 0.0)
+    # only None and blank mean absent
+    assert parse_lab_result(None) == (None, None, None)
+    assert parse_lab_result("") == (None, None, None)
+
+
+def test_run_logs_never_overwrite_each_other():
+    """Two runs starting in the same second both saw the name free and
+    both opened it "w", so one silently overwrote the other. The file
+    is now created EXCLUSIVELY."""
+    import tempfile
+
+    from qrp.runlog import RunLog
+
+    d = tempfile.mkdtemp()
+    logs = []
+    for _ in range(3):
+        rl = RunLog(directory=d, run_id="demo")
+        logs.append(rl.log_path)
+        rl.close()
+    assert len({p.name for p in logs}) == 3, [p.name for p in logs]
+    assert all(p.exists() for p in logs)
