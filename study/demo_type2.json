@@ -1,0 +1,549 @@
+{
+ "qrp_parameters": [
+  {
+   "type": 2,
+   "runid": "demo",
+   "startdate": "2011-01-01",
+   "enddate": "2015-06-30",
+   "censordate": "2015-06-30"
+  }
+ ],
+ "cohortfile": [
+  {
+   "cohortgrp": "lisinopril",
+   "enrollmentnum": 1,
+   "coverage": "MD",
+   "enrolgap": 45,
+   "chartres": "N",
+   "enrdays": 183,
+   "agestrat": "18-44 45-64 65-74 75+",
+   "reqdaysaftind": 0
+  },
+  {
+   "cohortgrp": "beta_blocker",
+   "enrollmentnum": 1,
+   "coverage": "MD",
+   "enrolgap": 45,
+   "chartres": "N",
+   "enrdays": 183,
+   "agestrat": "18-44 45-64 65-74 75+",
+   "reqdaysaftind": 0
+  }
+ ],
+ "type2file": [
+  {
+   "group": "lisinopril",
+   "t2washper": 183,
+   "point": "N",
+   "episodegap": 15,
+   "episodegaptype": "F",
+   "expextper": 0,
+   "minepisdur": 1,
+   "maxepisdur": 365,
+   "t2fupwashper": 183,
+   "eventcount": 1,
+   "censor_dth": "Y",
+   "t2atriskstart": 0,
+   "blackoutper": 0,
+   "reqdaysaftepi": 0
+  },
+  {
+   "group": "beta_blocker",
+   "t2washper": 183,
+   "point": "N",
+   "episodegap": 30,
+   "episodegaptype": "F",
+   "expextper": 0,
+   "minepisdur": 1,
+   "maxepisdur": 365,
+   "t2fupwashper": 183,
+   "eventcount": 1,
+   "censor_dth": "Y",
+   "t2atriskstart": 0,
+   "blackoutper": 0,
+   "reqdaysaftepi": 0
+  }
+ ],
+ "cohortcodes": [
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00001",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00002",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00003",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00004",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00005",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00006",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00007",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00008",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00009",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00010",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00011",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00012",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00013",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00014",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00015",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00016",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00017",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00018",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00019",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "DEF",
+   "code": "E00020",
+   "codecat": "RX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00001",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00002",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00003",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00004",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00005",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00006",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00007",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00008",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00009",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00010",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00011",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00012",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00013",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00014",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00015",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00016",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00017",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00018",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00019",
+   "codecat": "DX"
+  },
+  {
+   "group": "lisinopril",
+   "indexcriteria": "EVENT",
+   "code": "D00020",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00021",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00022",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00023",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00024",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00025",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00026",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00027",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00028",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00029",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00030",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00031",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00032",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00033",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00034",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00035",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00036",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00037",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00038",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00039",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "DEF",
+   "code": "E00040",
+   "codecat": "RX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00001",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00002",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00003",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00004",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00005",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00006",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00007",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00008",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00009",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00010",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00011",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00012",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00013",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00014",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00015",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00016",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00017",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00018",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00019",
+   "codecat": "DX"
+  },
+  {
+   "group": "beta_blocker",
+   "indexcriteria": "EVENT",
+   "code": "D00020",
+   "codecat": "DX"
+  }
+ ]
+}
