@@ -119,13 +119,29 @@ WITH raw AS (
     SELECT DISTINCT
         m.denom_cfg_id,
         x.patid,
+        -- STOCKPILED dates. SAS shaves from `ADate + 1` to
+        -- `ExpireDt + washper` where both come from the stockpiled
+        -- exposure (ms_cidadenom.sas:461-478), not from the raw claim.
+        -- Using raw dates made the ineligible window start and end too
+        -- early, so members re-entered the denominator sooner than SAS
+        -- allows — visible as the incident cohorts carrying every large
+        -- difference, since only they have a washout at all.
         x.adate + 1                                   AS unelig_start,
-        x.adate + CAST(x.rxsup - 1 AS INTEGER)
-                + CAST(c.wash_per AS INTEGER)         AS unelig_end
-    FROM exposure_claims x
+        x.expiredt + CAST(c.wash_per AS INTEGER)      AS unelig_end
+    FROM stockpiled x
     JOIN cfg_denom_map m ON m.cohortgrp = x.cohortgrp
     JOIN cfg_cohort    c ON c.cohortgrp = x.cohortgrp
     WHERE c.wash_per <> 0
+      -- SAS shaves from `_groupindex`, which is the stockpiled
+      -- exposure JOINED TO ENROLMENT (ms_cidadenom.sas:459) — not
+      -- every exposure claim. A dispensing filled outside any
+      -- enrolment span never makes a member ineligible, and counting
+      -- it removed eligible time SAS keeps.
+      AND EXISTS (
+          SELECT 1 FROM enrollment_spans en
+          WHERE en.enr_cfg_id = c.enr_cfg_id
+            AND en.patid = x.patid
+            AND x.adate BETWEEN en.enr_start AND en.enr_end)
 
     UNION ALL
 
@@ -149,13 +165,22 @@ WITH raw AS (
     -- numerator-filtered claim source leaves excluded time in the
     -- denominator for everyone outside the cohort.
     FROM (
+        -- Windowed like every other claim source. SAS shaves from
+        -- `_IT<inclusioncodes>`, the EXTRACTED claim set, so a code
+        -- outside the extraction window never disqualifies anyone.
+        -- Reading the raw tables unbounded created shave periods SAS
+        -- does not have.
         SELECT patid, adate, code, 'DX' AS codecat FROM cdm_diagnosis
+         WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
         UNION ALL
         SELECT patid, adate, code, 'PX' FROM cdm_procedure
+         WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
         UNION ALL
         SELECT patid, adate, code, 'RX' FROM cdm_dispensing
+         WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
     ) s2
-    JOIN cfg_inclusion_codes k ON k.code = s2.code
+    JOIN cfg_inclusion_codes k
+      ON k.code = s2.code AND k.codecat = s2.codecat
     JOIN cfg_inclusion r
       ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
      AND r.cond = k.cond AND r.subcond = k.subcond
@@ -167,6 +192,13 @@ WITH raw AS (
       AND coalesce(r.condfromanchor, '') <> 'EPISODEENDDT'
       AND coalesce(r.condtoanchor, '')   <> 'EPISODEENDDT'
 ),
+-- SAS drops degenerate periods BEFORE merging
+-- (`if UneligStart<=UneligEnd;`, ms_cidadenom.sas:467). One whose
+-- start is past its end shaves nothing on its own, but carried into
+-- the running-max merge below it can still extend a block.
+guarded AS (
+    SELECT * FROM raw WHERE unelig_start <= unelig_end
+),
 -- merge overlapping periods per member: a running max of the end seen
 -- so far starts a new block whenever a gap appears
 marked AS (
@@ -175,7 +207,7 @@ marked AS (
                     PARTITION BY denom_cfg_id, patid ORDER BY unelig_start
                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
                 THEN 0 ELSE 1 END AS new_block
-    FROM raw
+    FROM guarded
 ),
 blocks AS (
     SELECT *, sum(new_block) OVER (

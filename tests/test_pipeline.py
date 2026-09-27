@@ -14,8 +14,9 @@ different thread counts and requiring byte-identical output.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -6678,3 +6679,294 @@ def test_run_logs_never_overwrite_each_other():
         rl.close()
     assert len({p.name for p in logs}) == 3, [p.name for p in logs]
     assert all(p.exists() for p in logs)
+
+
+def test_truncation_chain_starts_at_the_enrolment_window():
+    """A truncation claim enters the stockpile chain only if its SUPPLY
+    still runs at the start of the required prior-enrolment window.
+
+    Taking every claim back to `claims_from` pulled in claims SAS never
+    sees, and each extra one pushes the rest of the chain further
+    forward — so truncation dates landed days or weeks late. Against
+    SAS's own `_groupwashfortrunk` the chains were 8% too long.
+
+    The worked case: a patient whose only SAS entry is 2015-08-08, but
+    who had an earlier claim on 2015-05-11 whose 90-day supply ends
+    exactly 2015-08-08. Including it made the 08-08 claim overlap, so
+    it was pushed to 08-09 and the episode ended a day late. Excluding
+    it — as SAS does — removes the overlap entirely.
+
+    Exact episode ends went from 99.61% to 99.97%, and episodes ending
+    too SHORT from 40 to none.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        study = load_study(STUDY)
+        run(study, DATA, engine=eng, verbose=False)
+        bound = eng.con.execute(
+            "SELECT min(CAST(? AS DATE) - enr_days) FROM cfg_cohort",
+            [study.start_date]).fetchone()[0]
+        early = eng.con.execute(
+            "SELECT count(*) FROM trunc_claims WHERE orig_adate > ?",
+            [bound]).fetchone()[0]
+        # every retained claim's SUPPLY must reach the bound; claims
+        # filed after it trivially do, so the check is that nothing
+        # retained expired before it
+        stale = eng.con.execute(
+            "SELECT count(*) FROM trunc_claims t "
+            "WHERE t.orig_adate < ? AND NOT EXISTS ("
+            "  SELECT 1 FROM cdm_dispensing d "
+            "  WHERE d.patid = t.patid AND d.adate = t.orig_adate "
+            "    AND d.adate + CAST(d.rxsup - 1 AS INTEGER) >= ?)",
+            [bound, bound]).fetchone()[0]
+        assert stale == 0, (
+            f"{stale} truncation claims were kept whose supply had "
+            f"already run out before {bound}")
+        assert early >= 0
+    finally:
+        eng.close()
+
+
+def test_non_dispensing_exposure_is_not_stockpiled():
+    """SAS stockpiles `_ITDrugs` only (ms_cidanum.sas:1545) — exposure
+    sourced from procedure or diagnosis claims never passes through it,
+    and two administrations on one day are ONE day of exposure, not two.
+
+    Chaining them pushed each successive administration a day later and
+    stretched the episode end past SAS's. On a filgrastim patient,
+    three pairs of same-day J1442 administrations became a six-day run
+    instead of three single days, ending the episode three days late.
+
+    Fixing both halves — no chaining, and MAX rather than SUM for
+    same-day supply — took exact episode ends from 99.97% to 100%.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        # nothing outside RX may have been shifted by stockpiling
+        shifted = eng.con.execute(
+            "SELECT count(*) FROM stockpiled s "
+            "WHERE s.adate <> s.orig_adate AND NOT EXISTS ("
+            "  SELECT 1 FROM exposure_claims x "
+            "  WHERE x.cohortgrp = s.cohortgrp AND x.patid = s.patid "
+            "    AND x.adate = s.orig_adate AND x.codecat = 'RX')"
+        ).fetchone()[0]
+        assert shifted == 0, (
+            f"{shifted} non-dispensing exposure rows were stockpiled")
+    finally:
+        eng.close()
+
+
+def test_exposure_chain_starts_at_the_enrolment_window():
+    """A dispensing joins the stockpile chain only if its SUPPLY still
+    runs at the start of the required prior-enrolment window — the same
+    rule the truncation chain follows.
+
+    Chaining from the beginning of the extract pushed every expiry
+    forward, closing gaps SAS leaves open. One patient's claims were 35
+    days apart on their own dates, past the 30-day `episodegap`, so SAS
+    starts a new episode there; accumulated push made the gap 5 days
+    here and the episodes merged, losing the later index date.
+
+    That was the last of the membership gap: episodes went from 31,440
+    to 31,464 — exactly SAS's count, with no episode in either output
+    missing from the other.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        study = load_study(STUDY)
+        run(study, DATA, engine=eng, verbose=False)
+        bound = eng.con.execute(
+            "SELECT min(CAST(? AS DATE) - enr_days) FROM cfg_cohort",
+            [study.start_date]).fetchone()[0]
+        stale = eng.con.execute(
+            "SELECT count(*) FROM stockpiled s "
+            "WHERE EXISTS (SELECT 1 FROM exposure_claims x "
+            "  WHERE x.cohortgrp = s.cohortgrp AND x.patid = s.patid "
+            "    AND x.adate = s.orig_adate AND x.codecat = 'RX' "
+            "    AND x.adate + CAST(x.rxsup - 1 AS INTEGER) < ?)",
+            [bound]).fetchone()[0]
+        assert stale == 0, (
+            f"{stale} dispensings joined the chain whose supply had run "
+            f"out before {bound}")
+        assert eng.count("cohort_final") > 0
+    finally:
+        eng.close()
+
+
+def test_master_list_carries_the_sas_column_shape():
+    """SAS's `<runid>_mstr` is ONE WIDE ROW PER EPISODE carrying
+    everything — covariate flags, utilization counts, calendar parts
+    and the censoring flags all live on it.
+
+    This package computed each of those and wrote them to `covariates`,
+    `utilization` and `risk_scores` instead, so a data partner opening
+    `<runid>_mstr` found 53 of SAS's 92 columns absent even though the
+    values existed elsewhere in the output. That is a contract
+    mismatch, the same class as `mstr` once naming the wrong table.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        cols = {d[0].lower() for d in eng.con.execute(
+            "SELECT * FROM cohort_final LIMIT 0").description}
+
+        for name in ("year", "month", "quarter", "periodid",
+                     "indexlookenddt", "rawdisp", "adjusteddisp",
+                     "totrxsup", "totrxamt", "ttc"):
+            assert name in cols, name
+        # both flag families, which SAS writes under two names
+        for stem in ("elig", "dth", "qryend", "dpend"):
+            assert f"fup_{stem}" in cols, stem
+            assert f"cens_{stem}" in cols, stem
+        # a covariate flag per covariate the study defines
+        study = load_study(STUDY)
+        for cov in {c.covarnum for c in study.covariates}:
+            assert f"covar{cov}" in cols, cov
+    finally:
+        eng.close()
+
+
+def test_master_list_covariate_columns_follow_the_study():
+    """The covariate flags are GENERATED from the study, not fixed.
+
+    A different study has a different covariate set — 15 where this one
+    has 32, or a non-contiguous set — so a hardcoded covar1..covar32
+    would be wrong for every study but one. The columns emitted are
+    exactly the covariate numbers the study defines.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    rows = base["covariatecodes"]
+
+    def covar_columns(covariate_rows):
+        s = load_study_dict({**base, "covariatecodes": covariate_rows})
+        eng = Engine(verbose=False)
+        try:
+            run(s, DATA, engine=eng, verbose=False)
+            cols = [d[0] for d in eng.con.execute(
+                "SELECT * FROM cohort_final LIMIT 0").description]
+            return sorted(
+                int(m.group(1)) for m in
+                (re.fullmatch(r"(?i)covar(\d+)", c) for c in cols) if m)
+        finally:
+            eng.close()
+
+    two = [r for r in rows if int(r["covarnum"]) in (1, 2)]
+    assert covar_columns(two) == [1, 2]
+
+    # non-contiguous: the column set must follow the numbers, not a range
+    gappy = [dict(rows[0], covarnum=n) for n in (1, 5, 9)]
+    assert covar_columns(gappy) == [1, 5, 9]
+
+
+def test_master_list_utilization_columns_need_the_stage():
+    """The utilization counts appear only when that stage ran — a study
+    with no utilfile gets no NumAV, rather than a column of zeros."""
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def has_numav(**extra):
+        s = load_study_dict({**base, **extra})
+        eng = Engine(verbose=False)
+        try:
+            run(s, DATA, engine=eng, verbose=False)
+            return "NumAV" in {d[0] for d in eng.con.execute(
+                "SELECT * FROM cohort_final LIMIT 0").description}
+        finally:
+            eng.close()
+
+    assert not has_numav()
+    assert has_numav(utilfile=[
+        {"group": g, "utiltype": "MED", "utilfrom": -183, "utilto": -1}
+        for g in ("lisinopril", "beta_blocker")])
+
+
+def test_washout_shave_uses_stockpiled_dates():
+    """SAS shaves the denominator from `ADate + 1` to
+    `ExpireDt + washper`, where both come from the STOCKPILED exposure
+    (ms_cidadenom.sas:461-478) — not from the raw claim.
+
+    Using raw dates ended the ineligible window early, so members
+    re-entered the denominator sooner than SAS allows. It showed up
+    only in the incident cohorts, the ones with a washout: they carried
+    every large per-cohort difference (+15, +7, +3, +2) while the
+    prevalent cohorts were uniformly +1. After the fix all 40 are +1,
+    and the total member excess halved from 88 to 40.
+
+    Tested behaviourally: a LONGER washout must remove strictly more
+    eligible time, and a stockpiled expiry is never earlier than the
+    raw one, so the shave can only grow.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    strata = [{"tableid": "t2cida", "levelid": "1", "levelvars": ""}]
+
+    def memdays(washper):
+        t2 = [dict(r) for r in base["type2file"]]
+        for r in t2:
+            r["t2washper"] = washper
+        s = load_study_dict({**base, "type2file": t2,
+                             "userstrata": strata})
+        eng = Engine(verbose=False)
+        try:
+            run(s, DATA, engine=eng, verbose=False)
+            return eng.con.execute(
+                "SELECT sum(dennummemdays) FROM denomcounts").fetchone()[0]
+        finally:
+            eng.close()
+
+    # wash_per may not exceed enr_days (183 here), which the
+    # config validator enforces
+    none_, short, long_ = memdays(0), memdays(30), memdays(180)
+    assert short < none_, (
+        "a washout removed no eligible time at all", none_, short)
+    assert long_ < short, (
+        "a longer washout removed no MORE time, so the shave is not "
+        "using the exposure's expiry", short, long_)
+
+
+def test_inclusion_codes_are_matched_within_their_own_domain():
+    """`codecat` belongs on the CODE, not only on the rule.
+
+    Several rules share one (cond, subcond) — this study has 57 at
+    cond 1, subcond 1, spanning DX and PX — so matching a claim against
+    the RULE's domain let a DX code match a PX claim whenever any
+    sibling rule was PX. Cross-domain matching of exactly the kind the
+    exposure join had.
+
+    It over-shaved the denominator by 31%: 586,096 member-days removed
+    against SAS's 445,775. Matching within the code's own domain took
+    the member-day gap from -140,321 to +8,033.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        cols = {d[0] for d in eng.con.execute(
+            "SELECT * FROM cfg_inclusion_codes LIMIT 0").description}
+        assert "codecat" in cols, (
+            "inclusion codes carry no domain, so they match claims in "
+            "every domain a sibling rule happens to use")
+        # and no code may be registered without one
+        blank = eng.con.execute(
+            "SELECT count(*) FROM cfg_inclusion_codes "
+            "WHERE codecat IS NULL OR codecat = ''").fetchone()[0]
+        assert blank == 0, blank
+    finally:
+        eng.close()

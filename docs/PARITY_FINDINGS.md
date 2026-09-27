@@ -1638,3 +1638,610 @@ At 0.39% of episode ends, with patients and episodes both within 0.08%,
 this is the point where the remaining explanations are cheaper to get
 from a SAS-side `QRP_DEBUG=Y` run — which writes the intermediate
 datasets directly — than from further inference.
+
+
+---
+
+## Debug datasets: the residual is now directly comparable
+
+A `QRP_DEBUG=Y` run supplied the per-cohort intermediates — `_fut`,
+`_groupwashfortrunk`, `_pov1`, `_pov4`, `_ptsmasterlist`, `_fupevent`,
+`_inclexcl` and the per-level attrition sets, for all 40 cohorts. The
+truncation chain can now be compared against SAS's own, instead of
+inferred from episode ends.
+
+### `_fut` — the truncation dates
+
+For `antixa_rupture_prev`:
+
+| | |
+|---|--:|
+| SAS `_fut` rows | 332 |
+| this package | 348 |
+| keys present in both | 317 |
+| **same `trunkdt`** | **308** |
+
+The nine that differ are all LATER here, by 2, 4, 6 and 10 days.
+
+### `_groupwashfortrunk` — the claims those dates come from
+
+| | |
+|---|--:|
+| SAS rows | 65,532 |
+| this package | 70,840 |
+| only in SAS | 2,918 |
+| only here | **8,304** |
+
+**This package carries about 8% more truncation claims than SAS**, and
+each extra claim adds another push to the stockpile chain. That is the
+mechanism behind every remaining difference: same cadence, more steps.
+
+One patient makes it concrete — both chains step exactly 90 days, but
+with 37 entries here against SAS's 35:
+
+```
+SAS  2015-08-06  2015-11-04  2016-02-02  2016-05-02 ...  ends 2023-07-25
+here 2015-05-18  2015-08-16  2015-11-14  2016-02-12 ...  ends 2023-11-02
+```
+
+### A correction, and a caution
+
+An earlier entry recorded the supply-reach window
+(`rxdate + rxsup - 1 >= studystartdate`) as "measured, output-identical".
+**It was never applied** — the search string in that edit had a
+trailing space and the replacement failed silently, so the measurement
+was of unchanged code. Applied properly it is measurably WORSE: exact
+ends 99.61% to 99.45%, with short cases rising from 40 to 98. It is not
+in the build.
+
+That is the second time an edit here reported a result it had not
+actually produced. Any change whose measurement shows NO movement at
+all should be treated as suspect until the code is confirmed changed.
+
+### The excess is concentrated, not uniform
+
+Comparing chain LENGTH per patient against `_groupwashfortrunk`:
+
+| | patients | extra rows here |
+|---|--:|--:|
+| chains identical in length | **4,091** | 0 |
+| longer here | 1,991 | +4,862 |
+| longer in SAS | 46 | -73 |
+
+and the patient sets themselves differ: 6,373 here against SAS's 6,128,
+so **245 patients carry a truncation chain here that SAS has none for
+at all**.
+
+Two-thirds of patients match exactly. That rules out a systematic
+difference in the stockpiling algorithm — which would perturb every
+chain — and points at a per-PATIENT difference in what enters the set.
+
+**The 245 extra patients turn out to be nearly harmless**: only 8 of
+them reach `cohort_final` at all, so the truncation dates computed for
+the rest are never consulted. Restricting the set to patients with an
+exposure claim removed them and changed parity not at all — while
+over-restricting the set to 1,137 patients against SAS's 6,128, so that
+is not SAS's rule either. Reverted.
+
+The difference that MATTERS is therefore the 1,991 patients whose
+chains are 2-3 claims longer, not the patient roster. Those patients
+are in both sets; SAS simply has fewer claims for them. Diffing the raw
+claims behind one such chain against `_groupwashfortrunk`, date by
+date, is the remaining question — and both sides are now on disk.
+
+### Two more hypotheses tested and reverted
+
+| tried | result |
+|---|---|
+| supply-reach window (`rxdate + rxsup - 1 >= studystartdate`) applied to the truncation set | **worse** — exact ends 99.61% to 99.45%, short cases 40 to 98 |
+| `rxamt > 0` scoped to the truncation set only (it had already measured worse applied globally) | **worse** — 99.61% to 99.57%, and it removed only 45 of the 5,308 excess rows |
+
+Neither is in the build. The second is worth noting as a near-miss:
+`ms_cidanum.sas:617` really does filter `rxsup > 0 and rxamt > 0`, but
+that clause guards a different extraction than the one feeding
+`_groupwashfortrunk`.
+
+### SOLVED: the chain must start at the enrolment window
+
+The debug datasets made the diff possible. A patient with ONE entry in
+SAS and two here:
+
+```
+patid 5372
+  SAS _groupwashfortrunk :  2015-08-08
+  here                   :  2015-05-11,  2015-08-09
+  raw FUT claims         :  ... 2015-05-11 (90d), 2015-08-08 (90d)
+```
+
+The 2015-05-11 claim's 90-day supply ends exactly **2015-08-08**. With
+it in the chain the 08-08 claim overlaps by one day and is pushed to
+08-09; without it there is no overlap and 08-08 stands. SAS excludes
+the earlier claim, so its truncation date is a day earlier — and that
+one day is the episode-end difference.
+
+**A truncation claim enters the chain only if its SUPPLY still runs at
+the start of the required prior-enrolment window**
+(`start_date - enr_days`). Taking every claim back to `claims_from`
+pulled in claims SAS never sees, and each extra one pushes everything
+after it further forward.
+
+| | before | after |
+|---|--:|--:|
+| identical episode end dates | 99.61% | **99.97%** |
+| ends too SHORT | 40 | **0** |
+| ends too long | 82 | **8** |
+| truncation claim rows | 70,840 | 66,964 (SAS 65,532) |
+| episodes | 31,444 | 31,440 (SAS 31,464) |
+
+### And then: non-dispensing exposure is not stockpiled either
+
+The last eight differences were all ONE patient, two episodes across
+four cohorts. The claims are filgrastim J-codes — procedure-sourced
+exposure, not dispensings:
+
+```
+patid 60364873, three pairs of same-day J1442 administrations
+  09-19 x2, 09-20 x2, 09-21 x2   (rxsup 1 each, no rxamt)
+  chained here ->  09-19..09-20, 09-21..09-22, 09-23..09-24
+  + expextper 30                   episode ends 2018-10-24
+  SAS                              episode ends 2018-10-21
+```
+
+Two defects in one place:
+
+* **Chaining.** SAS stockpiles `_ITDrugs` only, so procedure- and
+  diagnosis-sourced exposure keeps its own dates. This had already been
+  fixed for the truncation set and not for exposure.
+* **Same-day supply.** Two administrations of the same drug on one day
+  are ONE day of exposure. Summing them added a day per repeat.
+
+With both corrected the last exposure day is 2018-09-21, and
+`09-21 + 30 = 2018-10-21` — SAS's answer exactly.
+
+### SOLVED: the membership gap, by the same rule
+
+24 episodes were in SAS's master list and not here; none were here and
+absent from SAS. Traced through the funnel:
+
+| stage | of the 24 |
+|---|--:|
+| exposure claims exist on that date | 24 |
+| reach `index_candidates` / `pov1` | 18 |
+| reach `episodes` | 2 |
+| reach `ptsmasterlist` | 0 |
+
+A worked case — SAS has ONE episode for the patient, starting
+2016-08-15; this package chained that date into a longer episode and so
+never produced it as an index:
+
+```
+claims on their OWN dates : ... 2016-04-13 (90d, expires 2016-07-11)
+                                2016-08-15   -> gap 35 days  > episodegap 30
+                                             -> SAS starts a NEW episode
+stockpiled here           : ... 2016-05-12..2016-08-09
+                                2016-08-15   -> gap 5 days   -> merged
+```
+
+The accumulated push had closed a gap SAS leaves open. **The exposure
+chain needed the same start rule as the truncation chain**: a
+dispensing joins only if its supply still runs at
+`start_date - enr_days`.
+
+| | before | after |
+|---|--:|--:|
+| episodes only in SAS | 24 | **0** |
+| episodes only here | 0 | **0** |
+| episodes | 31,440 | **31,464 — exactly SAS** |
+| patients | 19,722 | **19,738 — exactly SAS** |
+
+## Episode-level parity is exact
+
+| metric | this package | SAS | |
+|---|--:|--:|---|
+| patients | 19,738 | 19,738 | **exact** |
+| episodes | 31,464 | 31,464 | **exact** |
+| episode END dates | 31,464 / 31,464 identical | | **exact** |
+| outcomes | 3 | 3 | **exact** |
+| denominator members | 2,503,074 | 2,502,986 | +0.0035% |
+| denominator member-days | 2,268,871,418 | 2,268,962,961 | -0.004% |
+
+Every episode SAS produces, this package produces, with the same index
+date and the same end date. The only remaining difference in the whole
+comparison is the denominator, at 88 members in 2.5 million.
+
+### Episode ends: the earlier measurement
+
+| | |
+|---|--:|
+| matched episodes | 31,440 |
+| **identical `EpisodeEndDt`** | **31,440 (100.000%)** |
+| too long | 0 |
+| too short | 0 |
+
+Worth noting how this was found. Three hypotheses reasoned from the
+macro source all failed — the supply-reach window against the study
+start, the amount filter, the patient roster. The answer came from
+diffing ONE small chain against SAS's own dataset and asking what made
+those two specific claims different. The debug data turned a search
+over rules into a search over rows.
+
+### Next step
+
+Diff the 8,304 claims present here and absent from
+`_groupwashfortrunk` against the 2,918 in the other direction. Both
+sets are on disk; the question is which FILTER SAS applies to the
+truncation claim set that this package does not, and the answer is a
+single query away rather than another hypothesis.
+
+
+---
+
+## The mstr column contract
+
+SAS's `<runid>_mstr` is one wide row per episode carrying everything.
+This package computed the same values and wrote them to `covariates`,
+`utilization` and `risk_scores`, so 53 of SAS's 92 columns were absent
+from the master list even though the numbers existed elsewhere.
+
+| | columns |
+|---|--:|
+| SAS `r01_mstr` | 92 |
+| before | 39 (53 missing) |
+| **after** | **101 (8 missing)** |
+
+Added: the 32 covariate flags, the utilization counts under SAS's
+names, `year`/`month`/`quarter`, `PeriodID`, `IndexLookEndDt`,
+`RawDisp`, `AdjustedDisp`, `TotRxSup`, `TotRxAmt`, `ttc`, and both the
+`fup_*` and `cens_*` censoring families — SAS writes the same flags
+under two names (ms_finalizeptsmasterlist.sas:394).
+
+Episode count and every parity figure are unchanged: 31,464 episodes,
+19,738 patients, ends exact.
+
+### The columns follow the STUDY, not this study
+
+Nothing about the shape is hardcoded. The covariate flags are
+generated from `study.covariates`, so a study with 15 covariates gets
+15 columns and a study with a non-contiguous set gets exactly those
+numbers:
+
+| study covariates | mstr columns |
+|---|---|
+| 1..12 | covar1 .. covar12 |
+| 1, 2 | covar1, covar2 |
+| 1, 5, 9 | **covar1, covar5, covar9** |
+
+A hardcoded `covar1..covar32` would have been right for this study and
+wrong for every other one.
+
+The utilization counts are gated on the stage having run: a study with
+no `utilfile` gets no `NumAV` at all, rather than a column of zeros.
+Two tests pin both behaviours, including the non-contiguous case.
+
+### The eight NOT added, and why
+
+`cci`, `censorcat_sort`, `death_enctype`, `death_source`,
+`distindexexp`, `distindexhoi`, `exactnumvisit`, `fupdays_value_cat`.
+
+Each needs a source this package does not model — the Charlson index,
+the death-record provenance fields, the distribution-index identifiers
+and the follow-up-day categorisation. **They are omitted rather than
+filled with zeros**, so their absence stays visible to anyone
+comparing. Writing a plausible 0 into `CCI` would be worse than leaving
+the column out.
+
+### A gap this exposed in the stage table
+
+The stage was declared in `STAGES` and `run()` never called it, so it
+silently did nothing — the table says which stages EXIST, but `run()`
+still orders them by hand. `test_plan_and_run_cannot_disagree_about_stages`
+checks that every stage names a real SQL file and a real gate; it does
+NOT check that `run()` actually invokes each one. That is worth
+closing: the declaration and the execution can still drift apart in
+this one direction.
+
+
+---
+
+## The denominator: what is and is not known
+
+With episodes exact, the denominator is the only numeric difference
+left: **+88 members in 2,502,986** (0.0035%), and member-days **91,543
+UNDER** (-0.004%).
+
+The per-cohort shape is unchanged by every episode fix:
+
+| difference | cohorts |
+|---|--:|
+| +1 | **30** |
+| +2 | 4 |
+| +3 | 2 |
+| +7 | 2 |
+| +15 | 2 |
+
+Thirty cohorts off by exactly one member says a single member qualifies
+here and not in SAS, repeated across cohorts that share a denominator
+configuration.
+
+### Checked with the debug data
+
+`attrition_level2` is SAS's list of the 4,738 members it excluded at
+the enrolment step. **Not one of them survives this package's
+enrolment filter** — so the enrolment rule is at least as strict as
+SAS's, and the extra member is not being let in there.
+
+Members OVER while member-days are UNDER is itself informative: it is
+not one rule applied too loosely. It looks like an extra member with a
+short eligible window, plus slightly too much time shaved elsewhere.
+
+### The denomcounts dataset settled half of it
+
+`r01_denomcounts` gave per-cohort member and member-day counts, and the
+per-cohort split was the clue:
+
+| cohort | member difference |
+|---|--:|
+| hctz_rupture_inc / hctz_splenec_inc | +15 |
+| war_rupture_inc / war_splenec_inc | +7 |
+| doac_*_inc | +3 |
+| antixa_*_inc | +2 |
+| all 20 `_prev` | +1 |
+
+**Every large difference was an `_inc` cohort** — the ones with a
+washout. The washout shave was computing its ineligible window from
+`exposure_claims`, the RAW claim dates, where SAS uses the STOCKPILED
+exposure: `ADate + 1` to `ExpireDt + washper`
+(ms_cidadenom.sas:461-478). Raw dates end the window early, so members
+re-enter the denominator sooner than SAS allows.
+
+| | before | after |
+|---|--:|--:|
+| member excess | +88 | **+40** |
+| cohorts with a per-cohort excess above 1 | 8 | **0** |
+| member-days | -91,543 | -140,321 |
+
+All 40 cohorts are now uniformly +1 member. The member-day figure moved
+the wrong way — a stockpiled expiry is later than a raw one, so the
+shave grew — and both numbers are now about 0.005% of their totals.
+The change is kept because it is what the source specifies and because
+it removed the entire structured part of the error; the remaining
+member-day gap is uniform rather than concentrated, which is a better
+starting point than the mixture it replaced.
+
+### The shave source is `_groupindex`, not every claim
+
+`ms_cidadenom.sas:459` shaves from `_groupindex` — the stockpiled
+exposure JOINED TO ENROLMENT — not from the full claim set. A
+dispensing filled outside any enrolment span never makes a member
+ineligible.
+
+The set sizes confirm it: SAS's `_groupindex` has **10,706** rows for
+`antixa_rupture_inc`; this package's stockpiled exposure has 10,927,
+and restricting it to claims inside an enrolment span gives **10,707**.
+
+Applied as a semi-join. It is **output-identical on this study** — the
+221 excluded claims all fall outside the denominator windows anyway —
+and is kept because it is what the macro specifies, with that
+measurement recorded so it is not mistaken for a fix.
+
+### Tried and rejected
+
+| tried | result |
+|---|---|
+| drop the `denom_end` pullback, now that the shave is correct | far worse: members +35,052, member-days +2,592,961. The pullback is essential; it is one day per member, and the residual deficit is 0.056 days per member, two orders smaller. |
+
+That bounds the problem usefully: the remaining -140,321 member-days
+cannot be a whole-day boundary rule applied to every member. It is the
+shave removing slightly too much from a small number of members.
+
+### The degenerate-period guard
+
+`ms_cidadenom.sas:467` drops periods whose start is past their end
+(`if UneligStart<=UneligEnd;`) BEFORE merging. On its own such a period
+shaves nothing, but carried into a running-max merge it can still
+extend a block, so the order matters.
+
+Now applied, between the raw periods and the merge. **Output-identical
+on this study** — no degenerate periods arise here — and confirmed
+applied by inspecting the file rather than inferring it from the
+unchanged numbers, which is how the same edit was mis-reported twice
+before.
+
+### The member-day gap is entirely the EXCLUSION shave
+
+Disabling that branch alone separates the two problems cleanly:
+
+| exclusion shave | members | member-days |
+|---|--:|--:|
+| OFF | +40 | **+445,775** |
+| ON | +40 | **-140,321** |
+
+So this package removes 586,096 days where SAS removes 445,775 —
+**31% too much** — and the member count is untouched either way. The
++40 members and the -140,321 days are two INDEPENDENT problems, not one
+rule with two symptoms.
+
+Checked and ruled out as the cause:
+
+* **Subcondition logic.** SAS shaves per `(COND, SUBCOND)` with
+  condition-level combination, which would over-remove if applied as a
+  flat union. But this study has exactly one condition with one
+  subcondition per cohort — 57 code groups all at `cond=1, subcond=1`,
+  window `(-183, -1)` — so a union over the codes IS the right
+  semantics here. Not the cause on this study, though it remains a real
+  structural difference for studies that use several subconditions.
+* **The claim window.** SAS shaves from `_IT<inclusioncodes>`, the
+  extracted claim set; this package read the raw domain tables
+  unbounded. Now windowed to match — **output-identical**, because the
+  extra claims produce shave periods outside the denominator windows
+  anyway. Kept as correctness, recorded as a no-op.
+
+The 31% excess is therefore in the shape of the shaved period rather
+than in which claims feed it.
+
+#### Reading the shave loop, which is NOT symmetric
+
+`ms_cidadenom.sas` branches on the SUBcondition flag, and the two sides
+do opposite things:
+
+| `SUBINCLUSION` | builds | calls |
+|---|---|---|
+| 1 | `EligStart` / `EligEnd` | **`%ms_shaveoutside`** — keep only time INSIDE |
+| 0 | `UneligStart` / `UneligEnd` | shave the period OUT |
+
+This study's exclusion rules carry `condinclusion = 0` (the CONDITION
+is an exclusion) with `subcond_inclusion = 1` (the SUBCONDITION is an
+inclusion), so SAS takes the **shaveoutside** path and then combines at
+the condition level using `&INCLUSION`. This package takes the periods
+straight to a shave-out. Those are not obviously the same operation.
+
+An empirical check argues the net polarity is nonetheless right:
+disabling the shave gives +445,775 days and enabling it -140,321, with
+SAS between the two. An inverted polarity would not land 31% off; it
+would be wildly wrong. So the composition is probably equivalent and
+the length differs.
+
+Both branches take the period END from `ExpireDt` rather than `ADate`
+when `dateonly = 'N'` (lines 197-201 and 305-308). `ExpireDt >= ADate`,
+so that makes SAS's period LONGER and would have it shave MORE — the
+opposite of what is observed. **That rules the `ExpireDt` difference
+out as the cause**, which is worth recording because it was the
+obvious next thing to try and it would have been wrong.
+
+#### SOLVED: inclusion codes matched across domains
+
+`cfg_inclusion_codes` carried no `codecat`. The join matched a claim
+against the RULE's domain, and every rule in this study sits at
+`cond = 1, subcond = 1` — 57 of them, spanning DX and PX. So a DX code
+matched PX claims and a PX code matched DX claims, because a sibling
+rule always supplied the other domain.
+
+That is the same defect class as the exposure join's missing
+vocabulary check, in a different table.
+
+| | before | after |
+|---|--:|--:|
+| denominator member-days | **-140,321** | **+8,033** |
+| as a share of 2.27 billion | -0.0062% | **+0.0004%** |
+| days removed by the shave | 586,096 | 445,775 wanted |
+
+A 17-fold improvement, and the cohort figures are untouched: 19,738
+patients, 31,464 episodes, 3 outcomes, all still exactly SAS.
+
+#### What the reading did and did not buy
+
+Three candidates were eliminated by reading the macro before any code
+changed — the period-end `ExpireDt` rule (wrong direction), the
+subcondition combination (one subcondition here), and the `codedays`
+overlap path (`codedays = 1` throughout). Each would have been a
+plausible change and each would have been wrong.
+
+The actual cause was found by checking a REGISTERED TABLE's columns
+rather than the macro: `cfg_inclusion_codes` was missing a field it
+needed. That is the third defect in this comparison found by looking at
+what the code feeds itself rather than at what SAS says — after the
+`stockgroup` on truncation codes, and the `codetype` on exposure
+claims.
+
+#### Where that leaves it
+
+The over-removal is not explained by: which claims feed the shave
+(windowed, no change), subcondition combination (one subcondition
+here), or the period end rule (wrong direction). What has not been
+checked is the condition-level combination — how `&INCLUSION` merges
+the subcondition results — and the `codedays > 1` overlap path, which
+builds `overlap_start` as a MAX across repeats and would shorten
+periods for codes requiring several occurrences.
+
+That is the next place to look, and it wants the macro read carefully
+rather than another guess: three changes reasoned from this file today
+were tested and reverted, and the one that worked came from diffing
+data, not from reading.
+
+### What remains: one member per cohort
+
+### Why this stops here
+
+The debug folder carries the POV and attrition intermediates — `_pov1`,
+`_pov4`, `_fut`, `_groupwashfortrunk`, `_ptsmasterlist`,
+`attrition_level*` — but **no denominator intermediates**. There is no
+`_denom*` dataset, so the row-by-row diff that solved the truncation
+chain in two queries cannot be repeated here.
+
+`DPLocal.<runid>_DenomCounts` arrived and settled the structured half
+of the gap (see above). What it cannot settle is the rest: it carries
+one row per cohort at level 000, so it gives TOTALS, not members. The
+remaining +1 per cohort is a single member per denominator
+configuration, and naming that member needs a member-level dataset —
+`_UneligGroupIndex`, `_DenomEligible`, or whatever `ms_cidadenom`
+leaves behind under `QRP_DEBUG`.
+
+Everything inferable from the macro text has now been applied:
+stockpiled dates, the `_groupindex` enrolment restriction, and the
+degenerate-period guard. The two that were output-identical are marked
+as such. What is left is not a rule this package has wrong in a way the
+source reveals — it is one member in 62,000 per cohort, and the next
+honest step is data rather than more reading.
+
+At 0.0035%, with patients, episodes, episode end dates and outcomes all
+exact, this is the last open numeric item and the smallest one.
+
+
+---
+
+## The remaining +40 members
+
+Full suite **286 passed, 2 skipped, 0 failed** across 288 after the
+domain-matching fix, which touches every inclusion path.
+
+| metric | this package | SAS | gap |
+|---|--:|--:|--:|
+| patients | 19,738 | 19,738 | **exact** |
+| episodes | 31,464 | 31,464 | **exact** |
+| episode END dates | 31,464 / 31,464 identical | | **exact** |
+| outcomes | 3 | 3 | **exact** |
+| denominator members | 2,503,026 | 2,502,986 | +0.0016% |
+| denominator member-days | 2,268,970,994 | 2,268,962,961 | +0.0004% |
+
+One extra member per cohort, uniformly across all 40. Since 40 cohorts
+share 20 denominator configurations, that is roughly twenty members.
+
+### Checked and eliminated
+
+| candidate | finding |
+|---|---|
+| missing demographics | none: every member has a sex (89,306 F / 84,758 M) and a birth date |
+| degenerate windows | none: no segment has `memberdays <= 0`, and none has `denom_start > denom_end` |
+| zero-day members | none: the smallest total is 1 day, held by 10 members |
+
+The extra members are ordinary. They are not being admitted by a
+boundary that lets an empty window through.
+
+### Further inference: five more candidates eliminated
+
+| candidate | how checked | finding |
+|---|---|---|
+| enrolment span construction | compared against SAS's own `Enr_Start`/`Enr_End` in `_pov1` | **all 1,171 spans match exactly**, zero mismatches — SAS's enrolment bridging and this package's agree |
+| an age restriction | study config | the study sets no age bounds, and its only stratum is level 000, so age cannot move a member count |
+| washout involvement | grouped the gap by `enr_days` / `wash_per` | both groups are +1 per cohort and ~+4,000 days: the cause is in the SHARED base window, not the washout |
+| window bounds | checked every segment against the query period | none starts before it or ends after it; min 2016-04-01, max 2024-12-30 |
+| demographics and degenerate windows | as above | complete, and no empty or negative segment |
+
+The `_pov1` comparison is the strongest of these. Enrolment is the
+foundation the denominator is built on, and it is now verified
+identical to SAS's at the span level rather than assumed.
+
+### What would settle it
+
+The +8,033 member-day surplus over +40 members is about 200 days each,
+which is consistent with the extra members accounting for the whole
+day surplus as well — so the two remaining figures are probably ONE defect, not
+two. That is a change from the earlier position, when the exclusion
+shave made them independent.
+
+Localising it needs a member-level denominator dataset —
+`_UneligGroupIndex`, `_DenomEligible`, or whatever `ms_cidadenom`
+leaves under `QRP_DEBUG`. `r01_denomcounts` gives totals only, and
+totals have now been pushed as far as they go: every structured part of
+the gap is closed, and what remains is twenty named individuals that no
+aggregate can identify.

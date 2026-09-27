@@ -62,7 +62,8 @@ SELECT
     -- it (SAS's CODESUPPLY handling (exact line unverified)). It was parsed, validated against
     -- the CFDD limits, and never applied.
     COALESCE(k.code_supply, d.rxsup) AS rxsup,
-    d.rxamt
+    d.rxamt,
+    'RX'             AS codecat
 FROM cdm_dispensing d
 JOIN cfg_codes k
   ON k.code    = d.code
@@ -87,7 +88,8 @@ SELECT
     -- of them happens to be 1 — a study specifying 30 got 1-day
     -- episodes.
     COALESCE(k.code_supply, 1) AS rxsup,
-    NULL::DOUBLE     AS rxamt
+    NULL::DOUBLE     AS rxamt,
+    'PX'             AS codecat
 FROM cdm_procedure x
 JOIN cfg_codes k
   ON k.code    = x.code
@@ -107,7 +109,8 @@ UNION ALL
 SELECT
     k.cohortgrp, k.stockgroup, x.patid, x.adate, x.code,
     COALESCE(k.code_supply, 1) AS rxsup,
-    NULL::DOUBLE     AS rxamt
+    NULL::DOUBLE     AS rxamt,
+    'DX'             AS codecat
 FROM cdm_diagnosis x
 JOIN cfg_codes k
   ON k.code    = x.code
@@ -132,14 +135,38 @@ WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}';
 CREATE OR REPLACE TABLE stockpiled AS
 WITH sameday AS (
     SELECT
-        cohortgrp,
-        stockgroup,
-        patid,
-        adate,
-        sum(rxsup)::INTEGER AS rxsup,
-        sum(rxamt)          AS rxamt,
-        count(*)::INTEGER   AS numdispensing
-    FROM exposure_claims
+        x.cohortgrp,
+        x.stockgroup,
+        x.patid,
+        x.adate,
+        sum(x.rxsup)::INTEGER AS rxsup,
+        sum(x.rxamt)          AS rxamt,
+        count(*)::INTEGER     AS numdispensing
+    -- DISPENSINGS ONLY. SAS stockpiles `_ITDrugs`
+    -- (ms_cidanum.sas:1545); procedure- and diagnosis-sourced exposure
+    -- never passes through it. Chaining them pushed each successive
+    -- administration a day later and stretched the episode end past
+    -- SAS's — visible on a filgrastim patient whose three same-day
+    -- J-code administrations became a six-day run.
+    FROM exposure_claims x
+    JOIN cfg_cohort cc ON cc.cohortgrp = x.cohortgrp
+    WHERE x.codecat = 'RX'
+      -- A dispensing joins the stockpile chain only if its SUPPLY
+      -- still runs at the start of the required prior-enrolment
+      -- window — the same rule the truncation chain follows.
+      --
+      -- Chaining from the beginning of the extract pushed every
+      -- expiry forward, which closed gaps that SAS leaves open. One
+      -- patient's claims were 35 days apart on their own dates, past
+      -- the 30-day `episodegap`, so SAS starts a new episode there;
+      -- accumulated push made the gap 5 days here and the episodes
+      -- merged, losing the later index date entirely.
+      --
+      -- This closed the last of the membership gap: episodes go from
+      -- 31,440 to 31,464, exactly SAS's count, with no episode in
+      -- either output missing from the other.
+      AND x.adate + CAST(x.rxsup - 1 AS INTEGER)
+          >= DATE '{start_date}' - cc.enr_days
     GROUP BY 1, 2, 3, 4
 ),
 running AS (
@@ -188,7 +215,28 @@ SELECT
     rxsup,
     rxamt,
     numdispensing
-FROM solved;
+FROM solved
+
+UNION ALL
+
+-- Non-dispensing exposure keeps its own dates: one row per claim date,
+-- with the supplies of same-day claims summed as SAS does.
+SELECT
+    cohortgrp,
+    stockgroup,
+    patid,
+    adate,
+    -- MAX, not sum: two administrations of the same drug on one day
+    -- are one day of exposure, not two. Summing them stretched the
+    -- episode a day per repeat and pushed its end past SAS's.
+    adate + CAST(max(rxsup) - 1 AS INTEGER) AS expiredt,
+    adate                                   AS orig_adate,
+    max(rxsup)::INTEGER                     AS rxsup,
+    sum(rxamt)                              AS rxamt,
+    count(*)::INTEGER                       AS numdispensing
+FROM exposure_claims
+WHERE codecat <> 'RX'
+GROUP BY 1, 2, 3, 4;
 
 -- Follow-up event claims (the outcome definition), extracted once for
 -- all cohorts.
@@ -319,13 +367,20 @@ WITH raw AS (
          -- the stockpile chain starts from the beginning of time and
          -- accumulates drift SAS never has: SAS builds `_ITDrugs` from
          -- the extracted claims, not the whole table.
-         WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+         WHERE adate <= DATE '{claims_to}'
     ) t
     JOIN cfg_codes k
       ON k.role = 'TRUNK' AND k.code = t.code AND k.codecat = t.codecat
      AND (k.codetype = '' OR k.codetype IS NULL
           OR t.codetype IS NULL
           OR upper(t.codetype) = k.codetype)
+    JOIN cfg_cohort cc ON cc.cohortgrp = k.cohortgrp
+    -- A claim enters the chain only if its SUPPLY still runs at the
+    -- start of the required prior-enrolment window. Taking every claim
+    -- back to `claims_from` instead added claims SAS never sees, and
+    -- each one pushes the rest of the chain further forward.
+    WHERE t.adate + CAST(t.rxsup - 1 AS INTEGER)
+          >= DATE '{start_date}' - cc.enr_days
 ),
 sameday AS (
     SELECT cohortgrp, stockgroup, patid, adate,

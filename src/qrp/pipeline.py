@@ -172,6 +172,40 @@ def _covar_strata_sql(study: StudyConfig) -> tuple[str, str, str, str]:
             "".join(final_parts))
 
 
+def _mstr_extra_columns(eng: Engine, study: StudyConfig) -> str:
+    """SAS's mstr carries a flag per covariate and the utilization
+    counts on the episode row itself; this package keeps them in
+    separate tables. Generated rather than static because the covariate
+    numbers come from the study.
+    """
+    parts: list[str] = []
+    for cov in sorted({c.covarnum for c in study.covariates}):
+        parts.append(
+            f",\n    EXISTS (SELECT 1 FROM covariates_long v "
+            f"WHERE v.cohortgrp = f.cohortgrp AND v.patid = f.patid "
+            f"AND v.indexdt = f.indexdt AND v.covarnum = {cov})"
+            f"::SMALLINT AS \"COVAR{cov}\"")
+
+    # Utilization counts, under SAS's names, only when that stage ran.
+    try:
+        have = {d[0].lower() for d in eng.con.execute(
+            "SELECT * FROM utilization LIMIT 0").description}
+    except Exception:
+        have = set()
+    for src, sas in (("enc_av", "NumAV"), ("enc_oa", "NumOA"),
+                     ("enc_ip", "NumIP"), ("enc_is", "NumIS"),
+                     ("enc_ed", "NumED"), ("enc_total", "NumVisits"),
+                     ("numrx", "numrx"), ("numgeneric", "NumGeneric"),
+                     ("numclass", "NumClass")):
+        if src not in have:
+            continue
+        parts.append(
+            f",\n    (SELECT u.{src} FROM utilization u "
+            f"WHERE u.cohortgrp = f.cohortgrp AND u.patid = f.patid "
+            f"AND u.indexdt = f.indexdt) AS \"{sas}\"")
+    return "".join(parts)
+
+
 def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
     """Widen `baseline` with one column per OBSERVED category level.
 
@@ -436,6 +470,9 @@ STAGES: tuple[Stage, ...] = (
     Stage("covariates",             "80_covariates.sql", "any_covariates",
           "covariates (none defined)"),
     Stage("baseline",               "96_baseline.sql", "any_covariates"),
+    # AFTER covariates and utilization: it reads `covariates_long` and
+    # `utilization`, which those stages build.
+    Stage("master list columns",    "62_mstr_wide.sql"),
     Stage("cida denominators",      "92_cidadenom.sql", "any_cida_tables"),
     Stage("cida tables",            "90_cidatables.sql", "any_cida_tables"),
     Stage("follow-up time table",   "94_followuptime.sql", "any_followuptime"),
@@ -885,13 +922,19 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
             # cond 1 — without criteria here they would pick up each
             # other's codes, which is exactly what happened on a real
             # study using condlevel 1 for both.
+            # `codecat` belongs on the CODE, not only on the rule.
+            # Several rules share one (cond, subcond), so matching a
+            # claim against the rule's domain let a DX code match a PX
+            # claim whenever any sibling rule was PX — cross-domain
+            # matching of exactly the kind the exposure join had.
             {"cohortgrp": r.cohortgrp, "criteria": r.criteria,
-             "cond": r.cond, "subcond": r.subcond, "code": code}
+             "cond": r.cond, "subcond": r.subcond, "code": code,
+             "codecat": r.codecat}
             for r in study.inclusions
             for code in r.codes
         ],
         """cohortgrp VARCHAR, criteria VARCHAR, cond INTEGER,
-           subcond INTEGER, code VARCHAR""",
+           subcond INTEGER, code VARCHAR, codecat VARCHAR""",
     )
 
     eng.register(
@@ -1298,6 +1341,10 @@ def run(
         widen = _baseline_dummies(eng, study)
         if widen:
             eng.con.execute(widen)
+
+    # Widen the master list once everything it references exists.
+    eng.script_stage("master list columns", "62_mstr_wide.sql",
+                     mstr_extra=_mstr_extra_columns(eng, study), **fmt)
 
     # The study output table. Only built when USERSTRATA defines t2cida
     # levels, which is SAS's own gate (`where lowcase(tableID)='t2cida'`
