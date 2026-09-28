@@ -192,7 +192,11 @@ CROSS JOIN (
            has_hispanic, has_year FROM cfg_strata WHERE tableid = 't2cida'
     UNION ALL
     SELECT '1', FALSE, FALSE, FALSE, FALSE, FALSE
-    WHERE NOT EXISTS (SELECT 1 FROM cfg_strata)
+    -- scoped to t2cida, matching the branch above. An unqualified
+    -- `NOT EXISTS (SELECT 1 FROM cfg_strata)` was satisfied by a
+    -- study that defines only t2followuptime levels, so neither branch
+    -- produced a row and censoring exported EMPTY.
+    WHERE NOT EXISTS (SELECT 1 FROM cfg_strata WHERE tableid = 't2cida')
 ) lv
 GROUP BY ALL
 ORDER BY 1, 2, 3;

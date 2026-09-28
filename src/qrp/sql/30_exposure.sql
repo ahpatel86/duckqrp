@@ -315,7 +315,10 @@ FROM (
                'PX' AS codecat
         FROM cdm_procedure
         UNION ALL
-        SELECT patid, adate, code, NULL AS codetype, '**' AS enctype,
+        -- the dispensing vocabulary is real and must not be discarded:
+        -- hardcoding NULL here made every configured RX vocabulary
+        -- match any dispensing code string
+        SELECT patid, adate, code, codetype, '**' AS enctype,
                '' AS pdx, 'RX' AS codecat
         FROM cdm_dispensing
     ) x
@@ -323,6 +326,12 @@ FROM (
       ON k.code    = x.code
      AND k.role    = 'EVENT'
      AND k.codecat = x.codecat
+     -- Same vocabulary policy as the exposure join. Without it a code
+     -- configured as ICD-10 matched the same string recorded as ICD-9,
+     -- counting outcomes the study never defined.
+     AND (k.codetype = '' OR k.codetype IS NULL
+          OR x.codetype IS NULL
+          OR upper(x.codetype) = k.codetype)
     JOIN cfg_cohort c
       ON c.cohortgrp = k.cohortgrp
     JOIN cfg_care_setting cs
@@ -418,5 +427,11 @@ FROM (
 ) t
 JOIN cfg_codes k
   ON k.role = 'TRUNK' AND k.code = t.code AND k.codecat = t.codecat
+ -- Same missing-vocabulary policy as the drug branch above: a NULL
+ -- SOURCE vocabulary cannot contradict the configured one. The two
+ -- branches differed, so a diagnosis-sourced truncation code was
+ -- dropped by an extract that omits codetype while a drug-sourced one
+ -- was kept.
  AND (k.codetype = '' OR k.codetype IS NULL
+      OR t.codetype IS NULL
       OR upper(t.codetype) = k.codetype);

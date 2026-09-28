@@ -2245,3 +2245,35 @@ leaves under `QRP_DEBUG`. `r01_denomcounts` gives totals only, and
 totals have now been pushed as far as they go: every structured part of
 the gap is closed, and what remains is twenty named individuals that no
 aggregate can identify.
+
+
+---
+
+## Third review (at 0915de2): six remaining findings
+
+The review confirmed ten earlier concerns closed and listed six open.
+All six are now addressed.
+
+| severity | finding | fix |
+|---|---|---|
+| **High, carried over** | EVENT/IOC joins omit vocabulary matching | both joins now apply the same policy as the exposure join. The event source also hardcoded `NULL AS codetype` on its RX branch, discarding the dispensing vocabulary entirely — that is fixed too. |
+| **Medium, new regression** | follow-up-time-only studies export an EMPTY censoring table | the fallback checked for "no strata at all" while the main branch filtered to `t2cida`, so a study defining only `t2followuptime` levels satisfied neither. Scoped the check to `t2cida`. **This regression was introduced by my own tableid split**, which shows the value of a review pass after a fix. |
+| **Medium** | an extract without optional `race` still crashes | optional-column resolution is now GENERAL, covering `chart`, `race`, `hispanic`, `postalcode` and `postalcode_date`, including the demographic tie-break `ORDER BY`. Verified against an extract with all five removed: identical results, 61,725 episodes. |
+| **Low** | non-drug truncation lacks the drug branch's missing-vocabulary policy | branches aligned. |
+| **Low** | stale-CSV assertions can pass when stale files remain | rewritten against a clean run, and **verified to fail when cleanup is deliberately broken** — the previous version could not fail at all. |
+| (carried) | malformed lab criteria still disable the filter after a warning | a nonempty unparseable criterion now RAISES. A warning does not prevent silent broadening, because warnings are not read before results are. |
+
+Parity is unaffected: 19,738 patients, 31,464 episodes, 3 outcomes,
+all still exactly SAS.
+
+### One test left deliberately weak, and named as such
+
+`test_event_and_ioc_joins_enforce_vocabulary` is STRUCTURAL — it
+asserts the shipped SQL carries the predicate rather than observing a
+claim being excluded. A behavioural version needs a fixture whose event
+codes are defined ONLY with a vocabulary; the bundled demo study also
+defines them without one, and a permissive entry matches everything, so
+a behavioural assertion against it passes whether or not the fix is
+present. Two attempts at a behavioural test both passed vacuously
+before this was understood, which is exactly the failure the review
+caught in the CSV test.

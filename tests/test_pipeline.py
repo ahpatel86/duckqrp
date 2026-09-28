@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+import qrp
+
 from qrp import Engine, load_study, run
 
 STUDY = Path(__file__).resolve().parents[1] / "study" / "demo_full.json"
@@ -2583,7 +2585,13 @@ def test_lab_result_criterion_parsing():
     assert p("-2:2") == (":", -2.0, 2.0)         # negative lower bound
     assert p("7") == ("=", 7.0, None)
     assert p("") == (None, None, None)
-    assert p("nonsense") == (None, None, None)
+    # A NONEMPTY criterion that cannot be parsed is a configuration
+    # error, not an absent filter. Returning the sentinel let a typo in
+    # a threshold silently broaden the extraction, and a warning does
+    # not stop that because warnings are not read before results are.
+    for bad in ("nonsense", ">=bad", "5-10"):
+        with pytest.raises(ValueError, match="labresult"):
+            p(bad)
 
 
 def _lab_study(codes):
@@ -6583,33 +6591,38 @@ def test_denominator_key_separates_different_exclusions():
 
 def test_rerun_clears_stale_csv_copies():
     """`--csv` writes copies under {lib}/csv/, which the run-scoped
-    cleanup did not reach. Switching naming mode left the old name's
-    CSV beside the new one's, where it reads as a second result rather
-    than a leftover.
+    cleanup did not reach.
+
+    The earlier version of this test asserted set differences that are
+    disjoint by construction — `(first - second) & second` is ALWAYS
+    empty — so it could not fail no matter how many stale files
+    survived. It is now written against a clean run: the reused
+    directory must end up holding exactly the files a fresh directory
+    would.
     """
     import tempfile
 
     from qrp import run as _run
 
-    out = Path(tempfile.mkdtemp())
     study = load_study(STUDY)
 
-    _run(study, DATA, output_dir=str(out), names="sas", csv=True,
+    reused = Path(tempfile.mkdtemp())
+    _run(study, DATA, output_dir=str(reused), names="sas", csv=True,
          verbose=False)
-    first = {p.name for p in out.rglob("csv/*.csv")}
-    assert first, "no CSV copies were written"
-
-    _run(study, DATA, output_dir=str(out), names="logical", csv=True,
+    _run(study, DATA, output_dir=str(reused), names="logical", csv=True,
          verbose=False)
-    second = {p.name for p in out.rglob("csv/*.csv")}
 
-    # the two modes must actually differ, or this proves nothing
-    assert first != second, "both naming modes produced the same names"
-    # and nothing from the first run may survive
-    assert not (first - second) & second
-    assert second.isdisjoint(first - second)
-    leftover = {p.name for p in out.rglob("csv/*.csv")} - second
-    assert not leftover, ("stale CSV files survived the rerun", leftover)
+    clean = Path(tempfile.mkdtemp())
+    _run(study, DATA, output_dir=str(clean), names="logical", csv=True,
+         verbose=False)
+
+    def csvs(root):
+        return {p.relative_to(root).as_posix()
+                for p in root.rglob("csv/*.csv")}
+
+    stale = csvs(reused) - csvs(clean)
+    assert not stale, ("stale CSV files survived the rerun", sorted(stale))
+    assert csvs(clean), "no CSV copies were written at all"
 
 
 def test_enrollment_without_the_optional_chart_column():
@@ -6970,3 +6983,64 @@ def test_inclusion_codes_are_matched_within_their_own_domain():
         assert blank == 0, blank
     finally:
         eng.close()
+
+
+def test_event_and_ioc_joins_enforce_vocabulary():
+    """EVENT and IOC claims must match the CONFIGURED vocabulary.
+
+    Both joins matched on code and domain only, so a code configured as
+    ICD-10 also matched the same string recorded as ICD-9 — counting
+    outcomes and washout claims the study never defined. The RX branch
+    of the event source additionally hardcoded `NULL AS codetype`,
+    discarding the dispensing vocabulary outright.
+
+    This check is STRUCTURAL, and that is a weakness worth stating: it
+    asserts the shipped SQL carries the predicate rather than observing
+    a claim being excluded. A behavioural version needs a fixture whose
+    event codes are defined ONLY with a vocabulary; the bundled demo
+    study also defines them without one, and a permissive entry matches
+    everything, so a behavioural assertion against it passes whether or
+    not the fix is present.
+    """
+    sql_dir = Path(qrp.__file__).parent / "sql"
+    exposure = (sql_dir / "30_exposure.sql").read_text()
+    followup = (sql_dir / "60_followup.sql").read_text()
+
+    # the event source must not throw the dispensing vocabulary away
+    assert "NULL AS codetype" not in exposure, (
+        "the RX branch hardcodes a NULL vocabulary, so every configured "
+        "RX vocabulary matches any dispensing code")
+
+    guard = "OR upper(x.codetype) = k.codetype"
+    assert exposure.count(guard) >= 1, "EVENT join lost its vocabulary check"
+    assert guard in followup, "IOC join lost its vocabulary check"
+    # and both must accept a NULL SOURCE vocabulary
+    for text, name in ((exposure, "30_exposure"), (followup, "60_followup")):
+        assert "x.codetype IS NULL" in text, name
+
+
+def test_censoring_survives_a_followuptime_only_study():
+    """The censoring fallback was scoped to "no strata at all" while
+    the main branch filtered to t2cida, so a study defining only
+    t2followuptime levels produced NEITHER — and exported an empty
+    censoring table. A regression introduced by the tableid split."""
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    def censor_rows(strata):
+        eng = Engine(verbose=False)
+        try:
+            run(load_study_dict({**base, "userstrata": strata}), DATA,
+                engine=eng, verbose=False)
+            return eng.count("censoring")
+        finally:
+            eng.close()
+
+    only_fup = censor_rows(
+        [{"tableid": "t2followuptime", "levelid": "7", "levelvars": "sex"}])
+    only_cida = censor_rows(
+        [{"tableid": "t2cida", "levelid": "1", "levelvars": ""}])
+    assert only_fup > 0, "a follow-up-time-only study exported no censoring"
+    assert only_fup == only_cida

@@ -27,16 +27,25 @@ UNION ALL
 -- silently never matching.
 SELECT k.cohortgrp, x.patid, x.adate
 FROM (
-    SELECT patid, adate, code, 'DX' AS codecat FROM cdm_diagnosis
+    -- codetype is carried so the VOCABULARY can be matched. Without it
+    -- a code configured as ICD-10 matched the same string recorded as
+    -- ICD-9, admitting washout claims the study never asked for.
+    SELECT patid, adate, code, 'DX' AS codecat, codetype FROM cdm_diagnosis
     UNION ALL
-    SELECT patid, adate, code, 'PX' AS codecat FROM cdm_procedure
+    SELECT patid, adate, code, 'PX' AS codecat, codetype FROM cdm_procedure
     UNION ALL
-    SELECT patid, adate, code, 'RX' AS codecat FROM cdm_dispensing
+    SELECT patid, adate, code, 'RX' AS codecat, codetype FROM cdm_dispensing
 ) x
 JOIN cfg_codes k
   ON k.code    = x.code
  AND k.role    = 'IOC'
- AND k.codecat = x.codecat;
+ AND k.codecat = x.codecat
+ -- Same policy as the exposure join: an unset CONFIGURED vocabulary
+ -- matches anything, and a NULL SOURCE vocabulary cannot contradict
+ -- the configured one (extracts may omit the column entirely).
+ AND (k.codetype = '' OR k.codetype IS NULL
+      OR x.codetype IS NULL
+      OR upper(x.codetype) = k.codetype);
 
 -- Most recent disqualifying claim strictly before each index date.
 -- A view: consumed once, by cohort_final.

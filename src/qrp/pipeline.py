@@ -1129,12 +1129,28 @@ def run(
     # `chart` is OPTIONAL in SCDM. Referencing it unconditionally made
     # an enrolment file that carries every REQUIRED column fail with a
     # binder error, so a valid extract could not be read at all.
-    enr = reads.get("read_enrollment", "")
-    enr_cols: set[str] = set()
-    if enr and not enr.startswith("("):
-        enr_cols = {c.lower() for c in columns_of(
-            enr.split("('", 1)[1].rsplit("')", 1)[0])}
-    chart_col = "chart" if "chart" in enr_cols else "NULL"
+    # Every column the SCDM declares OPTIONAL is resolved against the
+    # actual extract and falls back to NULL. Referencing one that is
+    # absent makes DuckDB raise a BinderException, so an extract with
+    # every REQUIRED column could still be unreadable — first seen with
+    # `chart`, then again with `race`. Resolving them one at a time as
+    # each is reported does not converge; this covers the declared set.
+    def _optional(read_key: str, *names: str) -> dict[str, str]:
+        src = reads.get(read_key, "")
+        have: set[str] = set()
+        if src and not src.startswith("("):
+            have = {c.lower() for c in columns_of(
+                src.split("('", 1)[1].rsplit("')", 1)[0])}
+        return {n: (n if n in have else "NULL") for n in names}
+
+    optional_cols: dict[str, str] = {}
+    for key, cols in (
+        ("read_enrollment", ("chart",)),
+        ("read_demographic", ("race", "hispanic",
+                              "postalcode", "postalcode_date")),
+    ):
+        optional_cols.update(_optional(key, *cols))
+    chart_col = optional_cols["chart"]
 
     fmt = {
         **reads,
@@ -1143,6 +1159,7 @@ def run(
         # treats that as "match any", which is the old behaviour.
         "dispensing_codetype": ct_col or "NULL",
         "enrollment_chart": chart_col,
+        **{f"opt_{k}": v for k, v in optional_cols.items()},
         "indata": str(Path(indata)).rstrip("/"),
         "start_date": study.start_date.isoformat(),
         "end_date": study.end_date.isoformat(),

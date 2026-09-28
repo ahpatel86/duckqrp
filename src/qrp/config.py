@@ -149,18 +149,20 @@ def parse_lab_result(spec: Any) -> tuple[str | None, float | None, float | None]
         return (None, None, None)
 
     def _bad(why: str) -> tuple[None, None, None]:
-        # A criterion that cannot be parsed is DROPPED, which makes the
-        # extraction broader than intended — the dangerous direction,
-        # and the same reason unsupported inclusion rules warn. Silence
-        # here meant a typo in a lab threshold quietly removed the
-        # threshold. Reported in review.
-        import warnings as _w
-        _w.warn(
-            f"labresult {raw!r} {why}; the criterion is IGNORED, so this "
-            f"lab code extracts more records than the study intends",
-            stacklevel=3,
+        # A nonempty criterion that cannot be parsed is a CONFIGURATION
+        # ERROR, not an absent filter. Returning the no-filter sentinel
+        # made a typo in a lab threshold silently broaden the
+        # extraction — the dangerous direction — and a warning does not
+        # stop that, because warnings are not read before results are.
+        raise ValueError(
+            f"labresult {raw!r} {why}. A lab criterion that cannot be "
+            f"parsed would silently remove the threshold and extract "
+            f"more records than the study intends, so it is rejected. "
+            f"Use a comparison such as '>=10', a range such as "
+            f"'5:10' (a colon, not a hyphen, which SAS reads as a "
+            f"minus sign), or leave it blank for no criterion."
         )
-        return (None, None, None)
+
 
     if ":" in raw:
         lo_s, _, hi_s = raw.partition(":")

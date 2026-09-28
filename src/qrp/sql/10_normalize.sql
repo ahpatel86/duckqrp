@@ -40,10 +40,10 @@ SELECT
     upper(CAST(sex AS VARCHAR))      AS sex_raw,
     CASE WHEN upper(CAST(sex AS VARCHAR)) IN ('F','M')
          THEN upper(CAST(sex AS VARCHAR)) ELSE 'O' END AS sex,
-    upper(COALESCE(CAST(race AS VARCHAR), 'M'))     AS race,
-    upper(COALESCE(CAST(hispanic AS VARCHAR), 'U')) AS hispanic,
-    CAST(postalcode AS VARCHAR)      AS zip,
-    CAST(postalcode_date AS DATE)    AS zip_date
+    upper(COALESCE(CAST({opt_race} AS VARCHAR), 'M'))     AS race,
+    upper(COALESCE(CAST({opt_hispanic} AS VARCHAR), 'U')) AS hispanic,
+    CAST({opt_postalcode} AS VARCHAR)      AS zip,
+    CAST({opt_postalcode_date} AS DATE)    AS zip_date
 FROM {read_demographic}
 -- The ORDER BY is a TOTAL order, not just `birth_date`. Two demographic
 -- rows sharing a birth date would otherwise be resolved arbitrarily and
@@ -51,7 +51,10 @@ FROM {read_demographic}
 -- order is a latent parity failure; see tests/test_determinism.py.
 QUALIFY row_number() OVER (
     PARTITION BY patid
-    ORDER BY birth_date, sex, race, hispanic, postalcode
+    -- the tie-break must use the RESOLVED optional columns too,
+    -- or an extract lacking them fails here instead
+    ORDER BY birth_date, sex, {opt_race}, {opt_hispanic},
+             {opt_postalcode}
 ) = 1;
 -- ^ QUALIFY: the whole row_number()-then-filter-then-drop dance from the
 --   PySpark port collapses to one clause. Used throughout this package.
