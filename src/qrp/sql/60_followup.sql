@@ -341,3 +341,120 @@ WHERE
               AND b.adate BETWEEN m.indexdt
                               AND m.indexdt + c.blackout_per - 1
         ));
+
+-- ------------------------------------------------------------------
+-- Supply and amount WITHIN the episode, as SAS reports them.
+--
+-- SAS's TotRxSup sums the days of each dispensing that fall inside
+-- [IndexDt, EpisodeEndDt] — supply is CLIPPED to the episode window
+-- (its utilization macro is called with refend=EpisodeEndDt,
+-- ms_createptsmasterlist.sas:210-240). An episode truncated after 17
+-- days of a 90-day fill carries TotRxSup = 17, not 90. TotRxAmt is the
+-- dispensed amount PRORATED by the same fraction.
+--
+-- This package reported the uncapped episode supply as `daysupp`
+-- (+17% against SAS) and the INDEX dispensing's amount alone as
+-- `amtsupp` (-73%) — days and amount measured over different things.
+-- Checked per episode against SAS's master list: the clipped supply
+-- matches on 31,453 of 31,464 episodes, the prorated amount on 30,865.
+--
+-- The window ends where FOLLOW-UP ends, not where the episode ends: an
+-- outcome event stops the count (SAS's TotRxSup for wp307's warfarin
+-- patient 82014737 is 10 + 19 days, clipped at the first event on
+-- 2024-05-13, not 10 + 30 to the episode end).
+-- ------------------------------------------------------------------
+-- Amount: SAS shaves each FILL to ENROLMENT before same-day fills are
+-- combined (as it shaves claims before stockpiling), then prorates the
+-- combination over its overlap with the window.
+-- wp307 patient 153716000: two fills on the index date, 21 days/42 units
+-- and 60 days/60 units, 50 days of follow-up. Prorating the combined row
+-- once gives 102 x 50/81 = 62.963; SAS has 92 x 50/71 = 64.7887 — the
+-- 60-day fill cut to 50 days/50 units at the END OF ENROLMENT (2023-10-31),
+-- plus the 21-day fill whole. Clipping at the episode window instead was
+-- tried and was wrong: patient 164261173's two same-day fills run past
+-- the window but not past enrolment, and SAS prorates them once
+-- (254 x 64/118 = 137.7627).
+-- For a single fill, or same-day fills all inside the window, the two
+-- formulas are identical, so this changes only rows that combine
+-- several fills cut differently by the window end.
+CREATE OR REPLACE TABLE cohort_final AS
+WITH win AS (
+    SELECT cohortgrp, patid, indexdt, enr_end,
+           least(episodeenddt, coalesce(feventdt, episodeenddt)) AS fe
+    FROM cohort_final
+),
+rx AS (
+    -- dispensings, from the chain; same-day procedure duplicates are
+    -- counted from the raw rows below, as SAS counts every row
+    SELECT s.cohortgrp, s.patid, s.stockgroup, s.orig_adate,
+           s.adate, s.expiredt, s.rxsup, s.rxamt
+    FROM stockpiled s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM exposure_claims x
+        WHERE x.codecat <> 'RX' AND x.cohortgrp = s.cohortgrp
+          AND x.stockgroup = s.stockgroup AND x.patid = s.patid
+          AND x.adate = s.orig_adate)
+),
+rx_ep AS (
+    SELECT w.cohortgrp, w.patid, w.indexdt, w.fe, w.enr_end, r.stockgroup,
+           r.orig_adate, r.adate, r.rxsup, r.rxamt,
+           date_diff('day', greatest(r.adate, w.indexdt),
+                            least(r.expiredt, w.fe)) + 1 AS ov
+    FROM win w
+    JOIN rx r ON r.cohortgrp = w.cohortgrp AND r.patid = w.patid
+             AND r.adate <= w.fe AND r.expiredt >= w.indexdt
+),
+rx_rows AS (
+    -- each constituent fill clipped to the window, from the row's
+    -- chained start
+    SELECT e.cohortgrp, e.patid, e.indexdt, e.adate, e.stockgroup, e.ov,
+           any_value(e.rxamt) AS row_amt, any_value(e.rxsup) AS row_sup,
+           -- DECIMAL, not DOUBLE: a parallel sum of doubles can round
+           -- differently with the thread count (caught by
+           -- test_output_is_thread_count_invariant); decimal sums are exact
+           sum(CAST(x.rxamt * greatest(0, date_diff('day', e.adate,
+                   least(e.adate + CAST(x.rxsup - 1 AS INTEGER), e.enr_end)) + 1)
+               / x.rxsup AS DECIMAL(38, 12)))                     AS amt_c,
+           sum(greatest(0, date_diff('day', e.adate,
+                   least(e.adate + CAST(x.rxsup - 1 AS INTEGER), e.enr_end)) + 1))
+                                                                  AS sup_c
+    FROM rx_ep e
+    LEFT JOIN exposure_claims x
+      ON x.codecat = 'RX' AND x.cohortgrp = e.cohortgrp
+     AND x.stockgroup = e.stockgroup AND x.patid = e.patid
+     AND x.adate = e.orig_adate
+    GROUP BY e.cohortgrp, e.patid, e.indexdt, e.adate, e.stockgroup, e.ov
+),
+other AS (
+    SELECT w.cohortgrp, w.patid, w.indexdt,
+           date_diff('day', greatest(x.adate, w.indexdt),
+                     least(x.adate + CAST(x.rxsup - 1 AS INTEGER), w.fe)) + 1 AS ov,
+           x.rxamt, x.rxsup
+    FROM win w
+    JOIN exposure_claims x
+      ON x.codecat <> 'RX' AND x.cohortgrp = w.cohortgrp AND x.patid = w.patid
+     AND x.adate <= w.fe
+     AND x.adate + CAST(x.rxsup - 1 AS INTEGER) >= w.indexdt
+),
+totals AS (
+    SELECT cohortgrp, patid, indexdt, sum(ov) AS totrxsup,
+           CAST(sum(amt) AS DOUBLE) AS totrxamt
+    FROM (
+        SELECT cohortgrp, patid, indexdt, ov,
+               -- the constituents, if found; the row's own figures otherwise
+               CAST(coalesce(amt_c * ov / nullif(sup_c, 0), row_amt * ov / row_sup)
+                    AS DECIMAL(38, 12)) AS amt
+        FROM rx_rows
+        UNION ALL
+        SELECT cohortgrp, patid, indexdt, ov,
+               CAST(rxamt * ov / rxsup AS DECIMAL(38, 12)) FROM other
+    )
+    GROUP BY 1, 2, 3
+)
+SELECT
+    f.*,
+    COALESCE(t.totrxsup, 0)   AS episode_totrxsup,
+    COALESCE(t.totrxamt, 0.0) AS episode_totrxamt
+FROM cohort_final f
+LEFT JOIN totals t
+  ON t.cohortgrp = f.cohortgrp AND t.patid = f.patid AND t.indexdt = f.indexdt;

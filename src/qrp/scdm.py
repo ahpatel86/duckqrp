@@ -51,6 +51,12 @@ class TableSpec:
     # reader then had to write `spec.column_aliases or {}`.
     column_aliases: Mapping[str, tuple[str, ...]] = field(
         default_factory=dict)
+    # Whether a table missing BY NAME is searched for by column
+    # fingerprint. Fingerprinting reads every file's metadata (0.8-1.6s,
+    # most of a small run), so it is skipped for a table whose absence is
+    # common and has a fallback; such a table can still be named with
+    # `table_map`.
+    fingerprint: bool = True
     # A site with no death file should still be able to run, with death
     # censoring simply never triggering — better than refusing.
     optional_table: bool = False
@@ -102,7 +108,20 @@ SCDM: tuple[TableSpec, ...] = (
         aliases=("proc", "procedures"),
         optional_table=True,
     ),
-    TableSpec("encounter", (), (), "care setting, encounter-based events", used=False),
+    # Read for medical utilization: SAS counts visits (NumAV, NumOA, NumIP,
+    # NumED) from the ENCOUNTER table (ms_computeutilization.sas:139).
+    # Counting them from diagnosis claims missed encounters with no
+    # diagnosis — wp307: NumAV 56 short over 38 episodes, NumOA 559 short
+    # over 264. Optional: without it, visits come from diagnosis claims.
+    TableSpec(
+        "encounter",
+        ("patid", "adate", "enctype"),
+        ("encounterid",),
+        "medical utilization visit counts",
+        aliases=("enc", "encounters"),
+        optional_table=True,
+        fingerprint=False,
+    ),
     TableSpec(
         "lab_result",
         # Verified against a real SCDM lab extract. There is NO

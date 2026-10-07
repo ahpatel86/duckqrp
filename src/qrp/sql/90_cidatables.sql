@@ -40,8 +40,9 @@ WITH base AS (
         -- count and AdjustedDisp the post-stockpiling count.
         c.numdispensing                               AS rawdisp,
         1                                             AS adjusteddisp,
-        c.episode_rxsup                               AS totrxsup,
-        c.rxamt                                       AS totrxamt,
+        -- clipped to the episode window; see 60_followup.sql
+        c.episode_totrxsup                            AS totrxsup,
+        c.episode_totrxamt                            AS totrxamt,
         c.numevents                                   AS numevents,
         c.has_event                                   AS hadevent,
         c.person_days                                 AS followuptime,

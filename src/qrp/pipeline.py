@@ -172,19 +172,44 @@ def _covar_strata_sql(study: StudyConfig) -> tuple[str, str, str, str]:
             "".join(final_parts))
 
 
-def _mstr_extra_columns(eng: Engine, study: StudyConfig) -> str:
+def _mstr_extra_columns(eng: Engine, study: StudyConfig) -> tuple[str, str]:
     """SAS's mstr carries a flag per covariate and the utilization
     counts on the episode row itself; this package keeps them in
     separate tables. Generated rather than static because the covariate
     numbers come from the study.
+
+    Returns `(select_columns, joins)` for 62_mstr_wide.sql.
+
+    ONE pivot over `covariates_long` and ONE join to `utilization`,
+    whatever the number of covariates. The first version emitted a
+    correlated EXISTS per covariate and a scalar subquery per count — 25
+    and 9 separate lookups on wp307 — so the work grew with episodes x
+    covariates. At 20x wp307's sample (630k episodes, 8.9M covariate
+    rows) under a 2GB memory and 2GB spill budget it ran out of memory;
+    the pivot finished in 5-6s. It is also 4x faster at 1x (0.17s against
+    0.70s), with identical output.
+
+    These joins are invisible to the static join-budget test, which reads
+    the .sql template and sees only the placeholder; a dedicated test
+    checks the generated SQL instead.
     """
-    parts: list[str] = []
-    for cov in sorted({c.covarnum for c in study.covariates}):
-        parts.append(
-            f",\n    EXISTS (SELECT 1 FROM covariates_long v "
-            f"WHERE v.cohortgrp = f.cohortgrp AND v.patid = f.patid "
-            f"AND v.indexdt = f.indexdt AND v.covarnum = {cov})"
-            f"::SMALLINT AS \"COVAR{cov}\"")
+    covs = sorted({c.covarnum for c in study.covariates})
+    cols: list[str] = []
+    joins: list[str] = []
+    if covs:
+        flags = ",\n        ".join(
+            f'max((v.covarnum = {k})::SMALLINT) AS "COVAR{k}"' for k in covs)
+        joins.append(
+            "\nLEFT JOIN (\n"
+            "    SELECT v.cohortgrp, v.patid, v.indexdt,\n"
+            f"        {flags}\n"
+            "    FROM covariates_long v\n"
+            "    GROUP BY v.cohortgrp, v.patid, v.indexdt\n"
+            ") cv ON cv.cohortgrp = f.cohortgrp AND cv.patid = f.patid "
+            "AND cv.indexdt = f.indexdt")
+        cols.extend(
+            f',\n    coalesce(cv."COVAR{k}", 0)::SMALLINT AS "COVAR{k}"'
+            for k in covs)
 
     # Utilization counts, under SAS's names, only when that stage ran.
     try:
@@ -192,18 +217,45 @@ def _mstr_extra_columns(eng: Engine, study: StudyConfig) -> str:
             "SELECT * FROM utilization LIMIT 0").description}
     except Exception:
         have = set()
-    for src, sas in (("enc_av", "NumAV"), ("enc_oa", "NumOA"),
-                     ("enc_ip", "NumIP"), ("enc_is", "NumIS"),
-                     ("enc_ed", "NumED"), ("enc_total", "NumVisits"),
-                     ("numrx", "numrx"), ("numgeneric", "NumGeneric"),
-                     ("numclass", "NumClass")):
-        if src not in have:
-            continue
-        parts.append(
-            f",\n    (SELECT u.{src} FROM utilization u "
-            f"WHERE u.cohortgrp = f.cohortgrp AND u.patid = f.patid "
-            f"AND u.indexdt = f.indexdt) AS \"{sas}\"")
-    return "".join(parts)
+    util = [(src, sas) for src, sas in (
+                ("enc_av", "NumAV"), ("enc_oa", "NumOA"),
+                ("enc_ip", "NumIP"), ("enc_is", "NumIS"),
+                ("enc_ed", "NumED"), ("enc_days", "ExactNumVisit"),
+                ("numrx", "numrx"), ("numgeneric", "NumGeneric"),
+                ("numclass", "NumClass"))
+            if src in have]
+    if util:
+        joins.append(
+            "\nLEFT JOIN utilization u ON u.cohortgrp = f.cohortgrp "
+            "AND u.patid = f.patid AND u.indexdt = f.indexdt")
+        # NULL where SAS did not compute utilization (non-baseline
+        # cohorts), as SAS leaves it — not zero
+        cols.extend(f',\n    CASE WHEN u.util_computed THEN u.{src} END AS "{sas}"'
+                    for src, sas in util)
+        if "enc_days" in have:
+            # SAS's NumVisits is a CATEGORY of ExactNumVisit, blank where
+            # utilization was not computed; it held the numeric total
+            cols.append(
+                ',\n    CASE WHEN NOT coalesce(u.util_computed, FALSE) THEN \'\''
+                " WHEN u.enc_days = 0 THEN '0' WHEN u.enc_days = 1 THEN '1'"
+                " WHEN u.enc_days <= 7 THEN '2-7' ELSE '8+' END AS \"NumVisits\"")
+    # Risk scores, one column per requested score NAMED AFTER IT, as SAS
+    # (wp307: "CCI"). Reported for every cohort, as SAS does.
+    scores = sorted({r.riskscore for r in study.risk_scores})
+    try:
+        eng.con.execute("SELECT 1 FROM risk_scores LIMIT 0")
+        have_rs = True
+    except Exception:
+        have_rs = False
+    if scores and have_rs:
+        piv = ", ".join(
+            f"max(score) FILTER (WHERE riskscore = '{n}') AS \"{n}\"" for n in scores)
+        joins.append(
+            f"\nLEFT JOIN (SELECT cohortgrp, patid, indexdt, {piv} FROM risk_scores "
+            "GROUP BY 1, 2, 3) rs ON rs.cohortgrp = f.cohortgrp "
+            "AND rs.patid = f.patid AND rs.indexdt = f.indexdt")
+        cols.extend(f',\n    rs."{n}" AS "{n}"' for n in scores)
+    return "".join(cols), "".join(joins)
 
 
 def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
@@ -285,13 +337,26 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
                 f"sum(CASE WHEN c.{column} = {sql_str(value)} "
                 f"THEN 1 ELSE 0 END) AS \"{prefix}_{safe}\"")
 
+    # Covariates and per-episode measures are JOINED, not looked up per
+    # row. The first version emitted a correlated EXISTS per covariate
+    # and a scalar subquery per mean/std column inside the aggregation —
+    # the master-list flaw again, in a step that runs outside any timed
+    # stage. See test_baseline_uses_one_lookup_per_source.
+    joins: list[str] = []
+    covnums = sorted({int(cov.covarnum) for cov in study.covariates})
+    if covnums:
+        flags = ",\n        ".join(
+            f'max((v.covarnum = {k})::SMALLINT) AS "COVAR{k}"' for k in covnums)
+        joins.append(
+            "LEFT JOIN (\n    SELECT v.cohortgrp, v.patid, v.indexdt,\n"
+            f"        {flags}\n    FROM covariates_long v\n"
+            "    GROUP BY v.cohortgrp, v.patid, v.indexdt\n"
+            ") cv ON cv.cohortgrp = c.cohortgrp AND cv.patid = c.patid "
+            "AND cv.indexdt = c.indexdt")
     for cov in study.covariates:
         dummies.append(
-            f"sum(CASE WHEN EXISTS (SELECT 1 FROM covariates_long x "
-            f"WHERE x.cohortgrp = c.cohortgrp AND x.patid = c.patid "
-            f"AND x.indexdt = c.indexdt AND x.covarnum = {int(cov.covarnum)})"
-            f" THEN 1 ELSE 0 END) AS \"covar{int(cov.covarnum)}\""
-        )
+            f'sum(coalesce(cv."COVAR{int(cov.covarnum)}", 0)) '
+            f'AS "covar{int(cov.covarnum)}"')
 
     # Continuous variables get mean_ and std_, not a sum
     # (ms_createdistbaselinetable.sas:474-500). SAS lists Age, the risk
@@ -324,15 +389,28 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
                 f"baseline: {table} is missing {missing}; those "
                 f"mean_/std_ columns will be absent from the baseline "
                 f"table", stacklevel=2)
-        for src, sas in cols:
-            if src not in have:
-                continue
-            lookup = (f"(SELECT u.{src} FROM {table} u "
-                      f"WHERE u.cohortgrp = c.cohortgrp "
-                      f"AND u.patid = c.patid AND u.indexdt = c.indexdt)")
-            dummies.append(f"round(avg({lookup}), 4) AS \"mean_{sas}\"")
+        present = [(src, sas) for src, sas in cols if src in have]
+        if not present:
+            continue
+        # One row per episode is what the old scalar subquery assumed (it
+        # raised on a second row); a join would silently double-count
+        # instead, so check explicitly.
+        dup = eng.con.execute(
+            f"SELECT count(*) FROM (SELECT 1 FROM {table} "
+            f"GROUP BY cohortgrp, patid, indexdt HAVING count(*) > 1)"
+        ).fetchone()
+        if dup and dup[0]:
+            raise ValueError(
+                f"baseline: {table} has more than one row for {dup[0]} "
+                f"episode(s); the per-episode mean/std columns need one")
+        alias = "tu" if table == "utilization" else "tr"
+        joins.append(
+            f"LEFT JOIN {table} {alias} ON {alias}.cohortgrp = c.cohortgrp "
+            f"AND {alias}.patid = c.patid AND {alias}.indexdt = c.indexdt")
+        for src, sas in present:
+            dummies.append(f"round(avg({alias}.{src}), 4) AS \"mean_{sas}\"")
             dummies.append(
-                f"round(stddev_samp({lookup}), 4) AS \"std_{sas}\"")
+                f"round(stddev_samp({alias}.{src}), 4) AS \"std_{sas}\"")
 
     if not dummies:
         return ""
@@ -341,6 +419,7 @@ def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
         "SELECT b.*, " + ",\n       ".join(dummies) + "\n"
         "FROM baseline b\n"
         "JOIN cohort_final c ON c.cohortgrp = b.\"group\"\n"
+        + "".join(j + "\n" for j in joins) +
         "GROUP BY ALL\n"
         "ORDER BY 1;"
     )
@@ -357,25 +436,43 @@ def _combo_sql(study: StudyConfig) -> str:
     Only integers substituted into a fixed template ever reach SQL. The
     study's own text is never concatenated in.
     """
-    parts = []
-    for cov in study.covariates:
-        if cov.codecat != "CC":
-            continue
-        tests = {
-            n: (f"EXISTS (SELECT 1 FROM covariates_long x "
-                f"WHERE x.cohortgrp = m.cohortgrp AND x.patid = m.patid "
-                f"AND x.indexdt = m.indexdt AND x.covarnum = {int(n)})")
-            for n in cov.combo_refs
-        }
+    # SAS evaluates combinations ONE AT A TIME, in covariate-number order,
+    # each as its own step over the row of flags (ms_cidacov.sas:1201-1220:
+    # `if rule then covarX = 1`). So a combination sees every combination
+    # numbered before it, and one numbered AFTER it reads as false. wp307's
+    # covar32 references covar31; evaluating them all against the table as
+    # it stood before any were added made that reference always false and
+    # missed 171 of SAS's episodes.
+    #
+    # One INSERT per combination, in order, so each sees the earlier ones.
+    # Each is evaluated over ONE pivot of the covariates it references, not
+    # a correlated EXISTS per reference per episode, and only for cohorts
+    # SAS builds covariates for (createbaseline = 'Y'): a rule using NOT
+    # would otherwise flag cohorts SAS never evaluates.
+    stmts = []
+    for cov in sorted((c for c in study.covariates if c.codecat == "CC"),
+                      key=lambda c: int(c.covarnum)):
+        refs = sorted({int(n) for n in cov.combo_refs})
+        flags = ",\n        ".join(
+            f"max((covarnum = {n})::SMALLINT) AS f{n}" for n in refs)
+        tests = {n: f"(coalesce(p.f{int(n)}, 0) = 1)" for n in cov.combo_refs}
         expr = cov.combo_sql.format(**{f"c{k}": v for k, v in tests.items()})
         name = cov.covarname.replace("'", "''")
-        parts.append(
-            f"SELECT m.cohortgrp, m.patid, m.indexdt, {int(cov.covarnum)}, "
-            f"'{name}' FROM ptsmasterlist m WHERE {expr}"
-        )
-    return ("INSERT INTO covariates_long "
+        stmts.append(
+            "INSERT INTO covariates_long "
             "(cohortgrp, patid, indexdt, covarnum, covarname)\n"
-            + "\nUNION ALL\n".join(parts) + ";")
+            "WITH p AS (\n"
+            "    SELECT cohortgrp, patid, indexdt,\n        " + flags + "\n"
+            "    FROM covariates_long\n"
+            f"    WHERE covarnum IN ({', '.join(str(n) for n in refs)})\n"
+            "    GROUP BY cohortgrp, patid, indexdt\n)\n"
+            f"SELECT m.cohortgrp, m.patid, m.indexdt, {int(cov.covarnum)}, "
+            f"'{name}' FROM ptsmasterlist m LEFT JOIN p "
+            f"ON p.cohortgrp = m.cohortgrp AND p.patid = m.patid "
+            f"AND p.indexdt = m.indexdt\n"
+            f"WHERE m.cohortgrp IN (SELECT cohortgrp FROM cfg_cohort "
+            f"WHERE create_baseline)\n  AND ({expr});")
+    return "\n".join(stmts)
 
 
 def _empty_relation(spec) -> str:
@@ -577,6 +674,10 @@ def _denom_cfg_id(c, study: StudyConfig) -> str:
         # them let one cohort's exclusions be applied to another's
         # denominator through the shared config id.
         hashlib.sha1(_exclusion_key(c, study).encode()).hexdigest()[:12],
+        # The OUTCOME is deliberately NOT part of this key. It changes
+        # the denominator only for the few members with an event, and
+        # 92_cidadenom.sql handles those in per-cohort scopes rather
+        # than recomputing every member once per outcome.
         strata, demog))
 
 
@@ -601,6 +702,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "at_risk_start": c.at_risk_start,
                 "blackout_per": c.blackout_per,
                 "fup_wash_per": c.fup_wash_per,
+                "create_baseline": c.create_baseline,
                 "event_count": c.event_count,
                 "req_days_aft_ind": c.req_days_aft_ind,
                 "req_days_aft_epi": c.req_days_aft_epi,
@@ -619,6 +721,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
            min_epis_dur INTEGER, max_epis_dur INTEGER,
            min_days_supp INTEGER, at_risk_start INTEGER,
            blackout_per INTEGER, fup_wash_per INTEGER,
+           create_baseline BOOLEAN,
            event_count INTEGER, req_days_aft_ind INTEGER,
            req_days_aft_epi INTEGER, censor_death BOOLEAN,
            cum_dose_per INTEGER, min_cum_dose DOUBLE,
@@ -749,13 +852,16 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_mfu",
         [
-            {"cohortgrp": g, "analysisnum": a, "codecat": cc,
-             "countmethod": cm, "topxx": top, "mfufrom": f, "mfuto": t}
-            for g, a, cc, cm, top, f, t in study.mfu
+            {"cohortgrp": grp, "analysisnum": a, "codecat": cc,
+             "countmethod": cm, "topxx": top, "mfufrom": f, "mfuto": t,
+             "codetype": ct}
+            for g, a, cc, cm, top, f, t, ct in study.mfu
+            # a row with no group applies to every cohort
+            for grp in ([g] if g else [c.cohortgrp for c in study.cohorts])
         ],
         """cohortgrp VARCHAR, analysisnum INTEGER, codecat VARCHAR,
            countmethod VARCHAR, topxx INTEGER,
-           mfufrom INTEGER, mfuto INTEGER""",
+           mfufrom INTEGER, mfuto INTEGER, codetype VARCHAR""",
     )
 
     eng.register(
@@ -790,8 +896,9 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
 
     eng.register(
         "cfg_drugclass",
-        [{"code": c, "classname": n} for c, n in study.drug_classes],
-        "code VARCHAR, classname VARCHAR",
+        [{"code": c, "classname": n, "generic": g}
+         for c, n, g in study.drug_classes],
+        "code VARCHAR, classname VARCHAR, generic VARCHAR",
     )
 
     eng.register(
@@ -942,6 +1049,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         [
             {
                 "cohortgrp": c.cohortgrp,
+                "enr_cfg_id": _enr_cfg_id(c),
+                "enr_days": c.enr_days,
                 "covarnum": cov.covarnum,
                 "covarname": cov.covarname,
                 "codecat": cov.codecat,
@@ -952,9 +1061,12 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "dateonly": cov.dateonly,
             }
             for c in cohorts
+            # only cohorts SAS builds a baseline for (createbaseline='Y')
+            if c.create_baseline
             for cov in study.covariates
         ],
-        """cohortgrp VARCHAR, covarnum INTEGER, covarname VARCHAR,
+        """cohortgrp VARCHAR, enr_cfg_id VARCHAR, enr_days INTEGER,
+           covarnum INTEGER, covarname VARCHAR,
            codecat VARCHAR, covfrom INTEGER, covto INTEGER,
            covfromanchor VARCHAR, covtoanchor VARCHAR,
            dateonly BOOLEAN""",
@@ -963,11 +1075,21 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_covariate_codes",
         [
-            {"covarnum": cov.covarnum, "code": code}
-            for cov in study.covariates
-            for code in cov.codes
+            # each code keeps its OWN category: one covariate can mix
+            # dispensings and procedure claims
+            {"covarnum": cov.covarnum, "code": code, "codecat": cat,
+             # chain key for dispensings; the covariate itself when a
+             # study gives no stockgroup
+             "stockgroup": (sg.get(code) or f"covar{cov.covarnum}")}
+            # the code -> stockgroup map is built ONCE per covariate. It was
+            # rebuilt for every code — ~26k x 26k x 23 operations on a
+            # 600k-code study, which then never reached its first stage
+            for cov, sg in ((c, dict(c.code_stockgroups))
+                            for c in study.covariates)
+            for code, cat in (cov.code_cats
+                              or tuple((c, cov.codecat) for c in cov.codes))
         ],
-        "covarnum INTEGER, code VARCHAR",
+        "covarnum INTEGER, code VARCHAR, codecat VARCHAR, stockgroup VARCHAR",
     )
 
     eng.register(
@@ -1075,9 +1197,17 @@ def run(
         if not spec.used:
             continue
         pattern = resolve_table(indata, spec, table_map=table_map)
-        if pattern is None:
+        if pattern is None and spec.fingerprint:
             pattern = resolve_table(indata, spec, table_map=table_map,
                                     by_columns=fingerprints())
+        if pattern is None and spec.name == "encounter":
+            import warnings as _w
+            _w.warn(
+                "no encounter table found: medical visit counts (NumAV, "
+                "NumOA, NumIP, NumED) come from diagnosis claims, which miss "
+                "encounters that carry no diagnosis. If the extract has an "
+                "encounter table under another name, map it with table_map.",
+                stacklevel=2)
         if pattern is None:
             if spec.required and not spec.optional_table:
                 missing.append(spec.name)
@@ -1126,6 +1256,33 @@ def run(
     ct_col = next((c for c in ("rx_codetype", "codetype", "ndc_codetype")
                    if c in disp_cols), None)
 
+    # An INTEGER rxamt means fractional amounts were truncated when the
+    # extract was written — a 0.6 mL prefilled syringe becomes 0, is then
+    # removed by SAS's `rxamt > 0` dispensing rule, and its members drop
+    # out of the cohort silently. One real conversion did exactly this
+    # (54,995 amounts below 1 stored as 0). It cannot be repaired here, so
+    # say so loudly. A warning rather than an error: an extract can
+    # legitimately hold only whole amounts.
+    if disp and not disp.startswith("("):
+        try:
+            _row = eng.con.execute(
+                f"SELECT column_type FROM (DESCRIBE SELECT rxamt FROM {disp})"
+            ).fetchone()
+            rxamt_type = str(_row[0]).upper() if _row else ""
+        except Exception:                                   # noqa: BLE001
+            rxamt_type = ""
+        if rxamt_type in ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT"):
+            import warnings as _w
+            _w.warn(
+                f"dispensing.rxamt is stored as {rxamt_type}: any fractional "
+                f"dispensed amount (e.g. a 0.6 mL syringe) was truncated when "
+                f"the extract was written, and amounts below 1 are now 0 and "
+                f"will be excluded by the `rxamt > 0` dispensing rule. If the "
+                f"source has fractional amounts, regenerate the extract with "
+                f"rxamt as a floating-point type.",
+                stacklevel=2,
+            )
+
     # `chart` is OPTIONAL in SCDM. Referencing it unconditionally made
     # an enrolment file that carries every REQUIRED column fail with a
     # binder error, so a valid extract could not be read at all.
@@ -1148,6 +1305,10 @@ def run(
         ("read_enrollment", ("chart",)),
         ("read_demographic", ("race", "hispanic",
                               "postalcode", "postalcode_date")),
+        # the discharge date bounds an inpatient stay for enveloping; an
+        # extract without it (or without an encounter table) gets NULL,
+        # i.e. one-day stays, rather than a BinderException
+        ("read_encounter", ("ddate",)),
     ):
         optional_cols.update(_optional(key, *cols))
     chart_col = optional_cols["chart"]
@@ -1162,6 +1323,7 @@ def run(
         **{f"opt_{k}": v for k, v in optional_cols.items()},
         "indata": str(Path(indata)).rstrip("/"),
         "start_date": study.start_date.isoformat(),
+        "run_envelope": int(study.run_envelope),
         "end_date": study.end_date.isoformat(),
         "censor_date": study.effective_censor_date.isoformat(),
         # Claims outside the widest possible lookback can never matter.
@@ -1344,7 +1506,10 @@ def run(
         # they run after. The expression was parsed at load; only
         # integer covarnums reach the SQL, never study-supplied text.
         if study.any_combo_covariates:
-            eng.con.execute(_combo_sql(study))
+            # one statement per combination, run IN ORDER — see _combo_sql
+            from .sqlsplit import split_statements
+            for _stmt in split_statements(_combo_sql(study)):
+                eng.con.execute(_stmt.sql)
             # Rebuild prevalence: it is computed inside the covariates
             # stage, which runs BEFORE the combos are inserted, so it
             # would otherwise omit every combo covariate — 17 of 49 in
@@ -1360,8 +1525,9 @@ def run(
             eng.con.execute(widen)
 
     # Widen the master list once everything it references exists.
+    _mx = _mstr_extra_columns(eng, study)
     eng.script_stage("master list columns", "62_mstr_wide.sql",
-                     mstr_extra=_mstr_extra_columns(eng, study), **fmt)
+                     mstr_extra=_mx[0], mstr_joins=_mx[1], **fmt)
 
     # The study output table. Only built when USERSTRATA defines t2cida
     # levels, which is SAS's own gate (`where lowcase(tableID)='t2cida'`

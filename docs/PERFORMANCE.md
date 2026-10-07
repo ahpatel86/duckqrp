@@ -501,3 +501,38 @@ Worth noting the shape: the defect was introduced by adding TRUNK codes
 to a comprehension that had been fine at 12,488 codes and was quadratic
 at 200,480. No test failed, and correctness was unaffected. Only the
 benchmark showed it.
+
+---
+
+## Master-list columns: one pivot, not one lookup per column
+
+The covariate flags and utilization counts on the master list were
+generated as a correlated `EXISTS` per covariate and a scalar subquery
+per count — 25 and 9 separate lookups on wp307 — so the work grew with
+episodes x covariates.
+
+Measured on the 600k-code study, then with its master list and inputs
+replicated 20x (630k episodes, 8.9M covariate rows), under a 2GB memory
+and 2GB spill budget:
+
+| | 1x | 20x |
+|---|--:|--:|
+| per-column subqueries | 0.70s | **out of memory** |
+| single pivot + one join | **0.17s** | **5-6s** |
+
+Output identical (31,464 rows, no differences either way). In the
+pipeline the stage goes from 0.5s to 0.1s on both wp307 and the
+600k-code study.
+
+The six-join guard test could not catch this: the columns are generated
+in Python and injected into `62_mstr_wide.sql`, so the file it reads
+holds only a placeholder. `test_master_list_columns_use_one_lookup_per_source`
+inspects the generated SQL instead.
+
+## Related: the denominator outcome scopes
+
+The outcome-event shave first made the denominator exact by putting the
+outcome into its config key, which doubled every per-member table
+(1.36M -> 2.71M rows) and took wp307 from ~25s to 34.5s. Applying the
+outcome in small per-cohort scopes instead restored 20 configs and
+24.8s, with all 40 cohorts still exact. See PARITY_FINDINGS.md.

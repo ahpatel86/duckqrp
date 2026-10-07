@@ -394,6 +394,12 @@ class CohortConfig:
     # specify it, get no warning, and receive a broader cohort than SAS.
     event_care_settings: tuple[tuple[str, str, str], ...] = ()
 
+    # SAS computes covariates and a baseline table only for cohorts with
+    # `createbaseline = 'Y'` in the cohort file (ms_cidacov.sas:142).
+    # Defaults to True when the field is absent, so studies that never set
+    # it behave as before.
+    create_baseline: bool = True
+
     # ---------------- derived flags (no data probe needed) -----------
 
     @property
@@ -505,6 +511,15 @@ class Covariate:
     combo_sql: str = ""
     combo_refs: tuple[int, ...] = ()
     codes: tuple[str, ...] = ()
+    # (code, codecat) per code. A covariate can MIX categories: wp307's
+    # 'Pegfilgrastim Post-Index' lists NDCs as dispensings, NDCs billed
+    # on procedure claims, and J-codes. Taking the category from the
+    # first row matched only one of them. Empty for hand-written studies
+    # that supply a plain `codes` list; those use `codecat`.
+    code_cats: tuple[tuple[str, str], ...] = ()
+    # (code, stockgroup): SAS stockpiles covariate dispensings per
+    # covariate AND stockgroup (ms_cidacov_codeextraction.sas).
+    code_stockgroups: tuple[tuple[str, str], ...] = ()
 
     UNBOUNDED_BEFORE = -999999
     UNBOUNDED_AFTER = 999999
@@ -687,11 +702,15 @@ class StudyConfig:
     # UTILFILE rows: (cohortgrp, utiltype MED|DRUG, utilfrom, utilto)
     utilization: tuple[tuple[str, str, int, int], ...] = ()
     # NDC -> class lookup, for the distinct-class utilization count
-    drug_classes: tuple[tuple[str, str], ...] = ()
+    drug_classes: tuple[tuple[str, str, str], ...] = ()   # (code, classname, generic)
     # (cohortgrp, code, labdatetype, op, lo, hi)
     lab_codes: tuple[tuple, ...] = ()
     # (cohortgrp, analysisnum, codecat, countmethod, topxx, from, to)
     mfu: tuple[tuple, ...] = ()
+    # SAS's RUN_ENVELOPE (ms_envelope.sas): 0 envelopes claims within an
+    # inpatient stay, admit day included; 2 switches it off; any other
+    # value envelopes from the day AFTER admission.
+    run_envelope: int = 0
 
     def validate(self) -> None:
         if self.study_type != 2:
@@ -1471,11 +1490,19 @@ def _query_period(params: dict[str, Any],
 
 
 def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
+    # Each table's rows, with lower-cased keys, built ONCE. rows() is called
+    # 56 times while loading a study; rebuilding the large tables each time
+    # (600k covariate codes, 301k drug classes, 103k risk codes) was 154M
+    # str.lower calls and most of a large study's load time.
+    _rows_cache: dict[str, list[dict[str, Any]]] = {}
+
     def rows(name: str) -> list[dict[str, Any]]:
-        return [
-            {str(k).lower(): v for k, v in r.items()}
-            for r in (raw.get(name) or raw.get(name.upper()) or [])
-        ]
+        if name not in _rows_cache:
+            _rows_cache[name] = [
+                {str(k).lower(): v for k, v in r.items()}
+                for r in (raw.get(name) or raw.get(name.upper()) or [])
+            ]
+        return _rows_cache[name]
 
     # Scalars arrive either pre-resolved from qrp.inputfile, or as a
     # single-row dict in a hand-written demo file.
@@ -1513,6 +1540,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
                 race=_codes(cf.get("race"), ("0", "1", "2", "3", "4", "5", "M")),
                 hispanic=_codes(cf.get("hispanic"), ("Y", "N", "U")),
                 age_strata=AgeStrata.parse(cf.get("agestrat")),
+                create_baseline=_bool_yn(cf.get("createbaseline"), True),
                 wash_per=_int(t2.get("t2washper"), None),
                 point=_bool_yn(t2.get("point")),
                 episode_gap=_int(t2.get("episodegap"), 0),
@@ -1555,6 +1583,11 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
 
     strata = tuple(StratumLevel.parse(r) for r in rows("userstrata"))
 
+    def _mfu_countmethod(v):
+        m = str(v or "CODECOUNT").strip().upper()
+        return {"P": "PATCOUNT", "PATIENT": "PATCOUNT", "PATIENTS": "PATCOUNT",
+                "C": "CODECOUNT", "CODE": "CODECOUNT", "CODES": "CODECOUNT"}.get(m, m)
+
     mfu = tuple(
         (
             str(r.get("group") or r.get("cohortgrp") or ""),
@@ -1562,13 +1595,19 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
             str(r.get("codecat") or "DX").upper(),
             # codecount ranks by claims, patcount by distinct patients.
             # They give different orderings; SAS defaults to codecount.
-            str(r.get("countmethod") or "CODECOUNT").upper(),
+            # SAS's own file spells them 'P' and 'C'; only the long names
+            # were recognised, so 'P' silently ranked by claims.
+            _mfu_countmethod(r.get("countmethod")),
             _int(r.get("topxx"), 20),
             _int(r.get("mfufrom"), -365),
             _int(r.get("mfuto"), -1),
+            str(r.get("codetype") or "").strip(),
         )
+        # A row naming no group applies to EVERY cohort, as in SAS; it is
+        # expanded when the config is registered. These rows were dropped,
+        # so a study's MFU table — wp307's only MFU row has no group —
+        # was never produced.
         for r in rows("mfufile")
-        if (r.get("group") or r.get("cohortgrp"))
     )
 
     lab_codes = tuple(
@@ -1595,21 +1634,41 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         if r.get("code")
     )
 
+    # UTILFILE comes in two shapes. SAS's own is WIDE — one row per group
+    # with medutilfrom/medutilto AND drugutilfrom/drugutilto. The long
+    # shape (utiltype, utilfrom, utilto) is also accepted. Reading only the
+    # long shape turned every wide row into a MEDICAL window with the
+    # default -365..-1 and created no DRUG window at all: wp307's medical
+    # counts ran ~3x SAS's and its drug counts were all zero.
+    def _util_rows(r):
+        grp = str(r.get("group") or r.get("cohortgrp") or "")
+        wide = [k for k in ("medutilfrom", "medutilto", "drugutilfrom", "drugutilto")
+                if k in r]
+        if wide:
+            out = []
+            for kind, pfx in (("MED", "med"), ("DRUG", "drug")):
+                f, t = r.get(f"{pfx}utilfrom"), r.get(f"{pfx}utilto")
+                if f is not None or t is not None:
+                    out.append((grp, kind, _int(f, -365), _int(t, -1)))
+            return out
+        return [(grp, str(r.get("utiltype") or r.get("type") or "MED").upper(),
+                 _int(r.get("utilfrom"), -365), _int(r.get("utilto"), -1))]
+
     utilization = tuple(
-        (
-            str(r.get("group") or r.get("cohortgrp") or ""),
-            str(r.get("utiltype") or r.get("type") or "MED").upper(),
-            _int(r.get("utilfrom"), -365),
-            _int(r.get("utilto"), -1),
-        )
-        for r in rows("utilfile")
+        u for r in rows("utilfile")
         if (r.get("group") or r.get("cohortgrp"))
+        for u in _util_rows(r)
     )
 
+    # SAS's drug class file keys on `rx` (the NDC) and carries `generic`
+    # as well as `classname`. Requiring a `code` column dropped all
+    # 301,245 rows of wp307's file without a word.
     drug_classes = tuple(
-        (str(r["code"]), str(r.get("classname") or r.get("class") or ""))
+        (str(r.get("code") or r.get("rx")),
+         str(r.get("classname") or r.get("class") or ""),
+         str(r.get("generic") or ""))
         for r in rows("drugclassfile")
-        if r.get("code")
+        if (r.get("code") or r.get("rx"))
     )
 
     zipfile = tuple(
@@ -1624,6 +1683,24 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         if str(r.get("zip") or "").strip()
     )
 
+    # RISKSCOREFILE names the scores the study wants and gives each its
+    # window and anchors; RISKSCORECODES is a shared library of code lists
+    # for many scores. Only the codes file was read, so (a) every score in
+    # the library was computed — seven in wp307's, though it asks only for
+    # CCI — and (b) the window fell back to -365..-1 instead of the file's
+    # -183..0. A window given per code in the codes file still wins.
+    _rsf = {str(r.get("riskscore") or "").strip().upper(): r
+            for r in rows("riskscorefile")
+            if str(r.get("riskscore") or "").strip()}
+
+    def _rs_field(r, key, default):
+        own = r.get(key)
+        if own not in (None, ""):
+            return own
+        f = _rsf.get(str(r.get("riskscore") or "").strip().upper(), {})
+        v = f.get(key)
+        return default if v in (None, "") else v
+
     risk_scores = tuple(
         RiskScoreCode(
             riskscore=str(r.get("riskscore") or "").strip().upper(),
@@ -1631,11 +1708,11 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
             codecat=str(r.get("codecat") or "DX").strip().upper(),
             code=str(r.get("code") or "").strip(),
             weight=_float(r.get("weight")) or 0.0,
-            riskfrom=_int(r.get("riskfrom"), -365),
-            riskto=_int(r.get("riskto"), -1),
-            riskfromanchor=(str(r.get("riskfromanchor") or "").strip().upper()
+            riskfrom=_int(_rs_field(r, "riskfrom", -365), -365),
+            riskto=_int(_rs_field(r, "riskto", -1), -1),
+            riskfromanchor=(str(_rs_field(r, "riskfromanchor", "") or "").strip().upper()
                             or "INDEXDT"),
-            risktoanchor=(str(r.get("risktoanchor") or "").strip().upper()
+            risktoanchor=(str(_rs_field(r, "risktoanchor", "") or "").strip().upper()
                           or "INDEXDT"),
             # riskscorecodes carries its own care-setting restriction
             **(lambda pairs: {"enctype": pairs[0][0], "pdx": pairs[0][1]})(
@@ -1644,6 +1721,8 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         )
         for r in rows("riskscorecodes")
         if str(r.get("riskscore") or "").strip()
+        # only the scores the study asks for, when it says which
+        and (not _rsf or str(r.get("riskscore")).strip().upper() in _rsf)
     )
 
     # Derive `cond` and `subcond` the way SAS does
@@ -1667,12 +1746,18 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     # covariate (ms_processinputfiles.sas), so any row will do.
     _cov_rows: dict[int, dict[str, Any]] = {}
     _cov_codes: dict[int, list[str]] = {}
+    _cov_cats: dict[int, list[tuple[str, str]]] = {}
+    _cov_stock: dict[int, list[tuple[str, str]]] = {}
     for r in rows("covariatecodes"):
         num = _int(r.get("covarnum"), 0)
         _cov_rows.setdefault(num, r)
         code = str(r.get("code") or "").strip()
         if code:
             _cov_codes.setdefault(num, []).append(code)
+            _cov_cats.setdefault(num, []).append(
+                (code, str(r.get("codecat") or "DX").strip().upper()))
+            _cov_stock.setdefault(num, []).append(
+                (code, str(r.get("stockgroup") or "").strip()))
 
     covariates = tuple(
         Covariate(
@@ -1692,6 +1777,8 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
             dateonly=_bool_yn(r.get("dateonly")),
             # A supplied `codes` list still works, for hand-written
             # studies and the test fixtures.
+            code_cats=tuple(_cov_cats.get(num, ())),
+            code_stockgroups=tuple(_cov_stock.get(num, ())),
             codes=tuple(str(c) for c in (r.get("codes") or []))
                   or tuple(_cov_codes.get(num, ())),
             combo_sql=(parse_combo(r.get("code"))[0]
@@ -1712,6 +1799,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
 
     study = StudyConfig(
         study_type=_int(params.get("type"), 2),
+        run_envelope=_int(params.get("run_envelope"), 0),
         covariates=covariates,
         inclusions=inclusions,
         strata=strata,

@@ -43,24 +43,37 @@ No changes needed. The loader handles the real `PROC JSON` output:
 | `COHORTCODES` | `group`, `indexcriteria` (`DEF` / event), `code`, `codesupply` |
 | `COVARIATECODES` | `covarnum`, `covarname`, `codecat` (`DX`/`RX`), `covfrom`, `covto`, `dateonly`, `codes` |
 
+### Also read, in SAS's own formats
+
+Each of these is read in the format SAS's QRP uses, and was verified
+against SAS output on a 40-cohort study (see docs/PARITY_FINDINGS.md):
+
+| file | notes |
+|---|---|
+| `COHORTFILE` | including `createbaseline`: covariates, utilization and the baseline table are computed only for cohorts marked `Y` |
+| `INCLUSIONCODES` | inclusion/exclusion conditions; each code keeps its own category |
+| `USERSTRATA` | output strata |
+| `UTILFILE` | SAS's wide shape (`medutilfrom/to`, `drugutilfrom/to` per group) or the long shape (`utiltype`, `utilfrom`, `utilto`) |
+| `DRUGCLASSFILE` | `rx` (NDC), `generic`, `classname`: drives `numrx`, `NumGeneric`, `NumClass` |
+| `RISKSCOREFILE` | which scores to compute, and each score's window and anchors |
+| `RISKSCORECODES` | a code library; only the scores named in `RISKSCOREFILE` are computed |
+| `MFUFILE` | a row with no group applies to every cohort; `countmethod` `P` / `C` (or `PATCOUNT` / `CODECOUNT`); `codetype` restricts the code system |
+
+Study parameter `run_envelope` (SAS's `RUN_ENVELOPE`) is read: claims
+dated inside an inpatient stay are re-filed to it (care setting `IP`,
+flag `X`), as SAS does. `0` includes the admit day, `2` switches it off.
+
 ### Recognised but NOT implemented
 
-`INCLUSIONCODES`, `USERSTRATA`, `STOCKPILINGFILE`, `RISKSCOREFILE`,
-`RISKSCORECODES`, `UTILFILE`, `MFUFILE`.
-
-If your study supplies any of these, `load_study` **warns** and the run
-continues without them — so results will be *broader* than the SAS run
-(fewer exclusions applied). That is a deliberate loud-failure choice: a
-silent narrower answer would be worse. Tell me which ones your study
-actually uses and I'll wire them.
+`STOCKPILINGFILE`. Stockpiling uses SAS's defaults. If your study
+supplies one, tell me and I'll wire it.
 
 ### One gap worth naming
 
-Dose restrictions need a **strength per dispensed code**. In SAS this
-comes from the `drugclass` lookup keyed on NDC, which I have not wired
-in. Until then, supply a `codestrength` array of `{code, strength}`, or
-send `drugclass.sas7bdat` / the lookup JSON and I'll read it properly.
-Studies with no dose restriction don't need it.
+Dose restrictions need a **strength per dispensed code**. The drug class
+file is read, but for utilization only — the copies seen carry `rx`,
+`generic` and `classname`, no strength. Supply a `codestrength` array of
+`{code, strength}`. Studies with no dose restriction don't need it.
 
 ---
 
@@ -131,8 +144,14 @@ column is resolved from the file's actual schema rather than assumed.
 | `diagnosis` | `patid`, `adate`, `dx` | `dx_codetype`, `pdx`, `enctype` |
 | `death` | `patid`, `deathdt` | — (empty table is fine) |
 
-`procedure`, `encounter` and `lab_result` are not read yet — they carry
-PX covariates, care-setting logic and lab covariates.
+`procedure` (`patid`, `adate`, `px`; optional `px_codetype`, `enctype`)
+and `lab_result` are read when present. `encounter` (`patid`, `adate`,
+`enctype`; optional `encounterid`, `ddate`) is optional: SAS counts
+visits from it and uses its inpatient stays for enveloping. Without it,
+visits are counted from diagnosis claims (with a warning — encounters
+without a diagnosis are missed) and nothing is enveloped. It is not
+searched for by column fingerprint when absent; if yours has another
+name, map it with `table_map`.
 
 ### Things that are NOT a problem
 

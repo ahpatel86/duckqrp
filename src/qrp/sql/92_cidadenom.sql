@@ -49,7 +49,23 @@ WITH windows AS (
         e.patid,
         e.episode                       AS eligepisode,
         e.enr_start,
-        e.enr_end,
+        -- Enrolment ends at DEATH. SAS truncates the span before
+        -- building the window and deletes it if that leaves the end
+        -- before the start (ms_cidanum.sas:2184-2188):
+        --
+        --   if enrend_death in ('B','C') and DeathDt <= Enr_End
+        --       then Enr_End = DeathDt;
+        --   if Enr_end < Enr_Start then delete;
+        --
+        -- Extracts carry enrolment spans that run past a member's
+        -- death. Counting them admitted one dead member per
+        -- denominator configuration, each contributing their whole
+        -- post-death window.
+        -- unconditional: SAS gates this on `enrend_death`, a DATA
+        -- PARTNER setting rather than a cohort option, and enrolment
+        -- outliving a member is an extract artefact either way
+        CASE WHEN d.deathdt IS NOT NULL AND d.deathdt <= e.enr_end
+             THEN d.deathdt ELSE e.enr_end END AS enr_end,
         -- start: enrollment start plus the required prior-enrollment
         -- start: enrollment start plus the required prior enrollment,
         -- clipped to the query period
@@ -68,7 +84,9 @@ WITH windows AS (
         -- without the pullback put MEMBERS 1.4% high. Only the two
         -- together agree: 2,503,074 members against SAS's 2,502,986
         -- (0.0035%) and member-days within 0.02%.
-        least(e.enr_end, DATE '{end_date}')
+        least(CASE WHEN d.deathdt IS NOT NULL AND d.deathdt <= e.enr_end
+                   THEN d.deathdt ELSE e.enr_end END,
+              DATE '{end_date}')
           - greatest(
                 0,
                 c.min_epis_dur - 1,
@@ -82,6 +100,8 @@ WITH windows AS (
     FROM cfg_denom_cohort c
     JOIN enrollment_spans e
       ON e.enr_cfg_id = c.enr_cfg_id
+    -- the member's death, if any: enrolment cannot outlive it
+    LEFT JOIN deaths d ON d.patid = e.patid
     WHERE e.enr_end >= DATE '{start_date}'
 )
 SELECT
@@ -114,6 +134,93 @@ WHERE w.denom_end >= w.denom_start;
 -- The `washout <> 0` gate is SAS's, not an optimisation: with no
 -- washout the block does not run at all.
 -- ---------------------------------------------------------------
+-- Outcome-event periods, built separately so the ineligible-period
+-- union below stays within the join budget the memory-floor test
+-- enforces.
+-- Periods around each follow-up EVENT (the outcome). SAS makes a
+-- member ineligible from `ADate - BLACKOUTPER + 1` to
+-- `ExpireDt + FUPWASHPER` for every outcome claim, across the whole
+-- eligible population (ms_cidadenom.sas:486-515). A medical claim's
+-- ExpireDt is `ADate + CodeSupply - 1`, with CodeSupply defaulting
+-- to 1, so with the usual parameters each claim removes its own day.
+--
+-- This was missing entirely. It is small in member-days but it is
+-- the ONLY thing that separates two cohorts differing only in their
+-- outcome, so without it those denominators were identical.
+CREATE OR REPLACE TEMP TABLE _denom_event_periods AS
+SELECT DISTINCT
+    m.denom_cfg_id,
+    'a:' || ev.cohortgrp                                     AS scope,
+    ev.patid,
+    ev.adate - CAST(c.blackout_per AS INTEGER) + 1           AS unelig_start,
+    ev.adate + CAST(coalesce(sup.code_supply, 1) AS INTEGER) - 1
+             + CAST(coalesce(c.fup_wash_per, 0) AS INTEGER)  AS unelig_end
+FROM event_claims ev
+JOIN cfg_denom_map m ON m.cohortgrp = ev.cohortgrp
+JOIN cfg_cohort    c ON c.cohortgrp = ev.cohortgrp
+LEFT JOIN (
+    SELECT cohortgrp, code, max(code_supply) AS code_supply
+    FROM cfg_codes WHERE role = 'EVENT' GROUP BY 1, 2
+) sup ON sup.cohortgrp = ev.cohortgrp AND sup.code = ev.code;
+
+-- The denominator's OWN washout chain — reset at every enrolment span.
+--
+-- SAS shaves washout from `_groupindex`: stockpiled exposure joined to
+-- enrolment. Its stockpile chain RESTARTS in each enrolment span: a fill
+-- in a new span is never pushed by supply carried over from the
+-- previous one. Patient 98573092 shows it directly — enrolled to
+-- 2019-07-31 and again from 2019-10-01, their 2019-10-21 fill stays on
+-- 2019-10-21 in SAS, where a single continuous chain pushes it to
+-- 2019-11-09 with supply left over from July.
+--
+-- Two earlier versions got this partly right and are worth recording:
+--   * chaining every claim, then joining to enrolment: -34 member-days;
+--   * chaining claims within each patient's overall enrolment range:
+--     -24 — it fixed a warfarin patient (64384723, enrolled 2014-21 and
+--     2023) only because dropping out-of-range claims happened to stop
+--     drift crossing the gap. Resetting per span is the actual rule.
+-- Per-span chaining: denominator members AND member-days exact on all
+-- 40 cohorts of the study compared.
+--
+-- The episode path keeps `stockpiled`, which already matches SAS
+-- exactly, and is not touched.
+CREATE OR REPLACE TEMP TABLE _denom_chain AS
+WITH kept AS (
+    SELECT x.cohortgrp, x.stockgroup, x.patid, x.adate, x.rxsup, x.codecat,
+           en.enr_start AS span
+    FROM exposure_claims x
+    JOIN cfg_cohort c ON c.cohortgrp = x.cohortgrp
+    JOIN enrollment_spans en ON en.enr_cfg_id = c.enr_cfg_id AND en.patid = x.patid
+                            AND x.adate BETWEEN en.enr_start AND en.enr_end
+    WHERE c.wash_per <> 0
+      AND (x.codecat <> 'RX'
+           OR x.adate + CAST(x.rxsup - 1 AS INTEGER) >= DATE '{start_date}' - c.enr_days)
+),
+sameday AS (
+    SELECT cohortgrp, stockgroup, patid, span, adate, sum(rxsup)::INTEGER AS rxsup
+    FROM kept WHERE codecat = 'RX' GROUP BY 1, 2, 3, 4, 5
+),
+running AS (
+    SELECT *, sum(rxsup) OVER w AS cum_sup,
+           day_num(adate) - (sum(rxsup) OVER w - rxsup) AS anchor
+    FROM sameday
+    WINDOW w AS (PARTITION BY cohortgrp, stockgroup, patid, span
+                 ORDER BY adate ROWS UNBOUNDED PRECEDING)
+),
+solved AS (
+    SELECT *, max(anchor) OVER (PARTITION BY cohortgrp, stockgroup, patid, span
+                                ORDER BY adate ROWS UNBOUNDED PRECEDING) AS ra
+    FROM running
+)
+SELECT cohortgrp, patid,
+       from_day_num(cum_sup - 1 + ra - rxsup + 1) AS adate,
+       from_day_num(cum_sup - 1 + ra)             AS expiredt
+FROM solved
+UNION ALL
+SELECT cohortgrp, patid, adate, adate + CAST(max(rxsup) - 1 AS INTEGER)
+FROM kept WHERE codecat <> 'RX'
+GROUP BY cohortgrp, stockgroup, patid, adate;
+
 CREATE OR REPLACE TEMP TABLE _denom_unelig AS
 WITH raw AS (
     SELECT DISTINCT
@@ -127,21 +234,29 @@ WITH raw AS (
         -- allows — visible as the incident cohorts carrying every large
         -- difference, since only they have a washout at all.
         x.adate + 1                                   AS unelig_start,
-        x.expiredt + CAST(c.wash_per AS INTEGER)      AS unelig_end
-    FROM stockpiled x
+        -- The supply is CLIPPED AT THE ENROLMENT END before the
+        -- washout is added. SAS builds `_groupindex` by joining the
+        -- exposure to enrolment, and its ExpireDt never runs past
+        -- `Enr_End` — 46 of the 47 rows where its supply differed from
+        -- this package's ended exactly there. Carrying the full supply
+        -- made the ineligible window run days past where SAS ends it.
+        least(x.expiredt, en.enr_end)
+            + CAST(c.wash_per AS INTEGER)             AS unelig_end
+    FROM _denom_chain x
     JOIN cfg_denom_map m ON m.cohortgrp = x.cohortgrp
     JOIN cfg_cohort    c ON c.cohortgrp = x.cohortgrp
+    -- the enrolment span the claim falls in: SAS shaves from
+    -- `_groupindex`, which is the exposure JOINED to enrolment
+    JOIN enrollment_spans en
+      ON en.enr_cfg_id = c.enr_cfg_id AND en.patid = x.patid
+     AND x.adate BETWEEN en.enr_start AND en.enr_end
     WHERE c.wash_per <> 0
       -- SAS shaves from `_groupindex`, which is the stockpiled
       -- exposure JOINED TO ENROLMENT (ms_cidadenom.sas:459) — not
       -- every exposure claim. A dispensing filled outside any
       -- enrolment span never makes a member ineligible, and counting
       -- it removed eligible time SAS keeps.
-      AND EXISTS (
-          SELECT 1 FROM enrollment_spans en
-          WHERE en.enr_cfg_id = c.enr_cfg_id
-            AND en.patid = x.patid
-            AND x.adate BETWEEN en.enr_start AND en.enr_end)
+
 
     UNION ALL
 
@@ -218,54 +333,128 @@ SELECT denom_cfg_id, patid, min(unelig_start) AS unelig_start,
        max(unelig_end) AS unelig_end
 FROM blocks GROUP BY 1, 2, blk;
 
+-- ------------------------------------------------------------------
+-- SCOPES: share the expensive work across cohorts that differ only in
+-- their outcome.
+--
+-- The outcome-event shave touches very few members (38 in wp307), but
+-- keying the whole denominator by an outcome-aware config doubled every
+-- per-member table: 2.7M rows where 1.35M carry the same information.
+-- Instead the config stays outcome-free, and each cohort's event
+-- patients are computed again in two small scopes of their own:
+--
+--   '*'        every member, shared ineligible periods
+--   'b:<grp>'  that cohort's event patients, shared periods   (subtract)
+--   'a:<grp>'  the same patients, shared + event periods      (add back)
+--
+-- so  counts(cohort) = '*' + 'a:<grp>' - 'b:<grp>'.  Member-days and
+-- distinct members are both additive over disjoint sets of patients,
+-- so the result is exact, not approximate.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE VIEW _denom_ev_pat AS
+SELECT DISTINCT denom_cfg_id, scope, patid FROM _denom_event_periods;
+
+-- shared periods plus event periods, merged again for the 'a:' scope
+CREATE OR REPLACE VIEW _denom_unelig_a AS
+WITH raw AS (
+    SELECT p.denom_cfg_id, p.scope, u.patid, u.unelig_start, u.unelig_end
+    FROM _denom_unelig u
+    JOIN _denom_ev_pat p ON p.denom_cfg_id = u.denom_cfg_id AND p.patid = u.patid
+    UNION ALL
+    SELECT denom_cfg_id, scope, patid, unelig_start, unelig_end
+    FROM _denom_event_periods
+    WHERE unelig_start <= unelig_end
+),
+marked AS (
+    SELECT *,
+           CASE WHEN unelig_start <= max(unelig_end) OVER (
+                    PARTITION BY denom_cfg_id, scope, patid ORDER BY unelig_start
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                THEN 0 ELSE 1 END AS new_block
+    FROM raw
+),
+blocks AS (
+    SELECT *, sum(new_block) OVER (
+                 PARTITION BY denom_cfg_id, scope, patid ORDER BY unelig_start
+                 ROWS UNBOUNDED PRECEDING) AS blk
+    FROM marked
+)
+SELECT denom_cfg_id, scope, patid,
+       min(unelig_start) AS unelig_start, max(unelig_end) AS unelig_end
+FROM blocks GROUP BY denom_cfg_id, scope, patid, blk;
+
+CREATE OR REPLACE VIEW _denom_unelig_x AS
+SELECT denom_cfg_id, '*' AS scope, patid, unelig_start, unelig_end
+FROM _denom_unelig
+UNION ALL
+SELECT u.denom_cfg_id, 'b' || substr(p.scope, 2), u.patid, u.unelig_start, u.unelig_end
+FROM _denom_unelig u
+JOIN _denom_ev_pat p ON p.denom_cfg_id = u.denom_cfg_id AND p.patid = u.patid
+UNION ALL
+SELECT denom_cfg_id, scope, patid, unelig_start, unelig_end FROM _denom_unelig_a;
+
+CREATE OR REPLACE VIEW _denom_windows_x AS
+SELECT '*' AS scope, w.* FROM _denom_windows w
+UNION ALL
+SELECT p.scope, w.* FROM _denom_windows w
+JOIN _denom_ev_pat p ON p.denom_cfg_id = w.denom_cfg_id AND p.patid = w.patid
+UNION ALL
+SELECT 'b' || substr(p.scope, 2), w.* FROM _denom_windows w
+JOIN _denom_ev_pat p ON p.denom_cfg_id = w.denom_cfg_id AND p.patid = w.patid;
+
 -- Split each enrolled window around the ineligible periods inside it.
 CREATE OR REPLACE TEMP TABLE _denom_windows_shaved AS
 WITH overlapping AS (
-    SELECT w.denom_cfg_id, w.patid, w.eligepisode, w.enr_start, w.enr_end,
+    SELECT w.denom_cfg_id, w.scope, w.patid, w.eligepisode, w.enr_start, w.enr_end,
            w.denom_start, w.denom_end,
            greatest(u.unelig_start, w.denom_start) AS us,
            least(u.unelig_end, w.denom_end)        AS ue
-    FROM _denom_windows w
-    JOIN _denom_unelig u
-      ON u.denom_cfg_id = w.denom_cfg_id AND u.patid = w.patid
+    FROM _denom_windows_x w
+    JOIN _denom_unelig_x u
+      ON u.denom_cfg_id = w.denom_cfg_id AND u.scope = w.scope AND u.patid = w.patid
      AND u.unelig_start <= w.denom_end AND u.unelig_end >= w.denom_start
 ),
 -- the gap BEFORE each ineligible period ...
 gaps AS (
-    SELECT denom_cfg_id, patid, eligepisode, enr_start, enr_end,
-           coalesce(lag(ue) OVER (PARTITION BY denom_cfg_id, patid,
+    SELECT denom_cfg_id, scope, patid, eligepisode, enr_start, enr_end,
+           coalesce(lag(ue) OVER (PARTITION BY denom_cfg_id, scope, patid,
                                   eligepisode ORDER BY us) + 1,
                     denom_start)                    AS seg_start,
            us - 1                                   AS seg_end
     FROM overlapping
     UNION ALL
     -- ... and the tail after the last one
-    SELECT denom_cfg_id, patid, eligepisode, enr_start, enr_end,
+    SELECT denom_cfg_id, scope, patid, eligepisode, enr_start, enr_end,
            max(ue) + 1, max(denom_end)
     FROM overlapping
-    GROUP BY 1, 2, 3, 4, 5
+    GROUP BY 1, 2, 3, 4, 5, 6
 )
-SELECT denom_cfg_id, patid, eligepisode, enr_start, enr_end,
+SELECT denom_cfg_id, scope, patid, eligepisode, enr_start, enr_end,
        seg_start AS denom_start, seg_end AS denom_end,
        span_days(seg_start, seg_end) AS memberdays
 FROM gaps
 WHERE seg_end >= seg_start
 UNION ALL
 -- windows with no ineligible period inside them pass through untouched
-SELECT w.denom_cfg_id, w.patid, w.eligepisode, w.enr_start, w.enr_end,
+SELECT w.denom_cfg_id, w.scope, w.patid, w.eligepisode, w.enr_start, w.enr_end,
        w.denom_start, w.denom_end, w.memberdays
-FROM _denom_windows w
+FROM _denom_windows_x w
 WHERE NOT EXISTS (
-    SELECT 1 FROM _denom_unelig u
-    WHERE u.denom_cfg_id = w.denom_cfg_id AND u.patid = w.patid
+    SELECT 1 FROM _denom_unelig_x u
+    WHERE u.denom_cfg_id = w.denom_cfg_id AND u.scope = w.scope AND u.patid = w.patid
       AND u.unelig_start <= w.denom_end AND u.unelig_end >= w.denom_start);
 
 DROP TABLE _denom_windows;
+DROP VIEW _denom_windows_x;
+DROP VIEW _denom_unelig_x;
+DROP VIEW _denom_unelig_a;
+DROP VIEW _denom_ev_pat;
 ALTER TABLE _denom_windows_shaved RENAME TO _denom_windows;
 
 CREATE OR REPLACE TEMP TABLE _denom_demog AS
 SELECT
     el.denom_cfg_id,
+    el.scope,
     el.patid,
     el.eligepisode,
     el.denom_start,
@@ -294,6 +483,7 @@ DROP TABLE _denom_windows;
 CREATE OR REPLACE TEMP TABLE _denom_strat AS
 SELECT
     d.denom_cfg_id,
+    d.scope,
     d.patid,
     d.eligepisode,
     d.denom_start,
@@ -340,16 +530,25 @@ SELECT
     NULL::VARCHAR                                      AS cb_reg,
     NULL::SMALLINT                                     AS "month",
     NULL::SMALLINT                                     AS quarter,
-    count(DISTINCT s.patid)                            AS dennumpts,
+    -- '*' + after - before; see SCOPES above
+    count(DISTINCT s.patid) FILTER (WHERE s.scope = '*')
+      + count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'a:%')
+      - count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'b:%')
+                                                       AS dennumpts,
     -- OUTPUTDENOM='M' reports members only: SAS sets DenNumMemDays to
     -- MISSING for those cohorts, and 0 for the rest
     -- (ms_cidadenom.sas:1346-1347). NULL, not 0 — "we did not count
     -- this" and "we counted zero days" are different statements.
     CASE WHEN m.output_denom = 'M' THEN NULL
-         ELSE sum(s.memberdays) END                    AS dennummemdays
+         ELSE coalesce(sum(s.memberdays) FILTER (WHERE s.scope = '*'), 0)
+            + coalesce(sum(s.memberdays) FILTER (WHERE s.scope LIKE 'a:%'), 0)
+            - coalesce(sum(s.memberdays) FILTER (WHERE s.scope LIKE 'b:%'), 0)
+         END                                           AS dennummemdays
 FROM _denom_strat s
 -- one row per cohort sharing this config
 JOIN cfg_denom_map m ON m.denom_cfg_id = s.denom_cfg_id
+ -- each cohort sees the shared scope and only its OWN event scopes
+ AND (s.scope = '*' OR substr(s.scope, 3) = m.cohortgrp)
 CROSS JOIN (SELECT * FROM cfg_strata
             WHERE tableid = 't2cida') lv
 GROUP BY
@@ -359,6 +558,10 @@ GROUP BY
     CASE WHEN lv.has_sex      THEN s.sex         END,
     CASE WHEN lv.has_race     THEN s.race        END,
     CASE WHEN lv.has_hispanic THEN s.hispanic    END,
-    CASE WHEN lv.has_year     THEN s.index_year  END;
+    CASE WHEN lv.has_year     THEN s.index_year  END
+-- a stratum emptied by the event shave is not emitted, as before
+HAVING count(DISTINCT s.patid) FILTER (WHERE s.scope = '*')
+     + count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'a:%')
+     - count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'b:%') > 0;
 
 DROP TABLE _denom_strat;

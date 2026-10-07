@@ -40,6 +40,8 @@ WITH claims AS (
     JOIN cdm_diagnosis d
       ON d.patid = m.patid
      AND d.adate BETWEEN m.indexdt + a.mfufrom AND m.indexdt + a.mfuto
+     -- the row's code system, when it names one (wp307: ICD-10 only)
+     AND (coalesce(a.codetype, '') = '' OR d.codetype = a.codetype)
 
     UNION ALL
 

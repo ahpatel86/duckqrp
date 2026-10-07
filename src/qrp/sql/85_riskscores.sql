@@ -31,9 +31,13 @@
 CREATE OR REPLACE TABLE risk_scores AS
 WITH intercept AS (
     -- A constant per score, and the floor for anyone matching nothing.
-    SELECT riskscore, coalesce(sum(weight), 0) AS intercept
+    -- EVERY score is listed, with 0 when it has no intercept row: they are
+    -- cross-joined below, so listing only scores WITH an intercept dropped
+    -- all the others. Of wp307's seven library scores only FRAILTY has
+    -- one, so FRAILTY was reported under the name of the requested CCI.
+    SELECT riskscore,
+           coalesce(sum(weight) FILTER (WHERE is_intercept), 0) AS intercept
     FROM cfg_risk_codes
-    WHERE is_intercept
     GROUP BY 1
 ),
 hits AS (

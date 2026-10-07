@@ -39,9 +39,13 @@
 -- its cohorts are defined purely by HCPCS procedure codes. Extracting
 -- only from dispensing left those cohorts EMPTY, with no error.
 --
--- PX and DX claims carry no supply: rxsup is 1 (a point event, so the
--- episode is one day) and rxamt is NULL. That is what SAS gets too,
--- since those columns do not exist on those tables.
+-- PX and DX claims carry no supply of their own: rxsup is CODESUPPLY,
+-- or 1 (a point event). rxamt is 1 — SAS sets `RXAmt=1` and
+-- `NumDispensing=1` for medical claims (ms_cidanum.sas, the
+-- `if b or c or d or g` block). An earlier version used NULL and
+-- claimed SAS did too; each J-code administration then contributed
+-- nothing to `amtsupp`, and the peg/fil cohorts' amounts ran low on
+-- every mismatched episode.
 -- Exposure extraction.
  -- codetype is the CODE SYSTEM, and it must MATCH, not merely be
  -- carried along. One cohort's codes span several systems (DX/10,
@@ -76,7 +80,14 @@ JOIN cfg_codes k
       -- removed EVERY claim for a study that names a vocabulary.
       OR d.codetype IS NULL
       OR upper(d.codetype) = k.codetype)
-WHERE d.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+-- A dispensing counts if its SUPPLY reaches the window, not only its
+-- fill date: the exposure chain admits fills whose supply reaches the
+-- enrolment window. Filtering on the fill date dropped long fills
+-- dated before claims_from; exact parity on wp307 had rested on an
+-- accidental 365-day look-back from a risk-score default, and broke
+-- (patients +28, episodes +48) when that default was corrected.
+WHERE d.adate + CAST(d.rxsup - 1 AS INTEGER) >= DATE '{claims_from}'
+  AND d.adate <= DATE '{claims_to}'
 
 UNION ALL
 
@@ -88,7 +99,7 @@ SELECT
     -- of them happens to be 1 — a study specifying 30 got 1-day
     -- episodes.
     COALESCE(k.code_supply, 1) AS rxsup,
-    NULL::DOUBLE     AS rxamt,
+    1.0::DOUBLE      AS rxamt,
     'PX'             AS codecat
 FROM cdm_procedure x
 JOIN cfg_codes k
@@ -109,7 +120,7 @@ UNION ALL
 SELECT
     k.cohortgrp, k.stockgroup, x.patid, x.adate, x.code,
     COALESCE(k.code_supply, 1) AS rxsup,
-    NULL::DOUBLE     AS rxamt,
+    1.0::DOUBLE      AS rxamt,
     'DX'             AS codecat
 FROM cdm_diagnosis x
 JOIN cfg_codes k

@@ -1014,7 +1014,20 @@ def test_no_single_consumer_temp_tables():
               # swaps it over _denom_windows. A deliberate swap, not a
               # CTE that should have been inlined.
               "_denom_windows_shaved",
-              "_denom_unelig"}
+              "_denom_unelig",
+              # Outcome-event periods. Inlined as a CTE they push the
+              # _denom_unelig statement to nine joins, past the six-join
+              # memory guard below — the same trade the others make.
+              "_denom_event_periods",
+              # The denominator washout chain: inlining it adds two more
+              # joins to _denom_unelig, past the six-join guard.
+              "_denom_chain",
+              # the covariate dispensing chain: inlining it breaks the
+              # covariate query's join budget
+              "_covar_rx_chain",
+              # index-code distribution lists: each feeds the master-list
+              # statement, which they would push past the join budget
+              "_di_exp", "_di_hoi"}
     sql_dir = Path(__file__).resolve().parents[1] / "src" / "qrp" / "sql"
     offenders = []
 
@@ -2495,7 +2508,11 @@ def test_utilization_counts_are_ordered():
     rows = [{"group": g, "utiltype": t, "utilfrom": -365, "utilto": -1}
             for g in ("lisinopril", "beta_blocker")
             for t in ("MED", "DRUG")]
-    classes = [{"code": f"N{i:05d}", "classname": f"c{i % 5}"}
+    # generics nest within classes (generic k belongs to class k % 5), as
+    # in a real drug class file; without generics every NDC shares one
+    # empty generic and NumClass > NumGeneric trivially
+    classes = [{"code": f"N{i:05d}", "classname": f"c{(i % 10) % 5}",
+                "generic": f"g{i % 10}"}
                for i in range(1, 200)]
     eng = Engine(verbose=False)
     try:
@@ -2546,7 +2563,11 @@ def test_utilization_window_is_honoured():
                 for g in ("lisinopril", "beta_blocker")]
         eng = Engine(verbose=False)
         try:
-            run(_util_study(rows), DATA, engine=eng, verbose=False)
+            # SAS counts a dispensing only if its NDC is in the drug
+            # class file, so the window needs one to find anything
+            classes = [{"code": f"N{i:05d}", "classname": f"c{i % 5}",
+                        "generic": f"g{i % 10}"} for i in range(1, 200)]
+            run(_util_study(rows, classes), DATA, engine=eng, verbose=False)
             return eng.con.execute(
                 "SELECT sum(numrx) FROM utilization").fetchone()[0]
         finally:
@@ -7044,3 +7065,1050 @@ def test_censoring_survives_a_followuptime_only_study():
         [{"tableid": "t2cida", "levelid": "1", "levelvars": ""}])
     assert only_fup > 0, "a follow-up-time-only study exported no censoring"
     assert only_fup == only_cida
+
+
+def test_denominator_enrolment_ends_at_death():
+    """Enrolment cannot outlive the member.
+
+    SAS truncates the span to the death date before building the
+    window, and deletes it if that leaves the end before the start
+    (ms_cidanum.sas:2184-2188). Real extracts carry spans that run past
+    a death: patid 39853274 died 2015-10-26 yet held a span through
+    2016-12-31, and this package gave them an eligible window of
+    2016-07-02 to 2016-12-30. One such member per denominator
+    configuration was counted.
+
+    Fixing it took the denominator member count to EXACTLY SAS's on all
+    40 cohorts of the study compared, from +40.
+
+    This check is STRUCTURAL: it asserts the window bound consults the
+    death date. A behavioural version needs a fixture containing a
+    member whose enrolment outlives them, which the synthetic generator
+    does not produce.
+    """
+    sql = (Path(qrp.__file__).parent / "sql" / "92_cidadenom.sql").read_text()
+    assert "deathdt" in sql, (
+        "the denominator window ignores death entirely, so enrolment "
+        "spans that outlive a member are counted in full")
+    # and it must bound the END of the window, not merely be mentioned
+    assert "d.deathdt <= e.enr_end" in sql
+    assert "THEN d.deathdt ELSE e.enr_end END" in sql
+
+
+def test_supply_and_amount_are_clipped_to_the_episode():
+    """SAS's TotRxSup counts only the days of each dispensing that fall
+    inside [IndexDt, EpisodeEndDt], and TotRxAmt prorates the amount by
+    the same fraction. This package reported the UNCAPPED episode supply
+    (+17% against SAS) and the INDEX dispensing's amount alone (-73%).
+
+    Checked per episode against SAS's master list on wp307: the clipped
+    supply matches on 31,453 of 31,464 episodes.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        r = eng.con.execute("""
+            SELECT
+              count(*) FILTER (WHERE episode_totrxsup > episode_rxsup),
+              count(*) FILTER (WHERE episode_totrxsup < episode_rxsup),
+              count(*) FILTER (WHERE episode_totrxsup <= 0)
+            FROM cohort_final""").fetchone()
+        assert r[0] == 0, "clipped supply exceeded the uncapped supply"
+        assert r[1] > 0, (
+            "no episode had its supply clipped, so the window is not "
+            "being applied — truncated episodes must report less supply")
+        assert r[2] == 0, "an episode reported no supply at all"
+    finally:
+        eng.close()
+
+
+def test_integer_rxamt_is_flagged():
+    """An INTEGER rxamt means fractional amounts were truncated when the
+    extract was written; amounts below 1 become 0 and are then removed
+    by the `rxamt > 0` rule. It must not pass silently."""
+    import warnings
+
+    from qrp import Engine
+
+    # the synthetic fixture writes integer amounts, so it must warn
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        eng = Engine(verbose=False)
+        try:
+            run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        finally:
+            eng.close()
+    assert any("rxamt is stored as" in str(w.message) for w in caught)
+
+
+def test_denominator_is_shaved_around_outcome_events():
+    """SAS removes member-time around every follow-up EVENT claim, from
+    `ADate - BLACKOUTPER + 1` to `ExpireDt + FUPWASHPER`, across the whole
+    eligible population (ms_cidadenom.sas:486-515). Adding it took wp307's
+    member-day gap from +753 to exact.
+
+    Cohorts that differ ONLY in their outcome share one denominator
+    config — the outcome is applied per cohort in small scopes rather
+    than recomputing every member once per outcome — yet each must get
+    its own counts, and one cohort's outcome must never reach another's.
+    The test builds exactly that pair, because cohorts with different
+    exposures have separate configs anyway and would not exercise the
+    scope filter at all.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+    from qrp.pipeline import _denom_cfg_id
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+
+    # make beta_blocker an exact copy of lisinopril except for its name,
+    # so the two share one denominator config
+    def is_lis(r): return r.get("group") == "lisinopril"
+    codes = [r for r in base["cohortcodes"] if r.get("group") != "beta_blocker"]
+    codes += [dict(r, group="beta_blocker") for r in base["cohortcodes"] if is_lis(r)]
+    lis_t2 = next(r for r in base["type2file"] if is_lis(r))
+    t2 = [dict(lis_t2, group=r["group"]) if r.get("group") == "beta_blocker" else r
+          for r in base["type2file"]]
+    extra = {k: [dict(r, group="beta_blocker") if r.get("group") == "beta_blocker" else r
+                 for r in base.get(k, [])]
+             for k in ("inclusioncodes",) if k in base}
+    shared = {**base, **extra, "type2file": t2,
+              "userstrata": [{"tableid": "t2cida", "levelid": "1", "levelvars": ""}]}
+
+    # a frequent diagnosis that is not already in use, as an outcome for
+    # lisinopril ONLY
+    used = {str(r.get("code")) for r in codes}
+    code = "X00529"
+    assert code not in used, "pick a code that is not already used"
+
+    def counts(extra_codes):
+        s = load_study_dict({**shared, "cohortcodes": codes + extra_codes})
+        eng = Engine(verbose=False)
+        try:
+            run(s, DATA, engine=eng, verbose=False)
+            return s, dict(eng.con.execute(
+                'SELECT "group", dennummemdays FROM denomcounts').fetchall())
+        finally:
+            eng.close()
+
+    s0, without = counts([])
+    s1, with_event = counts([{"group": "lisinopril", "codecat": "DX",
+                              "code": code, "fupcriteria": "DEF"}])
+
+    cl = [c for c in s1.cohorts if c.cohortgrp == "lisinopril"][0]
+    cb = [c for c in s1.cohorts if c.cohortgrp == "beta_blocker"][0]
+    assert _denom_cfg_id(cl, s1) == _denom_cfg_id(cb, s1), (
+        "the two cohorts must SHARE a config for this test to mean anything")
+
+    assert with_event["lisinopril"] < without["lisinopril"], (
+        "an outcome that occurs often removed no member-time")
+    assert with_event["beta_blocker"] == without["beta_blocker"], (
+        "lisinopril's outcome leaked into beta_blocker's denominator",
+        without["beta_blocker"], with_event["beta_blocker"])
+
+
+def test_denominator_washout_chain_restarts_each_enrolment_span():
+    """SAS's stockpile chain for the denominator washout RESTARTS in each
+    enrolment span: a fill in a new span is never pushed by supply carried
+    over from the previous span.
+
+    Patient 98573092 in the study compared: enrolled to 2019-07-31 and
+    again from 2019-10-01. SAS keeps their 2019-10-21 fill on 2019-10-21;
+    a single continuous chain pushed it to 2019-11-09. Chaining per span
+    made all 194,122 washout periods across 20 incident cohorts match
+    SAS's `_UneligGroupIndex` exactly, and denominator member-days exact
+    on all 40 cohorts.
+
+    Behaviourally: the first dispensing in every span must keep its own
+    date, whatever came before it in an earlier span.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    # the denominator stage runs only with CIDA strata, and the chain has
+    # work to do only with a washout
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    t2 = [dict(r, t2washper=183) for r in base["type2file"]]
+    study = load_study_dict({
+        **base, "type2file": t2,
+        "userstrata": [{"tableid": "t2cida", "levelid": "1", "levelvars": ""}]})
+
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        # earliest RX fill per (cohort, stockgroup, patient, span) on the
+        # raw side, against the earliest chained date in the same span
+        bad = eng.con.execute("""
+            WITH raw AS (
+                SELECT x.cohortgrp, x.stockgroup, x.patid, en.enr_start AS span,
+                       min(x.adate) AS first_fill
+                FROM exposure_claims x
+                JOIN cfg_cohort c ON c.cohortgrp = x.cohortgrp
+                JOIN enrollment_spans en
+                  ON en.enr_cfg_id = c.enr_cfg_id AND en.patid = x.patid
+                 AND x.adate BETWEEN en.enr_start AND en.enr_end
+                WHERE c.wash_per <> 0 AND x.codecat = 'RX'
+                  -- the chain's own entry rule: supply must reach the
+                  -- start of the enrolment window
+                  AND x.adate + CAST(x.rxsup - 1 AS INTEGER)
+                      >= CAST(? AS DATE) - c.enr_days
+                GROUP BY 1, 2, 3, 4
+            )
+            SELECT count(*) FROM raw r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM _denom_chain d
+                WHERE d.cohortgrp = r.cohortgrp AND d.patid = r.patid
+                  AND d.adate = r.first_fill)
+        """, [study.start_date]).fetchone()[0]
+        total = eng.con.execute("SELECT count(*) FROM _denom_chain").fetchone()[0]
+        assert total > 0, "the denominator washout chain is empty"
+        assert bad == 0, (
+            f"{bad} span(s) had their first fill pushed — supply was carried "
+            f"across an enrolment gap")
+    finally:
+        eng.close()
+
+
+def test_master_list_columns_use_one_lookup_per_source():
+    """The master-list covariate flags and utilization counts must come
+    from ONE pivot over `covariates_long` and ONE join to `utilization`,
+    however many covariates the study defines.
+
+    The first version emitted a correlated EXISTS per covariate and a
+    scalar subquery per count, so the work grew with episodes x
+    covariates; at 20x wp307's sample it ran out of memory where the
+    pivot took 5-6s. The static join-budget test cannot catch this — it
+    reads the .sql template, which holds only a placeholder — so this
+    test inspects the SQL that is actually generated.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+    from qrp.pipeline import _mstr_extra_columns
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base, "utilfile": [
+        {"group": g, "utiltype": "MED", "utilfrom": -183, "utilto": -1}
+        for g in ("lisinopril", "beta_blocker")]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        cols, joins = _mstr_extra_columns(eng, study)
+    finally:
+        eng.close()
+    n_cov = len({c.covarnum for c in study.covariates})
+    assert n_cov > 1, "needs several covariates to mean anything"
+    sql = cols + joins
+    assert sql.count("covariates_long") == 1, sql
+    assert sql.count("JOIN utilization") == 1, sql
+    assert "EXISTS" not in sql and "SELECT u." not in sql, (
+        "per-row correlated lookups are back")
+    # one output column per covariate (each line names it twice: the
+    # pivot's column, then the alias)
+    assert cols.count(' AS "COVAR') == n_cov
+
+
+def test_baseline_uses_one_lookup_per_source():
+    """The baseline table's covariate counts and mean/std columns must
+    come from ONE covariate pivot and one join per measure table, not a
+    correlated lookup per column per episode.
+
+    The first version put a correlated EXISTS per covariate and a scalar
+    subquery per mean/std column inside the aggregation — the same flaw
+    as the master list, in a step that runs outside any timed stage. Its
+    replacement produces an identical baseline (every column and value,
+    on wp307 and the 600k-code study). Like the master list, the SQL is
+    generated in Python, so the static join test cannot see it.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+    from qrp.pipeline import _baseline_dummies
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base, "utilfile": [
+        {"group": g, "utiltype": "MED", "utilfrom": -183, "utilto": -1}
+        for g in ("lisinopril", "beta_blocker")]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        sql = _baseline_dummies(eng, study)
+    finally:
+        eng.close()
+    assert len({c.covarnum for c in study.covariates}) > 1
+    assert sql.count("covariates_long") == 1, sql
+    assert sql.count("JOIN utilization") == 1, sql
+    assert "EXISTS" not in sql and "(SELECT u." not in sql, (
+        "per-row correlated lookups are back in the baseline")
+
+
+def test_combo_covariates_are_evaluated_in_order():
+    """SAS evaluates combinations one at a time in covariate-number order
+    (ms_cidacov.sas:1201-1220), so a combination sees every combination
+    numbered before it and none numbered after. wp307's covar32
+    references covar31; evaluating all of them against the table as it
+    stood before any were added missed 171 of SAS's episodes.
+
+    Each combination is still a pivot, not a correlated EXISTS per
+    reference per episode. Self-contained: an earlier version read a
+    study file outside the repository and would have skipped elsewhere.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    combos = [
+        # 13 = 1 or 2 ;  14 sees 13 (earlier) ;  15 sees 16 (LATER) -> never
+        {"covarnum": 13, "codecat": "CC", "code": "1 or 2", "codedays": 1,
+         "dateonly": "N"},
+        {"covarnum": 14, "codecat": "CC", "code": "13", "codedays": 1,
+         "dateonly": "N"},
+        {"covarnum": 15, "codecat": "CC", "code": "16", "codedays": 1,
+         "dateonly": "N"},
+        {"covarnum": 16, "codecat": "CC", "code": "1 or 2", "codedays": 1,
+         "dateonly": "N"},
+    ]
+    study = load_study_dict(
+        {**base, "covariatecodes": list(base["covariatecodes"]) + combos})
+    from qrp.pipeline import _combo_sql
+    sql = _combo_sql(study)
+    assert "EXISTS" not in sql, "per-reference correlated lookups are back"
+
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        n = dict(eng.con.execute(
+            "SELECT covarnum, count(*) FROM covariates_long "
+            "WHERE covarnum IN (13, 14, 15, 16) GROUP BY 1").fetchall())
+    finally:
+        eng.close()
+    assert n.get(13, 0) > 0, "the base combination matched nothing"
+    assert n.get(14, 0) == n[13], (
+        "a combination must see one numbered BEFORE it", n)
+    assert n.get(16, 0) == n[13]
+    assert n.get(15, 0) == 0, (
+        "a combination must NOT see one numbered AFTER it", n)
+
+
+def test_covariate_codes_keep_their_own_category():
+    """A covariate can mix categories. wp307's 'Pegfilgrastim Post-Index'
+    lists NDCs as dispensings (RX), NDCs billed on procedure claims (PX)
+    and J-codes (PX). The loader took the category from the FIRST row, so
+    the covariate matched only dispensings and found 15 of SAS's 224
+    episodes; per-code categories brought SAS-only covariate flags on
+    wp307 from 783 to 447 with no new false positives.
+    """
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    rows = [
+        {"covarnum": 90, "codecat": "RX", "codetype": "ND", "code": "N00001",
+         "covfrom": -30, "covto": -1},
+        {"covarnum": 90, "codecat": "PX", "codetype": "HC", "code": "J9999",
+         "covfrom": -30, "covto": -1},
+    ]
+    study = load_study_dict(
+        {**base, "covariatecodes": list(base["covariatecodes"]) + rows})
+    cov = next(c for c in study.covariates if int(c.covarnum) == 90)
+    assert dict(cov.code_cats) == {"N00001": "RX", "J9999": "PX"}, cov.code_cats
+
+
+def test_covariate_dispensings_are_stockpiled():
+    """SAS stockpiles covariate dispensings: clipped to enrolment, chained
+    per patient by covariate and stockgroup, clipped again
+    (ms_cidacov_codeextraction.sas:590-672). With raw fill dates, wp307's
+    post-index drug covariates disagreed with SAS in both directions;
+    stockpiling took SAS-only covariate flags from 276 to 14 and
+    mine-only from 252 to 99, with 28 of 32 covariates exact.
+
+    Behaviourally: for a covariate on a drug whose refills overlap, the
+    chain must move some fills LATER, and never any earlier.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    lis = sorted({str(r["code"]) for r in base["cohortcodes"]
+                  if r.get("group") == "lisinopril"
+                  and str(r.get("codecat", "")).upper() == "RX"})
+    assert lis, "lisinopril has no dispensing codes to build on"
+    rows = [{"covarnum": 90, "codecat": "RX", "codetype": "ND", "code": c,
+             "stockgroup": "lis", "covfrom": 1, "covto": 30, "dateonly": "Y"}
+            for c in lis]
+    study = load_study_dict(
+        {**base, "covariatecodes": list(base["covariatecodes"]) + rows})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        moved, earlier = eng.con.execute(f"""
+            WITH first_fill AS (
+                SELECT patid, min(adate) AS d FROM cdm_dispensing
+                WHERE code IN ({",".join(f"'{c}'" for c in lis)})
+                GROUP BY 1)
+            SELECT
+              count(*) FILTER (WHERE NOT EXISTS (
+                  SELECT 1 FROM cdm_dispensing d
+                  WHERE d.patid = x.patid AND d.adate = x.adate
+                    AND d.code IN ({",".join(f"'{c}'" for c in lis)}))
+                  -- clipping to enrolment also moves fills, onto a span
+                  -- start; only a move clipping cannot explain shows the
+                  -- chain at work
+                  AND NOT EXISTS (
+                      SELECT 1 FROM enrollment_spans en
+                      WHERE en.patid = x.patid AND en.enr_start = x.adate)),
+              count(*) FILTER (WHERE x.adate < f.d)
+            FROM _covar_rx_chain x JOIN first_fill f USING (patid)
+            WHERE x.covarnum = 90""").fetchone()
+    finally:
+        eng.close()
+    assert moved > 0, "no fill was moved: covariate dispensings are not stockpiled"
+    assert earlier == 0, f"{earlier} chained dates fall before the first fill"
+
+
+def test_covariate_chain_admits_only_claims_reaching_the_enrolment_window():
+    """The covariate dispensing chain applies the exposure chain's entry
+    rule: a dispensing whose supply ends before the cohort's enrolment
+    window opens (`start_date - enr_days`) never enters it. Without the
+    rule, old fills pushed later ones forward and wp307's pre-index drug
+    covariates flagged episodes SAS does not (mine-only 99 -> 1, SAS-only
+    14 -> 0; 31 of 32 covariates exact).
+
+    Invariant: no chained period may END before the window opens — only
+    claims reaching it are admitted, and chaining only moves dates later.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    lis = sorted({str(r["code"]) for r in base["cohortcodes"]
+                  if r.get("group") == "lisinopril"
+                  and str(r.get("codecat", "")).upper() == "RX"})
+    rows = [{"covarnum": 90, "codecat": "RX", "codetype": "ND", "code": c,
+             "stockgroup": "lis", "covfrom": -365, "covto": -1, "dateonly": "N"}
+            for c in lis]
+    study = load_study_dict(
+        {**base, "covariatecodes": list(base["covariatecodes"]) + rows})
+    codes = ",".join(f"'{c}'" for c in lis)
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        early, bad = eng.con.execute(f"""
+            WITH opens AS (
+                SELECT DISTINCT enr_cfg_id, CAST(? AS DATE) - enr_days AS d
+                FROM cfg_covariates)
+            SELECT
+              (SELECT count(*) FROM cdm_dispensing x
+               JOIN enrollment_spans en ON en.patid = x.patid
+                AND x.adate BETWEEN en.enr_start AND en.enr_end
+               JOIN opens o ON o.enr_cfg_id = en.enr_cfg_id
+               WHERE x.code IN ({codes})
+                 AND x.adate + CAST(x.rxsup - 1 AS INTEGER) < o.d),
+              (SELECT count(*) FROM _covar_rx_chain c
+               JOIN opens o ON o.enr_cfg_id = c.enr_cfg_id
+               WHERE c.covarnum = 90 AND c.cend_max < o.d)
+        """, [study.start_date]).fetchone()
+    finally:
+        eng.close()
+    assert early > 0, "no dispensing ends before the window: the test proves nothing"
+    assert bad == 0, f"{bad} chained periods end before the enrolment window opens"
+
+
+def test_covariate_chain_clips_supply_across_an_enrolment_gap():
+    """A dispensing that straddles an enrolment gap is split into one
+    piece per span, and each piece must carry its CLIPPED supply. Keeping
+    the full supply on both counted it twice.
+
+    Replays wp307 patient 124844251 (hctz_rupture_prev, index 2023-08-15):
+    enrolled 2019-07-01..2022-09-30 and 2023-01-01..2024-12-31, with a
+    180-day fill on 2022-07-19 across the gap. With full supply on the
+    2023 piece, the 2023 fills were pushed into the pre-index window and
+    the covariate was flagged where SAS does not flag it. Clipped (74 and
+    14 days), it is not. This was the last of wp307's 12,363 covariate
+    flags to match SAS.
+
+    Patient 2 is a positive control — an ordinary fill inside the window
+    — so the test cannot pass on a stage that flags nothing.
+    """
+    import datetime as dt
+    from qrp import Engine
+
+    D = dt.date
+    eng = Engine(verbose=False)
+    try:
+        eng.script_stage("macros", "00_macros.sql")
+        eng.register("cfg_covariates", [
+            {"cohortgrp": "g", "enr_cfg_id": "e", "enr_days": 183,
+             "covarnum": 1, "covarname": "drug pre-index", "codecat": "RX",
+             "covfrom": -30, "covto": -1, "covfromanchor": "INDEXDT",
+             "covtoanchor": "INDEXDT", "dateonly": False}],
+            """cohortgrp VARCHAR, enr_cfg_id VARCHAR, enr_days INTEGER,
+               covarnum INTEGER, covarname VARCHAR, codecat VARCHAR,
+               covfrom INTEGER, covto INTEGER, covfromanchor VARCHAR,
+               covtoanchor VARCHAR, dateonly BOOLEAN""")
+        eng.register("cfg_covariate_codes", [
+            {"covarnum": 1, "code": "N1", "codecat": "RX", "stockgroup": "s"}],
+            "covarnum INTEGER, code VARCHAR, codecat VARCHAR, stockgroup VARCHAR")
+        fills = [(1, D(2022, 7, 19), 180), (1, D(2023, 1, 26), 30),
+                 (1, D(2023, 8, 15), 30),
+                 (2, D(2023, 8, 1), 30)]
+        eng.register("cohort_claims", [
+            {"patid": p, "adate": a, "expiredt": a + dt.timedelta(days=s - 1),
+             "code": "N1", "codecat": "RX"} for p, a, s in fills],
+            "patid BIGINT, adate DATE, expiredt DATE, code VARCHAR, codecat VARCHAR")
+        eng.register("enrollment_spans", [
+            {"enr_cfg_id": "e", "patid": 1, "enr_start": D(2019, 7, 1), "enr_end": D(2022, 9, 30)},
+            {"enr_cfg_id": "e", "patid": 1, "enr_start": D(2023, 1, 1), "enr_end": D(2024, 12, 31)},
+            {"enr_cfg_id": "e", "patid": 2, "enr_start": D(2019, 1, 1), "enr_end": D(2024, 12, 31)}],
+            "enr_cfg_id VARCHAR, patid BIGINT, enr_start DATE, enr_end DATE")
+        eng.register("ptsmasterlist", [
+            {"cohortgrp": "g", "patid": p, "indexdt": D(2023, 8, 15),
+             "episodeenddt": D(2023, 9, 13)} for p in (1, 2)],
+            "cohortgrp VARCHAR, patid BIGINT, indexdt DATE, episodeenddt DATE")
+        eng.script_stage("covariates", "80_covariates.sql", start_date="2016-04-01")
+        flagged = {r[0] for r in eng.con.execute(
+            "SELECT patid FROM covariates_long WHERE covarnum = 1").fetchall()}
+    finally:
+        eng.close()
+    assert 2 in flagged, "the positive control was not flagged: the stage did not run as intended"
+    assert 1 not in flagged, (
+        "a fill straddling an enrolment gap kept its full supply on both pieces")
+
+
+def test_supply_counting_stops_at_the_first_event():
+    """SAS's TotRxSup counts supply up to where FOLLOW-UP ends, and an
+    outcome event ends it. wp307 warfarin patient 82014737: SAS has
+    10 + 19 days, clipped at the first event on 2024-05-13; counting to
+    the episode end gave 10 + 30. Clipping at the event took the supply
+    mismatches from 11 episodes to 8 with every count still exact.
+
+    Invariant: counted supply cannot exceed (days from index to the end
+    of follow-up) x (stockgroups the episode draws on). The guard makes
+    sure some episode really has supply running past its event.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base, "userstrata": [
+        {"tableid": "t2cida", "levelid": "1", "levelvars": ""}]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        past, over = eng.con.execute("""
+            WITH ep AS (
+                SELECT f.cohortgrp, f.patid, f.indexdt, f.episode_totrxsup,
+                       least(f.episodeenddt, f.feventdt) AS fup_end,
+                       f.episodeenddt
+                FROM cohort_final f
+                WHERE f.feventdt IS NOT NULL AND f.feventdt < f.episodeenddt),
+            k AS (
+                SELECT e.cohortgrp, e.patid, e.indexdt,
+                       count(DISTINCT s.stockgroup) AS n_sg,
+                       max(s.expiredt) AS last_supply
+                FROM ep e JOIN stockpiled s
+                  ON s.cohortgrp = e.cohortgrp AND s.patid = e.patid
+                 AND s.adate <= e.episodeenddt AND s.expiredt >= e.indexdt
+                GROUP BY 1, 2, 3)
+            SELECT
+              count(*) FILTER (WHERE k.last_supply > e.fup_end),
+              count(*) FILTER (WHERE e.episode_totrxsup >
+                  (date_diff('day', e.indexdt, e.fup_end) + 1) * k.n_sg)
+            FROM ep e JOIN k USING (cohortgrp, patid, indexdt)
+        """).fetchone()
+    finally:
+        eng.close()
+    assert past > 0, "no episode has supply running past its event: proves nothing"
+    assert over == 0, f"{over} episodes count supply after follow-up ended"
+
+
+def test_supply_and_amount_replay_wp307_patients():
+    """The episode supply/amount statement, run on four wp307 patients
+    replayed exactly — one per rule that brought `daysupp` and `amtsupp`
+    to exact agreement with SAS:
+
+      82014737  supply stops at the first event (2024-05-13): 10 + 19 = 29
+      60364873  duplicate same-day procedure claims each count: 6, not 3
+      153716000 same-day fills shaved to ENROLMENT before combining:
+                92 x 50/71 = 64.7887, not 102 x 50/81 = 62.963
+      164261173 same-day fills running past the window but NOT past
+                enrolment are prorated once: 254 x 64/118 = 137.7627
+                (this case is what ruled out clipping at the window)
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date
+    sql = (Path(qrp.__file__).parent / "sql" / "60_followup.sql").read_text()
+    stmt = [s for s in split_statements(sql) if s.target == "cohort_final"][-1].sql
+
+    eps = [  # cohortgrp, patid, indexdt, episodeenddt, feventdt, enr_end
+        ("w", 1, D(2024, 4, 12), D(2024, 6, 23), D(2024, 5, 13), D(2024, 9, 30)),
+        ("f", 2, D(2018, 9, 19), D(2018, 10, 21), None, D(2024, 12, 31)),
+        ("d", 3, D(2023, 9, 12), D(2023, 10, 31), None, D(2023, 10, 31)),
+        ("d", 4, D(2024, 7, 16), D(2024, 9, 17), None, D(2024, 12, 31)),
+    ]
+    # stockpiled rows (dispensings and, for patient 2, the collapsed
+    # procedure rows), and the raw claims behind them
+    stock = [  # cohortgrp, patid, stockgroup, orig, adate, expiredt, rxsup, rxamt
+        ("w", 1, "war", D(2024, 4, 12), D(2024, 4, 12), D(2024, 4, 21), 10, 10.0),
+        ("w", 1, "war", D(2024, 4, 25), D(2024, 4, 25), D(2024, 5, 24), 30, 30.0),
+        ("f", 2, "fil", D(2018, 9, 19), D(2018, 9, 19), D(2018, 9, 19), 1, 1.0),
+        ("f", 2, "fil", D(2018, 9, 20), D(2018, 9, 20), D(2018, 9, 20), 1, 1.0),
+        ("f", 2, "fil", D(2018, 9, 21), D(2018, 9, 21), D(2018, 9, 21), 1, 1.0),
+        ("d", 3, "doac", D(2023, 9, 12), D(2023, 9, 12), D(2023, 12, 1), 81, 102.0),
+        ("d", 4, "doac", D(2024, 7, 16), D(2024, 7, 16), D(2024, 11, 10), 118, 254.0),
+    ]
+    raw = [  # cohortgrp, patid, stockgroup, adate, rxsup, rxamt, codecat
+        ("w", 1, "war", D(2024, 4, 12), 10, 10.0, "RX"),
+        ("w", 1, "war", D(2024, 4, 25), 30, 30.0, "RX"),
+        *[("f", 2, "fil", D(2018, 9, 19 + i), 1, 1.0, "PX") for i in range(3) for _ in range(2)],
+        ("d", 3, "doac", D(2023, 9, 12), 21, 42.0, "RX"),
+        ("d", 3, "doac", D(2023, 9, 12), 60, 60.0, "RX"),
+        ("d", 4, "doac", D(2024, 7, 16), 90, 180.0, "RX"),
+        ("d", 4, "doac", D(2024, 7, 16), 28, 74.0, "RX"),
+    ]
+    eng = Engine(verbose=False)
+    try:
+        eng.register("cohort_final", [
+            dict(zip(("cohortgrp", "patid", "indexdt", "episodeenddt",
+                      "feventdt", "enr_end"), e)) for e in eps],
+            "cohortgrp VARCHAR, patid BIGINT, indexdt DATE, episodeenddt DATE, "
+            "feventdt DATE, enr_end DATE")
+        eng.register("stockpiled", [
+            dict(zip(("cohortgrp", "patid", "stockgroup", "orig_adate", "adate",
+                      "expiredt", "rxsup", "rxamt"), r)) for r in stock],
+            "cohortgrp VARCHAR, patid BIGINT, stockgroup VARCHAR, orig_adate DATE, "
+            "adate DATE, expiredt DATE, rxsup INTEGER, rxamt DOUBLE")
+        eng.register("exposure_claims", [
+            dict(zip(("cohortgrp", "patid", "stockgroup", "adate", "rxsup",
+                      "rxamt", "codecat"), r)) for r in raw],
+            "cohortgrp VARCHAR, patid BIGINT, stockgroup VARCHAR, adate DATE, "
+            "rxsup INTEGER, rxamt DOUBLE, codecat VARCHAR")
+        eng.con.execute(stmt)
+        got = {p: (s, round(a, 4)) for p, s, a in eng.con.execute(
+            "SELECT patid, episode_totrxsup, episode_totrxamt FROM cohort_final"
+        ).fetchall()}
+    finally:
+        eng.close()
+    assert got[1][0] == 29, ("supply must stop at the first event", got[1])
+    assert got[2][0] == 6, ("duplicate procedure claims each count", got[2])
+    assert got[3][1] == 64.7887, ("fills shaved to enrolment before combining", got[3])
+    assert got[4][1] == 137.7627, ("fills inside enrolment prorated once", got[4])
+
+
+def test_sas_utilfile_and_drugclass_formats_are_read():
+    """Both files failed SILENTLY in SAS's own formats.
+
+    UTILFILE is wide in SAS — one row per group with medutilfrom/medutilto
+    AND drugutilfrom/drugutilto. Only the long shape (utiltype, utilfrom,
+    utilto) was read, so each wide row became a MEDICAL window with the
+    default -365..-1 and no DRUG window was created: wp307's medical
+    counts ran ~3x SAS's and every drug count was zero.
+
+    The drug class file keys on `rx` and carries `generic`. Requiring a
+    `code` column dropped all 301,245 rows of wp307's file.
+
+    With both read (and utilization limited to createbaseline cohorts),
+    numrx, NumGeneric, NumClass, NumIP and NumED match SAS on every wp307
+    episode.
+    """
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base,
+        "utilfile": [{"group": "lisinopril", "medutilfrom": -183, "medutilto": 0,
+                      "drugutilfrom": -90, "drugutilto": 0}],
+        "drugclassfile": [{"rx": "N00001", "generic": "lisinopril",
+                           "classname": "ACE inhibitors"}]})
+    assert set(study.utilization) == {
+        ("lisinopril", "MED", -183, 0), ("lisinopril", "DRUG", -90, 0)}, study.utilization
+    assert study.drug_classes == (("N00001", "ACE inhibitors", "lisinopril"),)
+
+    # the long shape still works
+    long = load_study_dict({**base, "utilfile": [
+        {"group": "lisinopril", "utiltype": "DRUG", "utilfrom": -30, "utilto": -1}]})
+    assert long.utilization == (("lisinopril", "DRUG", -30, -1),)
+
+
+def test_mfu_reads_sas_format_rows():
+    """Three silent failures in SAS-format MFU rows (wp307's only row has
+    no group, countmethod 'P' and codetype '10'):
+
+    * a row naming no group applies to EVERY cohort; such rows were
+      dropped, so wp307 produced no MFU table at all;
+    * 'P' ranks by distinct patients; only 'PATCOUNT' was recognised, so
+      'P' fell back to ranking by claims;
+    * codetype restricts the code system; it was ignored.
+
+    With all three, wp307's MFU matches SAS's r01_mfu at every one of 400
+    rank positions by patient count, with identical counts per code.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base, "mfufile": [
+        {"analysisnum": 1, "codecat": "DX", "countmethod": "P", "topxx": 10,
+         "mfufrom": -365, "mfuto": -1},
+        {"analysisnum": 2, "codecat": "DX", "countmethod": "P", "topxx": 10,
+         "mfufrom": -365, "mfuto": -1, "codetype": "ZZ"}]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        con = eng.con
+        cohorts = {r[0] for r in con.execute(
+            "SELECT DISTINCT cohortgrp FROM mfu WHERE analysisnum = 1").fetchall()}
+        n2 = con.execute("SELECT count(*) FROM mfu WHERE analysisnum = 2").fetchone()[0]
+        by_pat = con.execute("""
+            SELECT count(*) FROM (
+              SELECT patcount < lead(patcount) OVER w AS bad
+              FROM mfu WHERE analysisnum = 1
+              WINDOW w AS (PARTITION BY cohortgrp ORDER BY rank)) WHERE bad""").fetchone()[0]
+        claims_disagree = con.execute("""
+            SELECT count(*) FROM (
+              SELECT codecount < lead(codecount) OVER w AS inv
+              FROM mfu WHERE analysisnum = 1
+              WINDOW w AS (PARTITION BY cohortgrp ORDER BY rank)) WHERE inv""").fetchone()[0]
+    finally:
+        eng.close()
+    assert cohorts == {c.cohortgrp for c in study.cohorts}, (
+        "a row naming no group must apply to every cohort", cohorts)
+    assert by_pat == 0, "countmethod 'P' must rank by distinct patients"
+    assert claims_disagree > 0, (
+        "patient and claim rankings agree everywhere: 'P' is untested")
+    assert n2 == 0, "codetype must restrict the code system"
+
+
+def test_risk_scores_follow_the_risk_score_file():
+    """RISKSCOREFILE names the scores a study wants and gives each its
+    window; RISKSCORECODES is a shared library. Three silent failures:
+
+    * the risk score file was never read, so every score's window fell
+      back to -365..-1 (wp307's file says -183..0);
+    * every score in the library was computed (seven in wp307's), not
+      just the requested CCI;
+    * a score with no intercept row vanished: the intercepts are
+      cross-joined, and only scores WITH one were listed. In wp307's
+      library only FRAILTY has an intercept, so FRAILTY was reported
+      under the name of the requested CCI.
+
+    Fixed, CCI matches SAS on all 31,464 wp307 episodes.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    code = "X00529"            # a frequent diagnosis the demo study does not use
+    study = load_study_dict({**base,
+        "riskscorefile": [{"riskscore": "AAA", "riskfrom": -183, "riskto": 0}],
+        "riskscorecodes": [
+            {"riskscore": "AAA", "code": code, "codecat": "DX", "condid": "01", "weight": 1},
+            {"riskscore": "BBB", "code": code, "codecat": "DX", "condid": "01", "weight": 1},
+            {"riskscore": "BBB", "code": "", "codecat": "IN", "condid": "IN", "weight": 5}]})
+    assert {(r.riskscore, r.riskfrom, r.riskto) for r in study.risk_scores} == {
+        ("AAA", -183, 0)}, "only the requested score, with the file's window"
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        scores, hit = eng.con.execute("""
+            SELECT list(DISTINCT riskscore), count(*) FILTER (WHERE score > 0)
+            FROM risk_scores""").fetchone()
+    finally:
+        eng.close()
+    assert scores == ["AAA"], f"a score without an intercept must be reported: {scores}"
+    assert hit > 0, "no episode scored: the test proves nothing"
+
+
+def test_master_list_utilization_and_score_columns_follow_sas():
+    """Master-list columns added to match SAS's mstr, each verified on all
+    31,464 wp307 episodes including where SAS leaves them NULL:
+
+    * utilization is NULL (not zero) for cohorts SAS computes none for
+      (createbaseline = 'N'); NumVisits is blank there;
+    * ExactNumVisit is the number of distinct visit DAYS; NumVisits is its
+      category '0' / '1' / '2-7' / '8+' (it held the numeric total);
+    * each requested risk score is a column named after it ("CCI"),
+      reported for every cohort;
+    * fupdays_value_cat buckets followuptime; Censorcat_sort is its rank.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    cf = [dict(r, createbaseline=("N" if (r.get("cohortgrp") or r.get("group")) == "beta_blocker" else "Y"))
+          for r in base["cohortfile"]]
+    study = load_study_dict({**base, "cohortfile": cf,
+        "utilfile": [{"group": g, "medutilfrom": -183, "medutilto": 0,
+                      "drugutilfrom": -183, "drugutilto": 0}
+                     for g in ("lisinopril", "beta_blocker")],
+        "riskscorefile": [{"riskscore": "AAA", "riskfrom": -183, "riskto": 0}],
+        "riskscorecodes": [{"riskscore": "AAA", "code": "X00529", "codecat": "DX",
+                            "condid": "01", "weight": 1}]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        r = eng.con.execute("""
+            SELECT
+              count(*) FILTER (WHERE cohortgrp = 'beta_blocker' AND
+                  ("NumAV" IS NOT NULL OR "ExactNumVisit" IS NOT NULL OR "NumVisits" <> '')),
+              count(*) FILTER (WHERE cohortgrp = 'lisinopril' AND "NumVisits" IS DISTINCT FROM
+                  CASE WHEN "ExactNumVisit" = 0 THEN '0' WHEN "ExactNumVisit" = 1 THEN '1'
+                       WHEN "ExactNumVisit" <= 7 THEN '2-7' ELSE '8+' END),
+              count(*) FILTER (WHERE cohortgrp = 'lisinopril' AND "ExactNumVisit" > 0),
+              count(*) FILTER (WHERE "AAA" IS NULL),
+              count(*) FILTER (WHERE "fupdays_value_cat" IS DISTINCT FROM
+                  CASE WHEN followuptime <= 90 THEN '0-90' WHEN followuptime <= 180
+                       THEN '91-180' ELSE '181+' END)
+            FROM cohort_final""").fetchone()
+        types = eng.con.execute(
+            'SELECT typeof("ExactNumVisit"), typeof("NumVisits") FROM cohort_final LIMIT 1'
+        ).fetchone()
+    finally:
+        eng.close()
+    # ExactNumVisit is a count, so an integer: SAS stores every numeric as a
+    # double, but a count can never be fractional. NumVisits is text, as SAS.
+    assert types == ("BIGINT", "VARCHAR"), types
+    assert r[0] == 0, "utilization must be NULL / blank where SAS computes none"
+    assert r[2] > 0, "no visits found: the category check proves nothing"
+    assert r[1] == 0, "NumVisits must be the category of ExactNumVisit"
+    assert r[3] == 0, "the risk score column must be named after the score"
+    assert r[4] == 0, "fupdays_value_cat must bucket followuptime"
+
+
+def test_distindex_numbering_follows_ms_codedistribution():
+    """distindexexp / distindexhoi, from ms_codedistribution.sas: each
+    index entity is numbered by row position — drug stockgroups sorted,
+    then medical codes sorted and EXPANDED in place (care setting '**' ->
+    IP IS ED AV OA; DX flag '*' -> P S X ''; PX -> X '') — and an episode's
+    value is its claims' ids joined with '_' in CHARACTER order.
+
+    Hand-derived ids for this replay:
+      exposure: stockgroups pegA=1, pegB=2; J2505 occupies 3..12, so
+                J2505 at AV (blank flag) = 10; J2506 at AV = 20
+      outcome:  D1 occupies 1..20; AV with flag S = 14
+    Patient 2's '10_2' checks the character order ('10' before '2').
+    On wp307, distindexhoi matches SAS on every episode, distindexexp on
+    all but 10 (claims SAS re-files into an inpatient stay).
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date(2023, 3, 1)
+    sql = (Path(qrp.__file__).parent / "sql" / "62_mstr_wide.sql").read_text()
+    stmts = [s.sql for s in split_statements(sql)
+             if s.target in ("_di_claims", "_di_ids", "_di_exp", "_di_hoi")]
+    assert len(stmts) == 4, [s.target for s in split_statements(sql)]
+    eng = Engine(verbose=False)
+    try:
+        eng.register("cfg_codes", [
+            {"cohortgrp": "g", "role": "DEF", "code": c, "codecat": cat,
+             "codetype": ct, "code_supply": None, "stockgroup": sg}
+            for c, cat, ct, sg in (("N1", "RX", "ND", "pegA"), ("N2", "RX", "ND", "pegB"),
+                                   ("J2505", "PX", "HC", None), ("J2506", "PX", "HC", None))
+        ] + [{"cohortgrp": "g", "role": "EVENT", "code": "D1", "codecat": "DX",
+              "codetype": "10", "code_supply": None, "stockgroup": None}],
+            "cohortgrp VARCHAR, role VARCHAR, code VARCHAR, codecat VARCHAR, "
+            "codetype VARCHAR, code_supply INTEGER, stockgroup VARCHAR")
+        eng.register("cfg_care_setting", [],
+                     "cohortgrp VARCHAR, code VARCHAR, enctype VARCHAR, pdx VARCHAR")
+        eng.register("cohort_final", [
+            {"cohortgrp": "g", "patid": p, "indexdt": D, "feventdt": D} for p in (1, 2, 3)],
+            "cohortgrp VARCHAR, patid BIGINT, indexdt DATE, feventdt DATE")
+        eng.register("stockpiled", [
+            {"cohortgrp": "g", "patid": p, "adate": D, "stockgroup": "pegB"} for p in (1, 2, 3)],
+            "cohortgrp VARCHAR, patid BIGINT, adate DATE, stockgroup VARCHAR")
+        eng.register("cdm_procedure", [
+            {"patid": 1, "adate": D, "code": "J2506", "codetype": "HC", "enctype": "AV", "pdx": ""},
+            {"patid": 2, "adate": D, "code": "J2505", "codetype": "HC", "enctype": "AV", "pdx": ""},
+            # patient 3's claim, ALREADY ENVELOPED into an inpatient stay by
+            # the cdm_procedure view (IP / 'X'): for J2506 that is id 13
+            {"patid": 3, "adate": D, "code": "J2506", "codetype": "HC", "enctype": "IP", "pdx": "X"}],
+            "patid BIGINT, adate DATE, code VARCHAR, codetype VARCHAR, enctype VARCHAR, pdx VARCHAR")
+        eng.register("cdm_diagnosis", [
+            {"patid": 1, "adate": D, "code": "D1", "codetype": "10", "pdx": "S", "enctype": "AV"}],
+            "patid BIGINT, adate DATE, code VARCHAR, codetype VARCHAR, pdx VARCHAR, enctype VARCHAR")
+        eng.register("cdm_dispensing", [], "patid BIGINT, adate DATE, code VARCHAR")
+        for st in stmts:
+            eng.con.execute(st)
+        exp = dict(eng.con.execute("SELECT patid, lst FROM _di_exp").fetchall())
+        hoi = dict(eng.con.execute("SELECT patid, lst FROM _di_hoi").fetchall())
+    finally:
+        eng.close()
+    assert exp == {1: "2_20", 2: "10_2", 3: "13_2"}, exp
+    assert hoi == {1: "14"}, hoi
+
+
+def test_dispensing_whose_supply_reaches_the_window_is_read():
+    """Claims are read from `claims_from` (study start minus the widest
+    look-back any feature needs). A dispensing must be kept if its SUPPLY
+    reaches that date, not only its fill date: the exposure chain admits a
+    fill whose supply reaches the enrolment window, however early it was
+    filled.
+
+    Filtering on the fill date dropped long fills. On wp307, exact parity
+    had rested on an accidental 365-day look-back from a wrong risk-score
+    default; correcting the default shrank the window and broke cohorts
+    (patients +28, episodes +48) without any test noticing.
+    """
+    from datetime import timedelta
+    from qrp import Engine
+
+    from qrp.config import load_study_dict
+
+    # The demo's widest look-back is 365 days, which puts claims_from on
+    # the first day of its data, so nothing could straddle it. Without its
+    # 365-day covariates the span is 183 and claims_from falls mid-2010,
+    # after six months of fills.
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base, "covariatecodes": [
+        r for r in base["covariatecodes"] if int(r.get("covfrom") or 0) > -365]})
+    span = study.widest_lookback_days
+    assert span is not None
+    claims_from = study.start_date - timedelta(days=span)
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        straddling, missing = eng.con.execute("""
+            WITH defs AS (
+                SELECT DISTINCT cohortgrp, code FROM cfg_codes
+                WHERE role = 'DEF' AND codecat = 'RX'),
+            early AS (
+                SELECT k.cohortgrp, d.patid, d.adate, d.code
+                FROM cdm_dispensing d JOIN defs k ON k.code = d.code
+                WHERE d.adate < CAST(? AS DATE)
+                  AND d.adate + CAST(d.rxsup - 1 AS INTEGER) >= CAST(? AS DATE))
+            SELECT count(*),
+                   count(*) FILTER (WHERE NOT EXISTS (
+                       SELECT 1 FROM exposure_claims x
+                       WHERE x.cohortgrp = e.cohortgrp AND x.patid = e.patid
+                         AND x.adate = e.adate AND x.code = e.code))
+            FROM early e""", [claims_from, claims_from]).fetchone()
+    finally:
+        eng.close()
+    assert straddling > 0, "no fill straddles claims_from: the test proves nothing"
+    assert missing == 0, f"{missing} fills whose supply reaches the window were dropped"
+
+
+def test_inpatient_stay_days_follow_run_envelope():
+    """The days that envelope a claim (ms_envelope.sas). RUN_ENVELOPE 0:
+    admit through discharge, touching stays merged (their union is the
+    same set of days); any other value but 2: from the day AFTER admit;
+    2: none. A missing discharge date is a one-day stay; a table without
+    `ddate` at all must not fail.
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date
+    sql = (Path(qrp.__file__).parent / "sql" / "10_normalize.sql").read_text()
+    stmt = next(st.sql for st in split_statements(sql) if st.target == "_ip_days")
+
+    def days(setting, with_ddate=True):
+        eng = Engine(verbose=False)
+        try:
+            eng.register("enc", [
+                {"patid": 1, "adate": D(2023, 1, 10), "ddate": D(2023, 1, 12), "enctype": "IP"},
+                {"patid": 1, "adate": D(2023, 1, 13), "ddate": D(2023, 1, 13), "enctype": "IP"},
+                {"patid": 2, "adate": D(2023, 2, 1), "ddate": None, "enctype": "IP"},
+                {"patid": 2, "adate": D(2023, 3, 1), "ddate": D(2023, 3, 5), "enctype": "AV"}],
+                "patid BIGINT, adate DATE, ddate DATE, enctype VARCHAR")
+            st = (stmt.replace("{read_encounter}", "enc")
+                      .replace("{run_envelope}", str(setting))
+                      .replace("{opt_ddate}", "ddate" if with_ddate else "NULL"))
+            eng.con.execute(st)
+            return {(p, d.day if d.month == 1 else -d.day) for p, d in
+                    eng.con.execute("SELECT patid, day FROM _ip_days").fetchall()}
+        finally:
+            eng.close()
+
+    # patient 1: 10..12 and 13 (touching); patient 2: one day (no ddate);
+    # the AV encounter never envelopes. February days are negated above.
+    assert days(0) == {(1, 10), (1, 11), (1, 12), (1, 13), (2, -1)}
+    assert days(1) == {(1, 11), (1, 12)}
+    assert days(2) == set()
+    assert days(0, with_ddate=False) == {(1, 10), (1, 13), (2, -1)}
+
+
+def test_claim_views_envelope_inpatient_stays():
+    """Enveloping happens in the cdm_diagnosis / cdm_procedure views, so
+    every stage sees it — as SAS envelopes its whole claim extraction. A
+    non-IP claim on a day inside an inpatient stay becomes care setting
+    'IP', flag 'X'; claims outside a stay, and claims already IP, are
+    unchanged. The procedure table has no flag: blank unless enveloped.
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date
+    sql = (Path(qrp.__file__).parent / "sql" / "10_normalize.sql").read_text()
+    wanted = ("_ip_days", "_cdm_diagnosis_raw", "cdm_diagnosis",
+              "_cdm_procedure_raw", "cdm_procedure")
+    stmts = [st.sql for st in split_statements(sql) if st.target in wanted]
+    assert len(stmts) == len(wanted), [st.target for st in split_statements(sql)]
+    eng = Engine(verbose=False)
+    try:
+        eng.register("enc", [{"patid": 1, "adate": D(2023, 1, 10), "ddate": D(2023, 1, 12),
+                              "enctype": "IP"}],
+                     "patid BIGINT, adate DATE, ddate DATE, enctype VARCHAR")
+        eng.register("dx", [
+            {"patid": 1, "adate": D(2023, 1, 11), "dx": "D1", "dx_codetype": "10", "pdx": "P", "enctype": "AV"},
+            {"patid": 1, "adate": D(2023, 1, 20), "dx": "D1", "dx_codetype": "10", "pdx": "P", "enctype": "AV"},
+            {"patid": 1, "adate": D(2023, 1, 11), "dx": "D2", "dx_codetype": "10", "pdx": "S", "enctype": "IP"}],
+            "patid BIGINT, adate DATE, dx VARCHAR, dx_codetype VARCHAR, pdx VARCHAR, enctype VARCHAR")
+        eng.register("px", [
+            {"patid": 1, "adate": D(2023, 1, 12), "px": "J1", "px_codetype": "HC", "enctype": "AV"},
+            {"patid": 1, "adate": D(2023, 1, 20), "px": "J1", "px_codetype": "HC", "enctype": "AV"}],
+            "patid BIGINT, adate DATE, px VARCHAR, px_codetype VARCHAR, enctype VARCHAR")
+        for st in stmts:
+            eng.con.execute(st.replace("{read_encounter}", "enc").replace("{run_envelope}", "0")
+                              .replace("{opt_ddate}", "ddate").replace("{read_diagnosis}", "dx")
+                              .replace("{read_procedure}", "px"))
+        dxr = {(c, d.day): (e, f) for c, d, e, f in eng.con.execute(
+            "SELECT code, adate, enctype, pdx FROM cdm_diagnosis").fetchall()}
+        pxr = {d.day: (e, f) for d, e, f in eng.con.execute(
+            "SELECT adate, enctype, pdx FROM cdm_procedure").fetchall()}
+    finally:
+        eng.close()
+    assert dxr[("D1", 11)] == ("IP", "X"), "an AV diagnosis inside a stay is enveloped"
+    assert dxr[("D1", 20)] == ("AV", "P"), "outside a stay it is unchanged"
+    assert dxr[("D2", 11)] == ("IP", "S"), "a claim already IP keeps its own flag"
+    assert pxr[12] == ("IP", "X"), "a procedure inside a stay (discharge day) is enveloped"
+    assert pxr[20] == ("AV", ""), "outside a stay: blank flag"
+
+
+def test_a_large_covariate_does_not_go_quadratic():
+    """A covariate with tens of thousands of codes must cost linear time.
+    Registering covariate codes once rebuilt the covariate's whole
+    code->stockgroup map for EVERY code — ~26k x 26k x 23 operations on a
+    600k-code study, which then never reached its first stage. Loading a
+    study also re-lowercased every large table on each of 56 lookups
+    (154M str.lower calls; wp307's load fell from 24.4s to 2.6s when
+    cached).
+
+    A 30,000-code covariate: seconds when linear, minutes if either
+    regresses.
+    """
+    import time
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    big = [{"covarnum": 90, "codecat": "DX", "code": f"Z{i:06d}", "stockgroup": "s",
+            "covfrom": -183, "covto": -1} for i in range(30_000)]
+    t = time.perf_counter()
+    study = load_study_dict(
+        {**base, "covariatecodes": list(base["covariatecodes"]) + big})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+    finally:
+        eng.close()
+    took = time.perf_counter() - t
+    # Measured on a single core: 7.4s linear, 56s with the per-code map
+    # rebuild. A first bound of 60s let the quadratic version PASS; 25s
+    # separates them with room either way.
+    assert took < 25, f"a 30,000-code covariate took {took:.0f}s"

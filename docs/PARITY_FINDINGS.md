@@ -2277,3 +2277,1077 @@ a behavioural assertion against it passes whether or not the fix is
 present. Two attempts at a behavioural test both passed vacuously
 before this was understood, which is exactly the failure the review
 caught in the CSV test.
+
+
+---
+
+## `_UneligGroupIndex`: the denominator shave, compared row by row
+
+The 20 per-cohort unelig datasets made the shave directly comparable.
+For `antixa_rupture_inc`:
+
+| | |
+|---|--:|
+| SAS rows | 10,706 |
+| this package | 10,707 |
+| patients, SAS and here | **1,143 / 1,143 — identical** |
+| rows matching exactly | 10,071 |
+| rows differing | ~635 |
+
+The patient SET is identical. What differs is dates, and the START of
+every differing row matches — only the END moves.
+
+### Found: SAS clips the supply at the enrolment end
+
+Joining to `_pov1`, which carries `rxsup` and `Enr_End`, 47 rows had a
+different supply. **46 of them have `ExpireDt = Enr_End` exactly**: SAS
+truncates a dispensing's supply where enrolment stops, before adding
+the washout. This package carried the full supply, so 46 ineligible
+windows ran past where SAS ends them.
+
+Applied — and **output-identical**, because the denominator window
+itself already ends at `enr_end`, so shaving beyond it changes nothing.
+Kept as correctness, recorded as a no-op, like the two before it.
+
+### The remaining difference is chain drift, and it is now visible
+
+The periods only in one output are the same patients with shifted
+dates:
+
+```
+patid  98573092   SAS 2019-10-22   here 2019-11-10   (+19 days)
+patid 116846041   SAS 2021-05-28   here 2021-06-03   (+6 days)
+patid 116846041   SAS 2021-08-31   here 2021-09-01   (+1 day)
+```
+
+Always later here, never earlier — the signature of a stockpile chain
+carrying claims SAS does not have, exactly as the truncation chain did
+before its start rule was fixed.
+
+The likely cause is ORDERING. This package chains ALL exposure claims
+and then restricts to enrolled ones; `_groupindex` is the exposure
+JOINED TO ENROLMENT, so SAS plausibly restricts first and chains
+second. Filtering after chaining leaves the pushes from out-of-enrolment
+claims baked into every later date.
+
+That is testable and is the next change — but it must be made in the
+DENOMINATOR path only. The episode path is exactly correct at 31,464
+episodes with every end date matching, and it is built from the same
+`stockpiled` table, so changing that table risks the parity already
+achieved. The denominator needs its own chain, built from enrolled
+claims, rather than a filter applied to the shared one.
+
+
+### Filtering before chaining: implemented, measured, reverted
+
+A denominator-specific chain was built from ENROLLED claims only,
+separate from `stockpiled` so the episode path stayed untouched. The
+result splits:
+
+| measure | before | after |
+|---|--:|--:|
+| unelig rows matching SAS EXACTLY | 10,071 | **10,417** |
+| unelig rows produced | 10,707 | 11,108 (SAS 10,706) |
+| cohorts exact on members | 0 | **4** |
+| member excess | +40 | +44 |
+| member-day excess | +8,033 | +66,151 |
+
+The DATES got closer and the row COUNT got worse, which locates the
+remaining difference precisely. Restricting before chaining fixes the
+drift — 346 more rows land on SAS's exact dates — but it also admits
+claims the old path excluded.
+
+The reason is which date the enrolment test uses. The old path filters
+on the STOCKPILED adate, so a claim pushed past the enrolment end is
+dropped; the new one filters on the RAW adate, so it is kept and
+chained. SAS's `_groupindex` carries stockpiled dates alongside
+`Enr_Start`/`Enr_End`, which does not by itself say which date the join
+used.
+
+Reverted, because the totals are worse and the ordering question is not
+settled by the evidence available. The next attempt should restrict on
+the RAW date before chaining AND drop rows whose stockpiled date leaves
+the enrolment span — combining both filters rather than choosing
+between them. That is a single testable change with both measurements
+already recorded to judge it against.
+
+
+### Both filters combined — and the inference that follows
+
+The specified experiment was run: restrict on the RAW date before
+chaining AND drop rows whose stockpiled date leaves the span.
+
+| measure | baseline | raw filter only | both filters |
+|---|--:|--:|--:|
+| unelig rows (SAS 10,706) | 10,707 | 11,108 | **10,945** |
+| rows matching SAS EXACTLY | 10,071 | 10,417 | **10,417** |
+| member excess | **+40** | +44 | +44 |
+| member-day excess | **+8,033** | +66,151 | +66,151 |
+
+The second filter removed 163 rows and moved the denominator totals
+NOT AT ALL. Those rows lay outside the denominator windows entirely.
+
+**This is the useful finding, and it points away from the shave.**
+Making the unelig periods measurably closer to SAS's — 346 more rows
+on exactly the right dates — makes the denominator totals WORSE, and
+consistently so. If the shave were the cause, accuracy there would
+improve the totals.
+
+So the +40 members and the day surplus are NOT primarily a shave
+problem. The shave's remaining imperfection is real but it is not what
+is moving those numbers; something in the BASE eligible window is, and
+the closer-to-SAS shave simply removes a compensating error.
+
+That reframes the next step. Rather than continuing to refine the
+unelig periods, the base window construction — `_denom_windows`, its
+start and end rules and the pullback — should be compared against a
+SAS reference. The shave has now been compared row by row against
+SAS's own dataset and is close; the base window has never been
+compared against anything except totals.
+
+All three variants are reverted. The baseline stands at +40 members
+and +8,033 member-days.
+
+
+## The base window, read from source at last
+
+`ms_cidadenom.sas:126-139` builds it plainly:
+
+```sas
+where Enr_End >= &startdate.;
+DenomEnrStartDt = Enr_Start;
+DenomEnrStartDt = DenomEnrStartDt + &ENRDAYS.;
+DenomEnrEndDt   = Enr_End;
+if DenomEnrEndDt >= DenomEnrStartDt;
+```
+
+**No clipping to the query period, and no pullback of any kind.** The
+clipping happens later and implicitly, where member-days are counted
+by intersecting the window with each TIME PERIOD
+(ms_cidadenom.sas:577-590):
+
+```sas
+if PeriodsOverlap(period1=DenomEnrStartDt DenomEnrEndDt,
+                  period2=PER&p .. PER&p1-1) then
+    NumMemDaysYM(&p) = sum(...,
+        Min(DenomEnrEndDt, PER&p1-1) - max(DenomEnrStartDt, PER&p) + 1);
+```
+
+A member is counted when their window overlaps any period; days
+outside every period contribute nothing.
+
+### Why this matters, and why it is not a one-line fix
+
+This package clips `denom_start` and `denom_end` to the query period
+and then subtracts a PULLBACK — a term derived empirically, by trying
+variants until the totals matched, not read from the macro. The source
+has no such term.
+
+But removing the pullback measures far worse (+35,052 members,
++2,592,961 member-days), so it is compensating for something real. The
+candidate is the PERIOD boundaries: SAS clips to `PER&p1 - 1` of the
+last period, which need not be the query period end. This study's
+query period runs to 2025-04-30 while its data ends 2024-12-30, so if
+SAS's final period stops at the data end, the effective clip differs
+from this package's by four months.
+
+That is the thing to check next, and it is checkable: compare against
+SAS's period definitions rather than guessing at a correction term.
+Replacing a fitted constant with the rule it was standing in for is
+the same move that fixed the truncation chain, the stockgroup and the
+inclusion-code domain — each of which looked like a tuning problem
+until the underlying rule was found.
+
+
+### The period-boundary hypothesis, eliminated
+
+The monitoring file settles what the periods are:
+
+```
+periodid 1   startdate 2016-04-01   fupenddate 2025-04-30   cdpend 'Y'
+```
+
+`cdpend = 'Y'` censors at the data partner end, so the single period
+runs 2016-04-01 to the data end rather than to 2025-04-30 — which was
+the suspected four-month discrepancy.
+
+**It makes no difference here.** The extract's enrolment ends
+2024-12-31, and this package's `denom_end` is
+`least(enr_end, end_date)`, so enrolment already bounds the window
+below both candidate period ends. The clip is the same either way.
+
+So the fitted pullback is NOT standing in for the period boundary. It
+remains unexplained, and it remains the only fitted constant in the
+package.
+
+What that leaves, for whoever picks this up: the pullback is one day
+per member, applied at `denom_end`. Removing it adds 35,052 members and
+2.59 million member-days, so it is doing real work — but no rule in
+`ms_cidadenom.sas` produces it, the base window there has no such term,
+and the period intersection does not either. Either it compensates for
+a difference in the ENROLMENT spans that feed the window (though those
+were verified identical against `_pov1` at the span level), or for
+something in how a member qualifies that has not yet been located.
+
+The honest summary of this line of work: the denominator shave has been
+compared row by row against SAS's own dataset and is close; the base
+window has been read from source and this package differs from it by a
+term that cannot be justified from the source but cannot be removed
+without making the numbers much worse. That contradiction is the next
+thing to resolve, and resolving it probably requires SAS's
+`_denom<group>` dataset — the base window before shaving — which would
+show the window boundaries directly.
+
+
+## `_denom<group>`: the +1 member is now a named patient
+
+The base-window datasets made the last difference addressable.
+
+| | SAS `_denom1` | here |
+|---|--:|--:|
+| rows | 68,803 | 67,680 |
+| patients | 63,409 | 62,463 |
+| earliest window start | **2010-07-03** | 2016-04-01 |
+
+SAS does NOT clip the window start to the query period — starts run
+back to 2010, exactly as `ms_cidadenom.sas:135-137` says
+(`Enr_Start + ENRDAYS`, no clipping). The period intersection then
+reduces 63,409 patients to the 62,462 that reach `denomcounts`.
+
+Restricting SAS's set to windows that overlap the query period and
+diffing against this package's:
+
+| | |
+|---|--:|
+| SAS, overlapping the period | 63,337 |
+| here | 62,463 |
+| **only here** | **1** |
+| only in SAS (shaved away entirely) | 875 |
+
+**One patient. That is the +1.**
+
+### The patient, and what distinguishes them
+
+```
+patid 39853274
+  enrolment  2010-01-01 .. 2015-10-31
+             2016-01-01 .. 2016-12-31      <- a two-month GAP
+  window here  2016-07-02 .. 2016-12-30    (2016-01-01 + 183, less the pullback)
+  SAS          no row at all
+```
+
+This package treats the two spans separately, so the second one starts
+its own 183-day qualifying clock on 2016-01-01 and qualifies on
+2016-07-02. SAS has no row for this patient in `_denom1` at all.
+
+#### Gap-bridging: checked and ruled out
+
+The obvious reading was that SAS BRIDGES the two spans into one, so the
+183-day clock starts in 2010 rather than 2016. `ms_episoderec.sas`
+exists for exactly that. But the call site passes **`ENROLGAP=0`**
+(ms_cidanum.sas:663) — no bridging at all. The hypothesis is wrong, and
+the patient's raw enrolment confirms the spans are genuinely separate:
+
+```
+2010-01-01 .. 2010-12-31   medcov Y  drugcov Y
+2011-01-01 .. 2015-10-31   medcov Y  drugcov Y
+2016-01-01 .. 2016-12-31   medcov Y  drugcov Y
+```
+
+#### Where the patient actually leaves SAS's pipeline
+
+They are NOT in `attrition_level2` (the enrolment step), and they ARE
+in `attrition_level6`. So SAS carries them through enrolment and drops
+them at level 6.
+
+That is as far as the available data goes, and it leaves a question
+rather than an answer: level 6 excludes 72,827 of the 73,940 that pass
+level 2, leaving 1,113 — the EXPOSED patients. The denominator is
+62,462, which cannot come from that path. So either the denominator
+input is taken before level 6 and something else excludes this patient,
+or `_denom1` is built from a set this comparison has not identified.
+
+What IS established, and is the useful result:
+
+* the +1 member is ONE named patient per denominator configuration,
+  reproducibly identified by diffing against `_denom<group>`
+* SAS does not clip the window start to the query period; this package
+  does, and that difference is real but is not what admits the patient
+* the patient has three clean enrolment spans, valid demographics, and
+  a window this package computes as 2016-07-02 to 2016-12-30
+* gap-bridging, demographics, degenerate windows, window bounds, the
+  period boundary and the washout are all eliminated
+
+The remaining question is narrow and concrete: what does
+`&datain.` — the dataset `ms_cidadenom` is invoked on — contain, and
+which step removes patid 39853274 from it.
+
+
+## SOLVED: enrolment that outlives the member
+
+The `_denom<group>` datasets reduced the +1 per cohort to one named
+patient, and the patient explained it:
+
+```
+patid 39853274
+  death        2015-10-26
+  enrolment    2010-01-01 .. 2010-12-31
+               2011-01-01 .. 2015-10-31
+               2016-01-01 .. 2016-12-31   <- ENTIRELY AFTER DEATH
+  window here  2016-07-02 .. 2016-12-30
+  SAS          no row at all
+```
+
+The extract carries an enrolment span that begins two months after the
+member died. SAS truncates the span to the death date before building
+the window and deletes it when that leaves the end before the start
+(ms_cidanum.sas:2184-2188):
+
+```sas
+if enrend_death in ('B','C') and DeathDt <= Enr_End then Enr_End = DeathDt;
+if Enr_end < Enr_Start then delete;
+```
+
+This package took the span at face value and gave a dead member a
+six-month eligible window.
+
+| | before | after |
+|---|--:|--:|
+| denominator members | +40 | **+0 — exactly SAS** |
+| cohorts exact on members | 0 / 40 | **40 / 40** |
+| denominator member-days | +8,033 | **+753** (0.00003%) |
+
+### A detail that cost two attempts
+
+The first fix aliased the truncated value as `enr_end` in the same
+SELECT that computes `denom_end` — and SQL does not expose a column
+alias to its siblings, so `denom_end` kept reading the raw
+`e.enr_end` and NOTHING CHANGED. The numbers were identical before and
+after, which looked like "the hypothesis is wrong" rather than "the
+code did not run". The rule written down earlier in this document —
+a change showing NO movement at all is suspect until the code is
+confirmed changed — applied exactly, and checking the patient directly
+rather than the totals is what caught it.
+
+## Final parity
+
+| metric | this package | SAS | |
+|---|--:|--:|---|
+| patients | 19,738 | 19,738 | **exact** |
+| episodes | 31,464 | 31,464 | **exact** |
+| episode END dates | 31,464 / 31,464 | | **exact** |
+| outcomes | 3 | 3 | **exact** |
+| denominator members | 2,502,986 | 2,502,986 | **exact** |
+| denominator member-days | 2,268,963,714 | 2,268,962,961 | +0.00003% |
+
+Every count matches. 753 member-days in 2.27 billion remain.
+
+
+### The last 753 member-days
+
+Distributed with clear structure:
+
+| difference | cohorts |
+|---|--:|
+| +7 | 14 (`*_rupture_prev`) |
+| +33 | 14 (`*_splenec_prev`) |
+| +26 | 3 (`*_splenec_inc`) |
+| +6 | 2 (`*_rupture_inc`) |
+| +32 | 2 (`*_splenec_inc`) |
+| +3 | 2 (`*_rupture_inc`) |
+
+**The split is by EXCLUSION CONDITION, not by exposure.** A rupture
+cohort and a splenectomy cohort differ only in their exclusion codes,
+and the splenectomy ones carry roughly 26 more excess days each. So the
+residual is in the exclusion-condition shave — this package removes
+slightly LESS time than SAS for splenectomy exclusions.
+
+That is where to look next, and the structure says it is a property of
+the codes rather than of the exposure or enrolment logic, both of which
+are now exact. The likely candidates are the `dateonly` handling on
+non-drug exclusion codes (SAS takes the period end from `ExpireDt`
+rather than `ADate` when `dateonly = 'N'`, which for a procedure code
+is the same date but need not be for every code) and the care-setting
+conditions on exclusion codes, which this package does not apply to the
+denominator shave.
+
+At 753 days in 2,268,962,961 — 0.00003% — with every count exact, this
+is the smallest remaining difference in the comparison.
+
+
+---
+
+## The test extract truncates `rxamt` — and what that changes
+
+The pyqrp investigation found that the SCDM-to-parquet conversion wrote
+`dispensing.rxamt` as an INTEGER, turning fractional amounts (a 0.6 mL
+prefilled syringe) into 0. The duckqrp test extract has the same
+defect:
+
+| | |
+|---|--:|
+| `rxamt` type | `INTEGER` |
+| dispensings | 4,478,080 |
+| `rxamt = 0` | 54,995 |
+| fractional values | **0** |
+
+Real dispensing data always contains fractional amounts; zero of them in
+4.5 million rows is the signature of truncation.
+
+### It does NOT explain the remaining denominator gap
+
+`92_cidadenom.sql` never reads `rxamt`. Both denominator shaves are
+driven by stockpiled DATES (from `rxsup`, which is genuinely whole days)
+and by exclusion conditions, which in this study are all DX/PX codes.
+The last 753 member-days were already traced to the rupture-vs-
+splenectomy exclusion shave, which touches no drug claim.
+
+### It DOES reverse an earlier conclusion
+
+An earlier entry recorded applying SAS's dispensing filter
+`rxsup > 0 and rxamt > 0` (ms_cidanum.sas:617), measuring it worse
+(episodes 31,444 -> 31,404), reverting it, and concluding that the
+filter "evidently guards a different dataset".
+
+**That conclusion was wrong.** The filter was dropping dispensings whose
+true amount was fractional — kept by SAS, which reads the real values,
+but stored as 0 in this extract. The measurement was correct; the
+inference drawn from it was not. With a correctly converted extract
+the filter is SAS's rule and should be restored, then re-measured.
+
+### It exposed two output columns never compared before
+
+`t2_cida.amtsupp` and `daysupp` against SAS:
+
+| cohort | SAS `amtsupp` | here | | SAS `daysupp` | here | |
+|---|--:|--:|--:|--:|--:|--:|
+| `peg_rupture_prev` | 411 | 1 | -99.8% | 885 | 1,069 | +21% |
+| `fil_rupture_prev` | 541 | 126 | -76.7% | 1,134 | 1,431 | +26% |
+| `antixa_rupture_prev` | 545,937 | 153,984 | -71.8% | 227,167 | 299,197 | +32% |
+| `hctz_rupture_prev` | 3,225,336 | 953,345 | -70.4% | 1,391,318 | 1,501,888 | +8% |
+
+Two definitional defects in `90_cidatables.sql`, independent of the
+input bug:
+
+* **`amtsupp` sums the INDEX dispensing's amount only** (`c.rxamt`),
+  while `daysupp` sums the whole episode (`c.episode_rxsup`). Days and
+  amount are measured over different things, so every cohort's amount
+  is low by roughly the share of non-index dispensings. Truncation adds
+  to this for the injectables, which is why peg falls to almost zero.
+* **`daysupp` is not clipped to the episode window.** SAS computes
+  `TotRxSup` from dispensings within `[IndexDt, EpisodeEndDt]` via its
+  utilization macro (`refend=EpisodeEndDt`, ms_createptsmasterlist.sas:
+  210-240), which is why a truncated episode earlier carried
+  `TotRxSup = 17` against a 90-day dispensing. This package sums
+  uncapped supply, so days run high wherever an episode is censored or
+  truncated.
+
+Neither is fixed yet: `amtsupp` cannot be verified against SAS until the
+extract carries real amounts.
+
+
+---
+
+## The denominator, resolved to 34 days
+
+### Correction: the pullback was never a fitted constant
+
+Earlier entries described the denominator's `denom_end` pullback as
+"derived empirically, not read from source" and "the only fitted
+constant in the package". **That was wrong.** It is SAS's own formula,
+term for term (ms_cidadenom.sas:709):
+
+```sas
+AdjustedEnrEndDt = min(Enr_End, &censordate.) - Max(0, &MinEpisDur.-1,
+    &MinDaySupp.-1, &BlackoutPer., &reqdaysaftind.,
+    &reqdaysaftepi. + max(&MinEpisDur.-1, &MinDaySupp.-1, &BlackoutPer.));
+DenomEnrEndDt = min(DenomEnrEndDt, AdjustedEnrEndDt);
+...
+if MemberDays > 0;
+```
+
+It also explains the 1,000 one-day segments SAS's `_denom` export has
+and this package does not: SAS trims them to zero length at this step
+and drops them with `MemberDays > 0`, exactly as this package does
+earlier. They are not a discrepancy.
+
+### Found: SAS shaves the denominator around OUTCOME events
+
+`ms_cidadenom.sas:486-515` removes member-time around every follow-up
+event claim, across the whole eligible population:
+
+```sas
+UneligStart = sum(ADate, -&BLACKOUTPER., 1);
+UneligEnd   = ExpireDt + &FUPWASHPER.;          /* dateonly = 'N' */
+```
+
+This package had no outcome shave at all. The clue was that its
+rupture and splenectomy denominators were IDENTICAL while SAS's differ
+by 23 days — and the two cohorts' exclusion lists turned out to be
+identical too (57 shared codes), leaving the outcome as the only thing
+that distinguishes them.
+
+Fixed in two places: the shave itself, and the denominator config key,
+which now includes `fup_wash_per` and the outcome codes so cohorts that
+differ only in outcome no longer share a denominator.
+
+| | before | after |
+|---|--:|--:|
+| denominator member-days vs SAS | +753 | **-34** |
+| cohorts exact on members AND member-days | 0 / 40 | **30 / 40** |
+
+Every prevalent cohort is now exact, along with ten incident ones.
+
+### What remains
+
+-34 member-days across ten incident cohorts, -1 to -5 each, in
+identical rupture/splenectomy pairs that differ by drug. Outcome-
+independent and drug-dependent places it in the WASHOUT shave — the
+stockpile-chain ordering already measured against `_UneligGroupIndex`
+(10,071 of 10,706 periods exact).
+
+### Not yet implemented
+
+The matching IOC washout shave (POV6, ms_cidadenom.sas:521-540: start
+`ADate + 1`, end `ExpireDt + FUPWASHPER`). wp307 has no IOC codes, so
+it cannot be verified here and was left out rather than added untested.
+The event shave also takes each claim's end as `ADate + CodeSupply - 1`;
+a `dateonly = 'Y'` code with a supply would differ, and no such code
+exists in this study.
+
+
+### The remaining 34 days: the washout chain ordering, re-tested properly
+
+An earlier entry rejected building the denominator's washout chain from
+ENROLLED claims ("filter before chaining") because it measured far worse
+(+66,151 member-days). **That experiment was flawed**: its chain kept
+only `codecat = 'RX'` claims, silently dropping every procedure-sourced
+exposure — the peg/fil J-codes — from the washout shave altogether.
+
+Re-run correctly (procedure claims kept, unchained, as SAS treats them;
+the same chain-start rule as the exposure chain):
+
+| | baseline (kept) | enrolled-first chain |
+|---|--:|--:|
+| cohorts exact on members and days | 30 / 40 | **32 / 40** |
+| other incident cohorts | -1 to -5 | **-1** (six cohorts) |
+| warfarin incident pair | -1 each | **+181 days, +1 member each** |
+| total member-days | **-34** | +356 |
+
+Enrolled-first fixes the drift for 38 of 40 cohorts but loses what looks
+like one 183-day washout window for one warfarin patient. A plausible
+mechanism: a dispensing filled just outside an enrolment span whose
+STOCKPILED date falls inside it — kept when chaining happens before the
+enrolment join (as SAS's `_groupindex` is built), dropped when it
+happens after. Neither ordering alone reproduces SAS. Chaining within
+each enrolment span would reconcile both observations, but that is a
+hypothesis, not a measured result.
+
+Reverted; the baseline has the smaller total error. Naming that one
+warfarin patient by diffing against `_uneliggroupindex` for the warfarin
+incident cohort is the cheapest next step.
+
+
+### The warfarin patient, named — and the chain rule it implies
+
+Diffing the warfarin incident cohort against `_uneliggroupindex37`
+named the patient the enrolled-first chain loses: **patid 64384723**.
+Two things are unusual about them:
+
+* every dispensing is recorded TWICE (two identical 30-day rows per
+  fill), so stockpiling sums each fill to 60 days while refills come
+  every ~30 — the chain drifts years ahead, past 2027;
+* their enrolment has a GAP: 2014-2021, then 2023.
+
+For this patient the baseline (chain every claim, then join to
+enrolment) matches SAS exactly; enrolled-first discards the claims filed
+during the 2022 gap and breaks the chain. Yet enrolled-first was closer
+for most other patients. Both observations fit one rule: **chain claims
+within the patient's OVERALL enrolment range** — drop claims before the
+first span or after the last, keep those in gaps between spans — then
+join to enrolment on the stockpiled date.
+
+| | baseline | enrolled-first | **overall range** |
+|---|--:|--:|--:|
+| member-days vs SAS | -34 | +356 | **-24** |
+| cohorts exact | 30 | 32 | **32** |
+| cohorts worse than baseline | — | 2 | **0** |
+
+Adopted. Remaining: -24 member-days in eight incident cohorts
+(antixa/doac -4, apix -3, riva -1), still in rupture/splenectomy pairs,
+so still the washout chain.
+
+
+## The denominator is exact
+
+### Found: SAS restarts the washout chain in each enrolment span
+
+Diffing `antixa_rupture_inc` against `_uneliggroupindex1` after the
+overall-range rule left only five patients. One of them showed the rule
+directly:
+
+```
+patid 98573092   enrolled 2011-01-01..2019-07-31, then 2019-10-01..2020-02-29
+fills            2019-05-13 (90d), 2019-07-22 (90d), 2019-10-21 (90d)
+continuous chain 2019-10-21 pushed to 2019-11-09 by July's leftover supply
+SAS              2019-10-21 stays on 2019-10-21
+```
+
+SAS's stockpile chain for the denominator RESTARTS at every enrolment
+span. That also reinterprets the warfarin patient (64384723): SAS's 2023
+periods step by exactly 30 then 60 days from 2023-01-27 — a fresh chain
+of 2023 fills, not one inherited from 2014-21. The overall-range rule
+had fixed that patient only incidentally, by dropping the claims that
+let drift cross the gap.
+
+| | baseline | overall range | **per-span chain** |
+|---|--:|--:|--:|
+| member-days vs SAS | -34 | -24 | **0** |
+| cohorts exact on members AND days | 30 / 40 | 32 / 40 | **40 / 40** |
+| washout periods matching SAS exactly | — | — | **194,122 / 194,122** |
+
+The last row is the strongest evidence: not just the totals but every
+one of the 194,122 washout periods across all 20 incident cohorts is
+identical to SAS's `_UneligGroupIndex`.
+
+A behavioural test pins it — the first fill in every span must keep its
+own date — and was confirmed to FAIL with the per-span reset removed.
+
+## Final parity on wp307
+
+| metric | this package | SAS | |
+|---|--:|--:|---|
+| patients | 19,738 | 19,738 | **exact** |
+| episodes | 31,464 | 31,464 | **exact** |
+| episode end dates | 31,464 / 31,464 | | **exact** |
+| outcomes | 3 | 3 | **exact** |
+| denominator members | 2,502,986 | 2,502,986 | **exact** |
+| denominator member-days | 2,268,962,961 | 2,268,962,961 | **exact** |
+| `daysupp` | | | +21 days in 6.4M |
+| `amtsupp` | | | -0.016% |
+
+Every count in the comparison now matches SAS exactly. What remains is
+in the supply/amount columns: 11 episodes' supply and 599 episodes'
+prorated amount differ slightly, most likely a same-day aggregation
+detail.
+
+
+## Getting the speed back: outcome scopes
+
+Putting the outcome into the denominator config key made the
+denominator exact, but doubled its cost: rupture and splenectomy cohorts
+no longer shared a config, so every member's window was computed twice.
+
+| | before the outcome fix | outcome in key | **outcome scopes** |
+|---|--:|--:|--:|
+| denominator configs | 20 | 40 | **20** |
+| rows in each per-member table | 1.36M | 2.71M | **1.36M** |
+| denominator stage | ~5s | 12.5s | **6.1s** |
+| wp307 end to end | ~25s | 34.5s | **24.8s** |
+| cohorts exact | 30 / 40 | 40 / 40 | **40 / 40** |
+
+The outcome touches only 38 members in this study. The config key is
+outcome-free again, and each cohort's event patients are computed in two
+small scopes alongside the shared one:
+
+    counts(cohort) = '*' (all members, shared periods)
+                   + 'a:<cohort>' (its event patients, shared + event periods)
+                   - 'b:<cohort>' (the same patients, shared periods only)
+
+Member-days and distinct members are both additive over disjoint sets
+of patients, so this is exact rather than an approximation — confirmed
+by all 40 cohorts still matching SAS.
+
+The test for it had to be rebuilt to mean anything. Its first version
+compared two demo cohorts with DIFFERENT exposures, which have separate
+configs anyway, so removing the line that keeps each cohort's scopes to
+itself changed nothing and the test still passed. It now builds two
+cohorts identical except for the outcome, asserts that they share a
+config, and was confirmed to FAIL with that line removed.
+
+---
+
+## Covariates: first comparison with SAS, and what it found
+
+Covariates had never been compared with SAS per episode. Against SAS's
+master-list flags on wp307 (32 covariates):
+
+| fix | SAS-only flags | mine-only flags |
+|---|--:|--:|
+| (start: every flag doubled) | — | — |
+| `createbaseline`: covariates and baseline only for 'Y' cohorts | 783 | 252 |
+| each covariate code keeps its own category | 447 | 252 |
+| combinations evaluated in covariate-number order | **276** | **252** |
+
+* **createbaseline.** SAS computes covariates and a baseline table only
+  for cohorts with `createbaseline = 'Y'` in the cohort file
+  (ms_cidacov.sas:142) — the 20 rupture cohorts here. The field reached
+  the JSON but was never read. Baseline: 40 rows -> 20, matching SAS.
+* **Per-code category.** A covariate can mix dispensing and procedure
+  codes; taking the category from the first row matched only one.
+  'Pegfilgrastim Post-Index' found 15 of SAS's 224 episodes.
+* **Combination order.** SAS evaluates combinations one at a time in
+  covariate-number order (ms_cidacov.sas:1201-1220), so covar32 sees
+  covar31. All 171 of covar32's missing episodes recovered.
+
+### Next: covariate dispensings are STOCKPILED in SAS
+
+The remaining two-way mismatches are post-index drug covariates
+(`dateonly = 'Y'`, days 1-30). SAS stockpiles covariate dispensings
+(ms_cidacov_codeextraction.sas:590-672, 855-905): clipped to enrolment
+spans, chained per patient by `covarnum` and `stockgroup` with the
+STOCKPILE_COVAR parameters (defaults as for exposure), clipped to
+enrolment again. This package uses raw fill dates.
+
+A crude test — one chain per patient, no stockgroups, no enrolment
+clipping — already cuts the mismatches sharply (SAS-only / mine-only):
+
+| | raw dates | crude chain |
+|---|--:|--:|
+| covar22 warfarin | 67 / 32 | 5 / 10 |
+| covar19 apixaban | 8 / 55 | 0 / 24 |
+| covar23 hydrochlorothiazide | 107 / 160 | 59 / 95 |
+
+covar23 improves least, as expected: hydrochlorothiazide spans many
+stockgroups (combination products) that SAS chains separately.
+
+**Implemented**, following SAS's sequence: covariate dispensings clipped
+to the cohort's enrolment spans, chained per (enrolment configuration,
+patient, covariate, stockgroup) with same-day supply summed, then
+clipped to enrolment again. Drug covariates are looked up in that chain;
+everything else as before.
+
+| | SAS-only flags | mine-only flags | covariates exact |
+|---|--:|--:|--:|
+| before stockpiling | 276 | 252 | 22 / 32 |
+| **stockpiled** | **14** | **99** | **28 / 32** |
+
+Four still differ: covar14 (0 / 23), covar15 (0 / 38), covar22 (5 / 10)
+and covar23 (9 / 28). Mostly flags SAS does NOT have — a sign the chain
+admits claims SAS leaves out, as the exposure chain did before its
+chain-start rule.
+
+The test for it was mutation-checked and initially proved nothing:
+clipping to enrolment alone moves fills (onto a span start), so "some
+fill moved" held with the chain bypassed. It now counts only moves that
+clipping cannot explain, and fails when the chain is removed.
+
+
+### Covariate chain-start rule: 31 of 32 exact
+
+The remaining mismatches were mostly flags SAS does NOT have, concentrated
+in the PRE-index drug covariates — the signature of a chain admitting
+claims SAS leaves out. The exposure chain's entry rule applies to
+covariate dispensings too: a dispensing whose supply ends before the
+cohort's enrolment window opens (`start_date - enr_days`) never enters
+the chain, so old fills cannot push later ones forward.
+
+| | SAS-only flags | mine-only flags | covariates exact |
+|---|--:|--:|--:|
+| stockpiled, no entry rule | 14 | 99 | 28 / 32 |
+| **with the entry rule** | **0** | **1** | **31 / 32** |
+
+`enr_days` is part of the chain key, so cohorts with different values
+never share a chain. One flag remains: covar15 (hydrochlorothiazide
+pre-index), one episode flagged here and not in SAS.
+
+Over this session, covariates went from every flag doubled to
+12,364 against SAS's 12,363.
+
+
+### The last covariate episode: a fill straddling an enrolment gap
+
+Patient 124844251 (hctz_rupture_prev, index 2023-08-15) is enrolled
+2019-07-01..2022-09-30 and 2023-01-01..2024-12-31, with a 180-day fill
+on 2022-07-19 that straddles the gap. Clipping to enrolment rightly gives
+one piece per span — but each piece kept the FULL 180-day supply, so the
+2023 piece pushed the patient's 2023 fills forward into the pre-index
+window. Clipped, the pieces carry 74 and 14 days.
+
+## Covariates: exact
+
+| | SAS | this package |
+|---|--:|--:|
+| covariate flags, all 32 covariates | 12,363 | **12,363** |
+| flags SAS has, this package does not | | **0** |
+| flags this package has, SAS does not | | **0** |
+| baseline table rows | 20 | **20** |
+
+From every flag doubled at the start of this work. Six fixes, each found
+by comparing per episode against SAS's master list: createbaseline,
+per-code categories, combination order, stockpiled covariate
+dispensings, the chain's entry rule, and clipped supply across
+enrolment gaps.
+
+
+## Amounts: medical exposure claims carry RXAmt = 1
+
+The `amtsupp` residue sat almost entirely in the pegfilgrastim and
+filgrastim cohorts (444 of 599 mismatched episodes in peg alone), and
+this package was ALWAYS lower. Those cohorts' exposure comes largely
+from procedure claims (J-codes). SAS sets `RXAmt=1` and
+`NumDispensing=1` for medical claims (ms_cidanum.sas, the
+`if b or c or d or g` block); this package used NULL, under a comment
+wrongly asserting SAS did the same.
+
+| | before | after |
+|---|--:|--:|
+| `amtsupp` vs SAS | -2,367 | **+15** in 15.1M |
+| episodes with a different amount | 599 | **15** |
+
+Every count stayed exact (rxamt is also an index tie-break). The 15
+remaining largely coincide with the 11 episodes whose SUPPLY differs.
+
+
+## Supply: exact
+
+The 11 episodes whose supply (`TotRxSup`) differed had two causes:
+
+* **Counting stops at the first event.** SAS counts supply to where
+  follow-up ends, and an outcome event ends it. Warfarin patient
+  82014737: SAS 10 + 19 days, clipped at the event on 2024-05-13; this
+  package counted 10 + 30 to the episode end.
+* **Duplicate same-day procedure claims count twice.** Filgrastim patient
+  60364873 has each injection recorded twice; SAS sums every row (6),
+  while stockpiling collapses same-day procedure claims to one (3). The
+  supply count now takes procedure and diagnosis claims from the raw
+  rows — they are not chained, so their dates are unchanged — while
+  episode construction keeps the collapsed set that made episode ends
+  exact.
+
+| | before | after |
+|---|--:|--:|
+| episodes with different supply | 11 | **0** |
+| `daysupp` vs SAS | +21 | **+0** in 6.4M |
+
+## Amount: exact
+
+All 12 remaining episodes were one patient, 153716000: two dispensings
+on the index date (21 days / 42 units and 60 days / 60 units), 50 days
+of follow-up. This package prorated once: 102 x 50/81 = 62.963. SAS:
+92 x 50/71 = 64.7887.
+
+The first reading — SAS clips each fill to the WINDOW before combining
+same-day fills — was implemented and was WRONG: it fixed this patient
+and broke two others. Patient 164261173 also has two same-day fills
+running past the window (90 days / 180 and 28 days / 74), and SAS
+prorates them once: 254 x 64/118 = 137.7627.
+
+The difference is enrolment. Patient 153716000's enrolment ends on
+2023-10-31, cutting the 60-day fill to 50 days / 50 units; patient
+164261173's enrolment outlasts both fills. SAS shaves each fill to
+ENROLMENT before combining same-day fills — as it shaves claims before
+stockpiling everywhere else — then prorates the combination over its
+overlap with the window.
+
+| | SAS | this package |
+|---|--:|--:|
+| `daysupp` | 6,384,382 | **exact** |
+| `amtsupp` | 15,109,779 | **exact** |
+| episodes with different supply | | **0** |
+| episodes with different amount | | **0** |
+
+`test_supply_and_amount_replay_wp307_patients` replays the four patients
+behind the supply and amount rules and was mutation-checked against
+each: prorating once, the rejected window clip, and removing the event
+clip each fail it on exactly the patient that rule concerns.
+
+
+## Utilization: exact
+
+Utilization had never been compared with SAS. Every count was wrong:
+medical visits ~3x SAS, drug counts all zero. Four causes:
+
+* **The utilization file's wide format was not read.** SAS's UTILFILE has
+  one row per group with medutilfrom/to AND drugutilfrom/to. Only the
+  long shape (utiltype, utilfrom, utilto) was parsed, so each row became
+  a MEDICAL window with the default -365..-1, and no DRUG window existed.
+* **The drug class file was dropped entirely.** It keys on `rx`; the
+  parser required `code` and silently discarded all 301,245 rows. SAS
+  counts NumGeneric as distinct GENERIC names, via an inner join on NDC
+  (ms_computeutilization.sas:396-421); this counted distinct NDCs.
+* **createbaseline again.** SAS computes utilization only for cohorts
+  with createbaseline = 'Y'; every total was exactly double.
+* **Visits come from the encounter table.** Counting from diagnosis
+  claims missed encounters with no diagnosis (NumAV -56, NumOA -559).
+  The encounter table is now an optional input; without one, visits fall
+  back to diagnosis claims with a warning. It is not fingerprinted when
+  missing by name (that costs 0.8-1.6s per run); map it with table_map.
+
+| per episode, all 31,464 | differing before | differing now |
+|---|--:|--:|
+| NumAV | 28,917 | **0** |
+| NumOA | 20,048 | **0** |
+| NumIP | 4,366 | **0** |
+| NumED | 7,133 | **0** |
+| numrx / NumGeneric / NumClass | 15,708 | **0** |
+
+Distinct encounter days and every encounter row give the same counts on
+this extract, so the data cannot say which SAS uses; distinct days are
+kept.
+
+
+## MFU: matches SAS wherever the result is determined
+
+wp307 produced no MFU table at all. Three silent failures, all in how
+SAS-format MFU rows were read:
+
+* a row naming no group applies to every cohort; such rows were dropped
+  (wp307's only MFU row has no group);
+* SAS spells countmethod 'P' / 'C'; only 'PATCOUNT' / 'CODECOUNT' were
+  recognised, so 'P' fell back to ranking by claims;
+* codetype restricts the code system (ICD-10 here) and was ignored.
+
+Against SAS's `r01_mfu`:
+
+| | SAS | this package |
+|---|--:|--:|
+| rows / cohorts | 400 / 40 | **400 / 40** |
+| same code, different counts | | **0** |
+| rank positions with a different patient count | | **0 of 400** |
+| codes at a different rank | | 114 |
+| SAS codes missing (a tie at the top-10 cutoff) | | 24 |
+
+The last two rows are entirely ties: every rank position holds the same
+patient count in both, and wherever the codes differ they have the same
+patient count. SAS's order among tied codes fits no rule tried — fewer
+claims first and more claims first each contradict it somewhere, and
+code order does too. SAS appears to sort on patient count alone and keep
+tied rows in whatever order its grouping produced, which cannot be
+reproduced outside SAS. This package keeps a deterministic tie-break
+(more claims, then code), so at the cutoff it can choose a different code
+from a tie than SAS did.
+
+
+## Risk scores: exact
+
+The CCI this package reported disagreed with SAS on every episode — and
+was not CCI at all. Three silent failures:
+
+* **The risk score file was never read.** Only the codes file was, so
+  each score's window fell back to -365..-1 instead of the file's
+  -183..0.
+* **Every score in the shared code library was computed** — seven in
+  wp307's — though the study asks only for CCI.
+* **A score without an intercept row vanished.** Intercepts are
+  cross-joined into the result, and only scores WITH an intercept were
+  listed. Of wp307's seven library scores only FRAILTY has one, so the
+  value reported as CCI was FRAILTY: fractional (0.04-0.14) where SAS's
+  CCI is an integer from -2 upward.
+
+| | SAS | this package |
+|---|--:|--:|
+| CCI, sum over 31,464 episodes | 39,316 | **39,316** |
+| episodes with a different CCI | | **0** |
+
+Unlike covariates and utilization, risk scores are computed for every
+cohort in SAS, not only createbaseline ones.
+
+The master list still names the column `RiskScore`; SAS names it after
+the score (`CCI`).
+
+
+## Master list: 88 of SAS's 92 columns
+
+Added, each matching SAS on all 31,464 wp307 episodes — including where
+SAS leaves a value NULL:
+
+| column | definition |
+|---|---|
+| `ExactNumVisit` | distinct visit DAYS in the window, across encounter types |
+| `NumVisits` | SAS's category of it: `0`, `1`, `2-7`, `8+` (it held the numeric total) |
+| `CCI` | each requested risk score as a column named after it, every cohort |
+| `fupdays_value_cat` | `followuptime` bucketed `0-90` / `91-180` / `181+` |
+| `Censorcat_sort` | that bucket's position, 1-3 |
+
+Utilization columns are now NULL, not zero, for cohorts SAS computes none
+for (createbaseline = 'N'), with `NumVisits` blank — as in SAS.
+
+Still missing: `death_source` and `death_enctype` (blank on every wp307
+row, so there is nothing to verify a definition against) and
+`distindexexp` / `distindexhoi` (they index into SAS's index-code
+distribution map).
+
+
+## Index-code distribution: distindexexp / distindexhoi
+
+Implemented from ms_codedistribution.sas. Per cohort and type, every
+index entity is numbered by row position: drug stockgroups sorted, then
+medical codes sorted by (codecat, codetype, enctype, pdx, code) and
+expanded in place — care setting '**' into IP IS ED AV OA, a DX flag '*'
+into P S X '', a PX into X ''. An episode's value is the ids of its
+claims on the index date (exposure) or first event date (outcome),
+joined with '_' in character order.
+
+| | episodes differing (of 31,464) |
+|---|--:|
+| `distindexhoi` | **0** |
+| `distindexexp` | 10 |
+
+All 10 are one mechanism, three patients. Patient 423995's J2506 claim is
+recorded at an AMBULATORY visit on the index date, 2022-12-24, but the
+patient has an INPATIENT stay from 12-20 to 12-24. SAS reports the IP /
+flag-X entity; this package the AV / blank one. SAS reassigns claims that
+fall inside an inpatient stay to that stay — its "envelope" processing
+(RUN_ENVELOPE) — and this package does not.
+
+**Enveloping is the next step, and it is broader than this column:** it
+changes the care setting of every claim inside an inpatient stay, which
+matters wherever a care-setting restriction applies (exposure, events,
+covariates). wp307 sets none elsewhere, so this column is the only place
+it shows here. Not covered either: pregnancy (PO) and cause-of-death (CD)
+entities, and SAS's skip for cohorts defined by labs, dates or death.
+
+Master list: 90 of SAS's 92 columns. Still absent: `death_source`,
+`death_enctype` (blank on every wp307 row).
+
+
+## Enveloping: every claim, as SAS
+
+Enveloping (ms_envelope.sas) now happens in the cdm_diagnosis and
+cdm_procedure views, so every stage sees it, as SAS envelopes its whole
+claim extraction (combo.sas and ms_cidanum.sas's claim set). A non-IP
+claim dated within an inpatient stay becomes care setting IP, flag X;
+the procedure view carries a flag column for this (blank unless
+enveloped). Stays come from the encounter table; RUN_ENVELOPE is read
+from the study (0: admit day included; 2: off; otherwise from the day
+after admit). A study without an encounter table, or without `ddate`,
+runs with one-day stays or none, rather than failing.
+
+**Correction to an earlier entry.** Enveloping was first limited to the
+index-code distribution because enveloping every claim appeared to break
+wp307 cohorts (patients +28, episodes +48). It did not: that run already
+carried an unrelated regression — dispensings filtered by fill date
+rather than supply — which alone produced exactly those numbers. With
+the regression fixed, enveloping every claim leaves every wp307
+comparison exact.
+
+## A regression, and how it got through
+
+The risk-score fix (reading the risk score file) narrowed the claim
+read window: the widest look-back fell from an accidental 365 days —
+the wrong risk-score default — to the correct 183. Exposure dispensings
+were filtered by FILL date, so long fills dated before the window were
+dropped, though their supply reached it: patients +28, episodes +48.
+Fixed by filtering on supply. It shipped in two packages because each
+change was verified only against the SAS output it targeted, and the
+suite runs on demo data with no SAS comparison. Every commit is now
+followed by the full wp307 comparison, not just the feature changed.
+
+## wp307: every comparison exact
+
+| | |
+|---|---|
+| patients, episodes, all 31,464 ends, outcomes | exact |
+| denominator members and member-days | exact |
+| supply (`daysupp`), amount (`amtsupp`) | exact |
+| 32 covariates per episode; baseline covariate counts | exact |
+| utilization: NumAV, NumOA, NumIP, NumED, numrx, NumGeneric, NumClass | exact |
+| CCI | exact |
+| distindexexp, distindexhoi | exact |
+| ExactNumVisit, NumVisits, fupdays_value_cat, Censorcat_sort | exact |
+| MFU | per-code counts exact; patient count matches at all 400 ranks; ties ordered differently (SAS's tie order is not reproducible) |
+
+Master list: 90 of SAS's 92 columns; `death_source` and
+`death_enctype` are blank on every wp307 row, so there is nothing to
+verify a definition against.

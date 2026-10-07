@@ -39,6 +39,9 @@ WITH episodes AS (
         c.hispanic,
         year(c.indexdt)::VARCHAR AS index_year
     FROM cohort_final c
+    -- SAS builds a baseline table only for cohorts with
+    -- createbaseline = 'Y' (ms_cidacov.sas:142)
+    WHERE c.cohortgrp IN (SELECT cohortgrp FROM cfg_cohort WHERE create_baseline)
 ),
 -- Discrete: one dummy per observed level, summed. Built by joining the
 -- episodes to their own distinct level values rather than pivoting on a

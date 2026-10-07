@@ -83,14 +83,63 @@ SELECT
     CAST(rxamt AS DOUBLE)          AS rxamt
 FROM {read_dispensing}
 WHERE rxdate IS NOT NULL
-  AND rxsup IS NOT NULL AND rxsup > 0;
--- NOTE: ms_cidanum.sas:617 filters `rxsup > 0 and rxamt > 0` on ITS
--- dispensing extraction, so requiring a positive amount here looked
--- right. MEASURED it is worse — episodes moved from 31,444 to 31,404
--- against SAS's 31,464, and ends too long rose from 82 to 94. That
--- filter evidently guards a different dataset, so it is not applied.
+  AND rxsup IS NOT NULL AND rxsup > 0
+  -- SAS's dispensing extraction keeps `rxsup > 0 and rxamt > 0`
+  -- (ms_cidanum.sas:617). This was once applied, measured worse, and
+  -- reverted — but the cause was the TEST EXTRACT, whose rxamt had been
+  -- written as INTEGER, truncating 54,995 fractional amounts (0.6 mL
+  -- syringes) to 0. With real amounts there are no zeros at all and
+  -- this filter changes nothing on that study; it stays because it is
+  -- SAS's rule and a true zero amount is not a dispensing.
+  AND rxamt IS NOT NULL AND rxamt > 0;
 
-CREATE OR REPLACE VIEW cdm_diagnosis AS
+-- ------------------------------------------------------------------
+-- ENVELOPING (ms_envelope.sas). A diagnosis or procedure claim dated
+-- within an inpatient stay, and not itself coded inpatient, is re-filed
+-- to the stay: care setting 'IP', principal flag 'X'.
+--
+-- SCOPE: every diagnosis and procedure claim, through the cdm_diagnosis
+-- and cdm_procedure views — as SAS envelopes its whole claim extraction
+-- (combo.sas, and ms_cidanum.sas's claim set). With it, every wp307
+-- comparison is exact.
+--
+-- CORRECTION: an earlier note here said enveloping every claim broke
+-- wp307 cohorts (patients +28, episodes +48). It did not. That run already
+-- carried an unrelated regression (dispensings filtered by fill date, not
+-- supply), which alone produced exactly those numbers; with it fixed,
+-- global enveloping leaves every cohort count exact.
+--
+-- With RUN_ENVELOPE 0 SAS first merges touching or overlapping IP
+-- encounters and envelopes admit..discharge inclusive; merged stays
+-- cover exactly the union of the encounters' days, so the union is used
+-- directly. Any other value except 2 envelopes from the day AFTER admit,
+-- per encounter; 2 switches enveloping off. A missing discharge date is
+-- a one-day stay. SAS's mindate cut (stays ending before extraction
+-- start) cannot change an extracted claim, so it is not applied.
+--
+-- wp307: re-filing one ambulatory J2506 claim on a discharge day is what
+-- separated SAS's distindexexp from this package's on 10 episodes.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE TABLE _ip_days AS
+WITH ip AS (
+    SELECT DISTINCT CAST(patid AS BIGINT) AS patid, CAST(adate AS DATE) AS a,
+           greatest(CAST(adate AS DATE),
+                    coalesce(CAST({opt_ddate} AS DATE), CAST(adate AS DATE))) AS e
+    FROM {read_encounter}
+    WHERE upper(trim(CAST(enctype AS VARCHAR))) = 'IP' AND adate IS NOT NULL
+),
+stays AS (
+    SELECT patid,
+           CASE WHEN {run_envelope} = 0 THEN a ELSE a + 1 END AS s, e
+    FROM ip
+    WHERE {run_envelope} <> 2
+)
+SELECT DISTINCT patid,
+       CAST(unnest(generate_series(s, e, INTERVAL 1 DAY)) AS DATE) AS day
+FROM stays
+WHERE s <= e;
+
+CREATE OR REPLACE VIEW _cdm_diagnosis_raw AS
 SELECT
     CAST(patid AS BIGINT)  AS patid,
     CAST(adate AS DATE)    AS adate,
@@ -100,6 +149,13 @@ SELECT
     upper(COALESCE(CAST(enctype AS VARCHAR), 'XX')) AS enctype
 FROM {read_diagnosis}
 WHERE adate IS NOT NULL;
+
+CREATE OR REPLACE VIEW cdm_diagnosis AS
+SELECT r.* REPLACE (
+    CASE WHEN i.patid IS NOT NULL AND r.enctype <> 'IP' THEN 'X'  ELSE r.pdx END AS pdx,
+    CASE WHEN i.patid IS NOT NULL AND r.enctype <> 'IP' THEN 'IP' ELSE r.enctype END AS enctype)
+FROM _cdm_diagnosis_raw r
+LEFT JOIN _ip_days i ON i.patid = r.patid AND i.day = r.adate;
 
 CREATE OR REPLACE TABLE deaths AS
 SELECT
@@ -112,7 +168,7 @@ GROUP BY 1;
 -- Procedures. Real input files use codecat='PX' freely — 150 of 1,124
 -- cohort codes, 80 covariate codes and 30 inclusion codes in the study
 -- file seen — so this is a mainstream domain, not an edge case.
-CREATE OR REPLACE VIEW cdm_procedure AS
+CREATE OR REPLACE VIEW _cdm_procedure_raw AS
 SELECT
     CAST(patid AS BIGINT)          AS patid,
     CAST(adate AS DATE)            AS adate,
@@ -120,6 +176,17 @@ SELECT
     CAST(px_codetype AS VARCHAR)   AS codetype,
     CAST(enctype AS VARCHAR)       AS enctype
 FROM {read_procedure};
+
+-- enveloped like diagnoses; the procedure table has no principal flag,
+-- so `pdx` is blank, or 'X' when the claim was enveloped
+CREATE OR REPLACE VIEW cdm_procedure AS
+SELECT r.* REPLACE (
+    CASE WHEN i.patid IS NOT NULL AND coalesce(r.enctype, '') <> 'IP' THEN 'IP'
+         ELSE r.enctype END AS enctype),
+    CASE WHEN i.patid IS NOT NULL AND coalesce(r.enctype, '') <> 'IP' THEN 'X'
+         ELSE '' END AS pdx
+FROM _cdm_procedure_raw r
+LEFT JOIN _ip_days i ON i.patid = r.patid AND i.day = r.adate;
 
 -- Laboratory results.
 --
