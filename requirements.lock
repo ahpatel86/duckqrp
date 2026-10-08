@@ -1,0 +1,13 @@
+# Pinned runtime dependency for offline / mirrored installs.
+#
+#   pip install --require-hashes -r requirements.lock
+#
+# Regenerate with:
+#   pip download duckdb==1.5.5 -d /tmp/wheels
+#   pip hash /tmp/wheels/*.whl
+#
+# Replace the hash below with the one for YOUR platform's wheel — hashes
+# are per-wheel, so a Linux x86_64 hash will not match a Windows or
+# macOS download. Sites that mirror PyPI internally should point pip at
+# the mirror with --index-url.
+duckdb==1.5.5
