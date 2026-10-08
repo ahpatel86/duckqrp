@@ -8127,3 +8127,47 @@ def test_every_example_study_still_loads(path):
         w.simplefilter("ignore")
         study = load_study(path)
     assert study.cohorts, f"{path.name} loaded no cohorts"
+
+
+def test_truncation_claims_only_for_patients_in_the_cohort():
+    """Truncation can only cut a patient's own episodes, and its stockpile
+    chain runs per patient, so claims of patients with no exposure in the
+    cohort cannot affect anything. They were built and stockpiled anyway:
+    on wp307 96% of 2.7M truncation rows (5.3s -> 2.4s once restricted),
+    with every one of 31,464 episode ends still matching SAS.
+
+    Here lisinopril is truncated by beta-blocker dispensings, which many
+    patients without lisinopril also have.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    bb = sorted({str(r["code"]) for r in base["cohortcodes"]
+                 if r.get("group") == "beta_blocker"
+                 and str(r.get("codecat", "")).upper() == "RX"})[:5]
+    fut = [{"group": "lisinopril", "codecat": "RX", "codetype": "ND", "code": c,
+            # a truncation code: INDEXCRITERIA 'FUT', FUPCRITERIA 'NOT'
+            "indexcriteria": "FUT", "fupcriteria": "NOT", "stockgroup": "bb"}
+           for c in bb]
+    study = load_study_dict({**base, "cohortcodes": list(base["cohortcodes"]) + fut})
+    codes = ",".join(f"'{c}'" for c in bb)
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        outsiders, rows, stray = eng.con.execute(f"""
+            SELECT
+              (SELECT count(DISTINCT d.patid) FROM cdm_dispensing d
+                WHERE d.code IN ({codes}) AND NOT EXISTS (
+                  SELECT 1 FROM exposure_claims x
+                  WHERE x.cohortgrp = 'lisinopril' AND x.patid = d.patid)),
+              (SELECT count(*) FROM trunc_claims WHERE cohortgrp = 'lisinopril'),
+              (SELECT count(*) FROM trunc_claims t WHERE NOT EXISTS (
+                  SELECT 1 FROM exposure_claims x
+                  WHERE x.cohortgrp = t.cohortgrp AND x.patid = t.patid))
+        """).fetchone()
+    finally:
+        eng.close()
+    assert outsiders > 0, "no outsider has these dispensings: the test proves nothing"
+    assert rows > 0, "no truncation claims were built at all"
+    assert stray == 0, f"{stray} truncation rows belong to patients outside the cohort"

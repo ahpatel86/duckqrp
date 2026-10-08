@@ -401,6 +401,13 @@ WITH raw AS (
     -- each one pushes the rest of the chain further forward.
     WHERE t.adate + CAST(t.rxsup - 1 AS INTEGER)
           >= DATE '{start_date}' - cc.enr_days
+      -- Only patients with exposure in this cohort. Truncation can only
+      -- cut a patient's own episodes, and the chain runs per patient, so
+      -- other patients' claims cannot move these dates. On wp307 96% of
+      -- the 2.7M truncation rows came from patients never in the cohort
+      -- and were built, stockpiled and never matched.
+      AND EXISTS (SELECT 1 FROM exposure_claims x
+                  WHERE x.cohortgrp = k.cohortgrp AND x.patid = t.patid)
 ),
 sameday AS (
     SELECT cohortgrp, stockgroup, patid, adate,
@@ -445,4 +452,7 @@ JOIN cfg_codes k
  -- was kept.
  AND (k.codetype = '' OR k.codetype IS NULL
       OR t.codetype IS NULL
-      OR upper(t.codetype) = k.codetype);
+      OR upper(t.codetype) = k.codetype)
+-- as above: only patients with exposure in this cohort
+WHERE EXISTS (SELECT 1 FROM exposure_claims x
+              WHERE x.cohortgrp = k.cohortgrp AND x.patid = t.patid);
