@@ -18,9 +18,9 @@
 -- groups and comparable across runs — a missing column and a zero
 -- column mean different things to a reader.
 --
--- This was previously emitted as `covariate_prevalence`: one row per
--- COVARIATE, long. That is a different table, not a renaming of this
--- one.
+-- An early version emitted a long, one-row-per-COVARIATE table under
+-- this name. That table (later `covariate_prevalence`) was not a SAS
+-- output and has been removed; the same counts are here, in SAS's form.
 --
 -- The `_<i>` suffix in the SAS name is a surveillance-period index,
 -- which this package does not model — see docs/OUTPUTS.md.

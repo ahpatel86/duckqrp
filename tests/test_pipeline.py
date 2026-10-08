@@ -8112,3 +8112,18 @@ def test_a_large_covariate_does_not_go_quadratic():
     # rebuild. A first bound of 60s let the quadratic version PASS; 25s
     # separates them with room either way.
     assert took < 25, f"a 30,000-code covariate took {took:.0f}s"
+
+
+@pytest.mark.parametrize("path", sorted((Path(__file__).resolve().parent.parent
+                                         / "study").glob("*.json")),
+                         ids=lambda p: p.name)
+def test_every_example_study_still_loads(path):
+    """Every study file shipped in study/ must load. Twelve of them — the
+    examples in SAS's own input-file format, one per feature area — were
+    referenced by no test and no document, so a change that broke them
+    would have gone unnoticed."""
+    import warnings as w
+    with w.catch_warnings():
+        w.simplefilter("ignore")
+        study = load_study(path)
+    assert study.cohorts, f"{path.name} loaded no cohorts"

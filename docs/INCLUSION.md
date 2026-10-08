@@ -45,7 +45,7 @@ episodes lack the required hypertension code, and **0** carry an
 excluded diabetes code. Failure reasons decompose as 70,437 INC-only,
 5,206 EXC-only, 3,910 both.
 
-## NOT implemented
+## Formerly not implemented
 
 ### `IEV` / `EEV` — now implemented
 
@@ -270,9 +270,6 @@ rather than taken on trust.
 
 ### Still not implemented
 
-These are parsed and **warned about at load**, because ignoring them
-makes the cohort broader than SAS's — the dangerous direction:
-
-
-If your studies use any of these, say which and they can be added — the
-shape fits what is already here.
+Nothing at present. A rule shape that is parsed but not evaluated is
+**warned about at load**, because ignoring it makes the cohort broader
+than SAS's — the dangerous direction.

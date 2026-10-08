@@ -10,6 +10,11 @@
 | **[PERFORMANCE_AND_TERMINALS.md](PERFORMANCE_AND_TERMINALS.md)** | Memory floors, spilling, scaling to 200-300GB, terminal compatibility. |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | Developers. Threading model, data flow, module map. |
 | **[UI.md](UI.md)** | UI architecture and the framework comparison. |
+| **[DEPLOYMENT.md](DEPLOYMENT.md)** | Getting it running at a Data Partner site: single executable, Docker, or pip. |
+| **[OUTPUTS.md](OUTPUTS.md)** | Every output table and column, and how each maps to SAS's. |
+| **[PARITY_RUN.md](PARITY_RUN.md)** | How to run a comparison against SAS, and what to send. |
+| **[PARITY_FINDINGS.md](PARITY_FINDINGS.md)** | The record of every SAS comparison made and every discrepancy fixed. |
+| **[PERFORMANCE.md](PERFORMANCE.md)** | Performance measurements and the changes they drove. |
 | **[screenshots/](screenshots/)** | Real renders of the terminal UI: controls, a healthy run, spilling, and the OOM message. |
 
 Screenshots are `export_screenshot()` output — the app's real terminal

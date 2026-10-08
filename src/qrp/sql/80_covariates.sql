@@ -241,26 +241,3 @@ hits AS (SELECT * FROM hits_other UNION SELECT * FROM hits_rx)
 SELECT DISTINCT w.cohortgrp, w.patid, w.indexdt, w.covarnum, w.covarname
 FROM windows w
 JOIN hits h USING (enr_cfg_id, enr_days, patid, covarnum, dateonly, ws, we);
-
--- Covariate counts, which the baseline table needs and which the port
--- computed by re-scanning the wide table.
-CREATE OR REPLACE TABLE covariate_prevalence AS
-SELECT
-    b.cohortgrp,
-    b.covarnum,
-    b.covarname,
-    count(c.patid)                       AS n_with_covariate,
-    b.n_episodes,
-    round(100.0 * count(c.patid) / nullif(b.n_episodes, 0), 2) AS pct
-FROM (
-    SELECT d.cohortgrp, d.covarnum, d.covarname, t.n_episodes
-    FROM cfg_covariates d
-    JOIN (SELECT cohortgrp, count(*) AS n_episodes
-          FROM ptsmasterlist GROUP BY 1) t
-      ON t.cohortgrp = d.cohortgrp
-) b
-LEFT JOIN covariates_long c
-       ON c.cohortgrp = b.cohortgrp
-      AND c.covarnum  = b.covarnum
-GROUP BY 1, 2, 3, b.n_episodes
-ORDER BY 1, 2;

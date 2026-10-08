@@ -205,7 +205,7 @@ Present in SAS, absent here, each behind a condition:
 | `IndexLookEndDt` truncation | mock surveillance (`PERIODIDSTART=1`, `PERIODIDEND>1`) | not implemented |
 | `censordate_maxdose` | `maxcumdose` **and** `cumdoseper` set | ✔ **FIXED** — see below |
 | dose limits on INC/EXC rows | `mincumdose`/`minafdd`/`maxafdd` set | ✔ **IMPLEMENTED** — see docs/INCLUSION.md |
-| FUT truncation (`trunkdt`) | Type 2/5 with episode extension | not implemented — truncates an extended episode at the first qualifying claim in the extension |
+| FUT truncation (`trunkdt`) | Type 2/5 with episode extension | ✔ **IMPLEMENTED** — truncation claims are stockpiled in their own stockgroups; all 31,464 episode ends of a 40-cohort study match SAS (see docs/PARITY_FINDINGS.md) |
 
 ---
 
@@ -324,7 +324,7 @@ one.
 |---|---|---|
 | `codedays` | 1 | 1 ✔ |
 | `dateonly` | `'N'` | `False` ✔ |
-| `minrxdays` | 1 | not implemented (documented gap) |
+| `minrxdays` | 1 | ✔ implemented — total days of supply in the window (`52_inclusion.sql`) |
 | `mincfdd` / `maxcfdd` | 0 *(on INCLUSIONCODES rows)* | n/a — cohort-level missing correctly means "no restriction", since `ms_pov1dose` gates on `&maxcfdd. ne .` |
 
 No new divergences. The cohort-level dose parameters and the

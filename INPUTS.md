@@ -63,6 +63,14 @@ Study parameter `run_envelope` (SAS's `RUN_ENVELOPE`) is read: claims
 dated inside an inpatient stay are re-filed to it (care setting `IP`,
 flag `X`), as SAS does. `0` includes the admit day, `2` switches it off.
 
+### Examples
+
+`study/real_*.json` are small studies in SAS's own input-file format
+(a `QRP_PARAMETERS` table mapping logical names to tables), one per
+feature area: CIDA, covariates, geography, inclusion, labs, MFU, risk
+scores, utilization and SCDM columns. A test loads every file in
+`study/` so they cannot silently stop working.
+
 ### Recognised but NOT implemented
 
 `STOCKPILINGFILE`. Stockpiling uses SAS's defaults. If your study

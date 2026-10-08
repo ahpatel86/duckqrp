@@ -321,10 +321,10 @@ built from two `proc means ... class &groupvar` passes merged by group.
   comparable across runs: a missing column and a zero column mean
   different things to a reader.
 
-This package emitted `covariate_prevalence` under the name — **one row
-per covariate, long**. A different table, not a renaming, so the name
-has been returned to `covariate_prevalence` and the real baseline
-implemented.
+An early version emitted a long, one-row-per-covariate table under
+this name. It was renamed `covariate_prevalence` when the real baseline
+was implemented, and has since been **removed**: it was not a SAS
+output, and every count it held is in the baseline table.
 
 The category columns are generated from the levels OBSERVED in the
 data rather than a hardcoded list, so a race code or age band the study
@@ -596,7 +596,7 @@ This package emitted one regardless.
 Both gates are now applied, and both warn at load rather than silently
 dropping a deliverable.
 
-### `OUTPUTDENOM='M'` — documented, then not implemented
+### `OUTPUTDENOM='M'` — implemented (it was once documented but missing)
 
 The `M` case was written into the docs and the dataclass comment and
 **never implemented**. A cohort set to `M` kept getting member-days it

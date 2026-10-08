@@ -80,12 +80,6 @@ OUTPUTS: tuple[Output, ...] = (
                 "shape and columns match."),
     Output("censoring", "censor_cida", "msoc", contract=True, emit="always"),
     Output("cohort_final", "mstr", "dplocal", contract=True, emit="always"),
-    Output("covariate_prevalence", "covariate_prevalence", "msoc", emit="covariate",
-           note="Not a SAS output. SAS's baseline table is wide and squared"
-                "(one row per group, one column per category level); this"
-                "is one row per covariate. Kept because the long form is"
-                "easier to read when checking a single covariate"
-                "definition."),
     Output("covariates_long", "covariates", "dplocal", emit="covariate",
            note="Not a SAS output. SAS holds covariate detection in work"
                 "datasets and emits only the derived baseline table; there"
@@ -280,7 +274,7 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
     # stale. Two ways that bites, both verified:
     #
     #   * Rerunning a study with a feature REMOVED — drop the
-    #     covariates, and covariates / baseline / covariate_prevalence
+    #     covariates, and the covariate and baseline tables
     #     survive from the previous run. A reader gets covariate results
     #     for a study that defines no covariates.
     #   * Switching --names between `sas` and `logical` — the same table

@@ -1510,13 +1510,6 @@ def run(
             from .sqlsplit import split_statements
             for _stmt in split_statements(_combo_sql(study)):
                 eng.con.execute(_stmt.sql)
-            # Rebuild prevalence: it is computed inside the covariates
-            # stage, which runs BEFORE the combos are inserted, so it
-            # would otherwise omit every combo covariate — 17 of 49 in
-            # the real study seen. Reported in review.
-            eng.con.execute(
-                (Path(__file__).parent / "sql"
-                 / "_covariate_prevalence.sql").read_text().format(**fmt))
 
         # The SAS baseline distribution table: wide, one row per group.
         eng.script_stage("baseline", "96_baseline.sql", **fmt)
