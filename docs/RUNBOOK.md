@@ -53,10 +53,12 @@ folder uninstalls everything cleanly.
 python3 -m venv ~/qrp-env
 ```
 
-**Install into it:**
+**Install into it**, from the folder where you unzipped the package
+(it contains `pyqrp-duck/`). The package is not published on PyPI, so
+`pip install qrp-duckdb` will not find it:
 
 ```bash
-~/qrp-env/bin/pip install qrp-duckdb
+~/qrp-env/bin/pip install ./pyqrp-duck
 ```
 
 **Then run the tool by its full path:**
@@ -86,23 +88,23 @@ activated, put `~/qrp-env/bin/` in front of it.
 If your site has `pipx`, it handles the environment for you:
 
 ```bash
-pipx install qrp-duckdb
+pipx install ./pyqrp-duck
 qrp --help
 ```
 
 ### No internet access
 
-Ask IT to mirror the package internally, then:
-
-```bash
-~/qrp-env/bin/pip install --require-hashes -r requirements.lock
-```
+Installing from the folder still downloads DuckDB (and a build tool)
+from the internet. Without access, use one of the offline routes in
+**[DEPLOYMENT.md](DEPLOYMENT.md)**: a pre-built offline bundle, a single
+executable, or a Docker image — prepared by someone with internet on
+the same operating system and Python version as your site.
 
 There is no separate database to set up, no server to start, no Java —
 one package and its engine.
 
 **Optional:** for the point-and-click screen,
-`~/qrp-env/bin/pip install "qrp-duckdb[ui]"`.
+`~/qrp-env/bin/pip install "./pyqrp-duck[ui]"`.
 
 ---
 
@@ -442,7 +444,7 @@ needed.
 
 ```bash
 python3 -m venv ~/qrp-env                       # one-time setup
-~/qrp-env/bin/pip install qrp-duckdb
+~/qrp-env/bin/pip install ./pyqrp-duck
 source ~/qrp-env/bin/activate                   # each new terminal
 
 qrp inspect --study s.json --indata data/       # check before running

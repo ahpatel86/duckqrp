@@ -9,29 +9,44 @@ developers with **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — a
 plain-language, five-step guide for an analyst at a Data Partner site.
 For security review, **[docs/SECURITY.md](docs/SECURITY.md)**.
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate   # see note below
-pip install -e ".[dev]"
+The package is a zip; everything below runs from the folder it unpacks
+to. It is **not published on PyPI**, so `pip install qrp-duckdb` and
+`pipx install qrp-duckdb` will not find it — install from the folder.
+No internet at your site? See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
+(offline bundle, single executable, or Docker).
 
-python -m qrp validate --study study/demo_type2.json
-python -m qrp run --study study/demo_type2.json \
-                  --indata /path/to/cdm_parquet \
-                  --out results/
+```bash
+unzip duckqrp-clean.zip && cd pyqrp-duck
+
+# A virtual environment is required, not optional: modern Linux and
+# Homebrew mark the system Python "externally managed" (PEP 668) and a
+# bare `pip install` is refused.
+python3 -m venv .venv
+source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
+                                   # Windows cmd.exe:    .venv\Scripts\activate.bat
+
+pip install .                      # to RUN it
+pip install ".[ui]"                # ...plus the optional terminal UI
+pip install -e ".[dev]"            # to DEVELOP it: editable, plus pytest, mypy, ruff
+# or, without managing an environment yourself:  pipx install .
+
+qrp doctor                         # checks the install on generated data
+qrp validate --study study/demo_type2.json
+qrp run --study study/demo_type2.json --indata /path/to/cdm_parquet --out results/
 
 # Outputs split into dplocal/ (patient-level, stays local) and msoc/
 # (aggregate, shareable), named <runid>_<table>. --layout flat for one
 # directory.
-python -m qrp show --out results/                 # list result tables
-python -m qrp show --out results/ attrition       # read one
+qrp show --out results/            # list result tables
+qrp show --out results/ attrition  # read one
 
-pytest                       # 196 tests
-
-# A virtual environment is required, not optional: modern Linux and
-# Homebrew mark the system Python "externally managed" (PEP 668) and a
-# bare `pip install` is refused. `pipx install qrp-duckdb` also works.
+# Developers (after the [dev] install):
+pytest                             # the full suite, ~330 tests
 python tools/gen_synthetic.py --out /tmp/qrp_data/100k --patients 100000
 python tools/bench.py --scales 100k 500k 2m
 ```
+
+`python -m qrp ...` works anywhere `qrp ...` does.
 
 ## What this is and isn't
 

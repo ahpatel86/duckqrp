@@ -21,7 +21,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pandas>=2", "mypy>=1.8", "ruff>=0.6"]
+# textual is here because tests/test_ui.py skips itself without it: a
+# developer install that omitted it ran 291 of 328 tests and reported no
+# error, so the terminal UI went untested without anyone noticing.
+dev = ["pytest>=8", "pandas>=2", "mypy>=1.8", "ruff>=0.6", "textual>=0.80"]
 ui = ["textual>=0.80"]
 serve = ["textual>=0.80", "textual-serve>=1.1"]
 
