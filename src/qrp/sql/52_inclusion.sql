@@ -32,6 +32,17 @@
 -- Written as one statement with CTEs rather than two temp tables: each
 -- intermediate has exactly one consumer, so materialising them would be
 -- a barrier for nothing.
+-- The episodes the conditions are evaluated for: SAS's level-16
+-- survivors (prior enrollment met), not the final ptsmasterlist. SAS
+-- applies inclusion/exclusion at attrition level 18, BEFORE the post-index
+-- criteria of levels 20-23, so an episode failing both is SAS's level-18
+-- exclusion. ptsmasterlist below still removes exactly the failures.
+CREATE OR REPLACE TEMP VIEW _incl_episodes AS
+SELECT * EXCLUDE (min_enr_days_met, min_enr_aft_met, min_day_sup_met,
+                  min_epi_dur_met, post_blackout_met)
+FROM episode_criteria
+WHERE min_enr_days_met;
+
 CREATE OR REPLACE TABLE inclusion_excluded AS
 WITH hits AS (
     -- Per (episode, condition, level): how many distinct days carry a
@@ -92,7 +103,7 @@ WITH hits AS (
         max(r.mincumdose)       AS need_cumdose,
         min(r.minafdd)          AS need_afdd_lo,
         max(r.maxafdd)          AS need_afdd_hi
-    FROM ptsmasterlist p
+    FROM _incl_episodes p
     -- DISTINCT on the condition key. Several INCLUSIONCODES rows share
     -- one (cond, condlevel) — one per code — so joining the raw table
     -- counts every claim once per row. count(DISTINCT adate) hid this
@@ -154,7 +165,7 @@ per_subcond AS (
              THEN any_value(r.subcond_inclusion)
              ELSE NOT any_value(r.subcond_inclusion)
         END AS satisfied
-    FROM ptsmasterlist p
+    FROM _incl_episodes p
     JOIN (SELECT DISTINCT cohortgrp, criteria, cond, subcond,
                  subcond_inclusion
           FROM cfg_inclusion WHERE criteria IN ('INC', 'EXC')) r

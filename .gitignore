@@ -23,3 +23,11 @@ logs/
 results/
 *.duckdb
 *.duckdb.wal
+
+# Run outputs and data never belong in the repository. results/ (above) is
+# the README's output folder; anything else a run writes should live outside
+# the repo. These catch the common ones:
+_dbg_*/
+*.parquet
+*.sas7bdat
+*.csv

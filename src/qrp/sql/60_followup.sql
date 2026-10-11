@@ -49,17 +49,38 @@ JOIN cfg_codes k
 
 -- Most recent disqualifying claim strictly before each index date.
 -- A view: consumed once, by cohort_final.
-CREATE OR REPLACE VIEW prior_event AS
+-- ------------------------------------------------------------------
+-- HOI incidence and HOI blackout, per episode, as flags: SAS's
+-- HOIIncidenceCrit and HOIBlackout (attrition levels 19 and 24),
+-- evaluated on the level-16 survivors as SAS does, not only on the final
+-- list. cohort_final filters on these flags: one definition for both.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE TABLE episode_hoi AS
 SELECT
-    m.cohortgrp,
-    m.patid,
-    m.indexdt,
-    e.adate AS prior_event_dt
-FROM ptsmasterlist m
-ASOF LEFT JOIN washout_claims e
-       ON e.cohortgrp = m.cohortgrp
-      AND e.patid     = m.patid
-      AND e.adate     < m.indexdt;
+    m.cohortgrp, m.patid, m.indexdt,
+    -- Follow-up washout. A NULL fup_wash_per means "never had an event"
+    -- (SAS uses 99999), so it is the strictest setting rather than the
+    -- loosest: any prior event at all disqualifies the episode.
+    CASE
+        WHEN c.fup_wash_per IS NULL THEN pe.adate IS NULL
+        WHEN c.fup_wash_per <= 0    THEN TRUE
+        ELSE pe.adate IS NULL OR pe.adate < m.indexdt - c.fup_wash_per
+    END                                                    AS hoi_incidence_met,
+    -- Blackout: SAS builds _EventsInBlackout and drops those episodes
+    -- outright (`if a and not b and not c and not d`,
+    -- ms_createpov56.sas:127). Shifting the at-risk start alone ignored
+    -- the event but KEPT the episode, inflating the denominator.
+    (c.blackout_per <= 0 OR NOT EXISTS (
+        SELECT 1 FROM event_claims b
+        WHERE b.cohortgrp = m.cohortgrp AND b.patid = m.patid
+          AND b.adate BETWEEN m.indexdt AND m.indexdt + c.blackout_per - 1
+    ))                                                     AS hoi_blackout_met
+FROM (SELECT cohortgrp, patid, indexdt FROM episode_criteria WHERE min_enr_days_met) m
+ASOF LEFT JOIN washout_claims pe
+       ON pe.cohortgrp = m.cohortgrp
+      AND pe.patid     = m.patid
+      AND pe.adate     < m.indexdt
+JOIN cfg_cohort c ON c.cohortgrp = m.cohortgrp;
 
 -- First event inside the at-risk window. `eventcount` controls how
 -- same-day events are collapsed, which is a config decision resolved
@@ -312,35 +333,14 @@ SELECT
     END AS exit_reason
 FROM ptsmasterlist m
 JOIN cfg_cohort c USING (cohortgrp)
-LEFT JOIN prior_event pe
-       ON pe.cohortgrp = m.cohortgrp
-      AND pe.patid     = m.patid
-      AND pe.indexdt   = m.indexdt
+JOIN episode_hoi h
+  ON h.cohortgrp = m.cohortgrp AND h.patid = m.patid AND h.indexdt = m.indexdt
 LEFT JOIN first_event fe
        ON fe.cohortgrp = m.cohortgrp
       AND fe.patid     = m.patid
       AND fe.indexdt   = m.indexdt
-WHERE
-    -- Follow-up washout. A NULL fup_wash_per means "never had an event"
-    -- (SAS uses 99999), so it is the strictest setting rather than the
-    -- loosest — any prior event at all disqualifies the episode.
-    CASE
-        WHEN c.fup_wash_per IS NULL THEN pe.prior_event_dt IS NULL
-        WHEN c.fup_wash_per <= 0    THEN TRUE
-        ELSE pe.prior_event_dt IS NULL
-             OR pe.prior_event_dt < m.indexdt - c.fup_wash_per
-    END
-    -- Blackout: SAS builds _EventsInBlackout and drops those episodes
-    -- outright (`if a and not b and not c and not d`,
-    -- ms_createpov56.sas:127). Shifting the at-risk start alone ignored
-    -- the event but KEPT the episode, inflating the denominator.
-    AND (c.blackout_per <= 0 OR NOT EXISTS (
-            SELECT 1 FROM event_claims b
-            WHERE b.cohortgrp = m.cohortgrp
-              AND b.patid     = m.patid
-              AND b.adate BETWEEN m.indexdt
-                              AND m.indexdt + c.blackout_per - 1
-        ));
+-- the follow-up washout and HOI blackout: flags defined once, in episode_hoi
+WHERE h.hoi_incidence_met AND h.hoi_blackout_met;
 
 -- ------------------------------------------------------------------
 -- Supply and amount WITHIN the episode, as SAS reports them.
@@ -417,7 +417,10 @@ rx_rows AS (
                / x.rxsup AS DECIMAL(38, 12)))                     AS amt_c,
            sum(greatest(0, date_diff('day', e.adate,
                    least(e.adate + CAST(x.rxsup - 1 AS INTEGER), e.enr_end)) + 1))
-                                                                  AS sup_c
+                                                                  AS sup_c,
+           -- raw dispensings combined into this stockpiled record
+           -- (SAS's NumDispensing); 1 if its constituents were not found
+           greatest(count(x.adate), 1)                           AS n_raw
     FROM rx_ep e
     LEFT JOIN exposure_claims x
       ON x.codecat = 'RX' AND x.cohortgrp = e.cohortgrp
@@ -436,17 +439,25 @@ other AS (
      AND x.adate <= w.fe
      AND x.adate + CAST(x.rxsup - 1 AS INTEGER) >= w.indexdt
 ),
+-- Dispensing counts come from the same summary as supply and amount
+-- (ms_finalizeptsmasterlist.sas:128-133, PROC MEANS over the records
+-- overlapping the episode): AdjustedDisp is the number of stockpiled
+-- records (_freq_), RawDisp the raw dispensings they combine
+-- (sum(NumDispensing)). The master list used the index record's count for
+-- both, and t2_cida a constant 1 for AdjustedDisp.
 totals AS (
     SELECT cohortgrp, patid, indexdt, sum(ov) AS totrxsup,
-           CAST(sum(amt) AS DOUBLE) AS totrxamt
+           CAST(sum(amt) AS DOUBLE) AS totrxamt,
+           count(*)                 AS adjusteddisp,
+           sum(n_raw)               AS rawdisp
     FROM (
-        SELECT cohortgrp, patid, indexdt, ov,
+        SELECT cohortgrp, patid, indexdt, ov, n_raw,
                -- the constituents, if found; the row's own figures otherwise
                CAST(coalesce(amt_c * ov / nullif(sup_c, 0), row_amt * ov / row_sup)
                     AS DECIMAL(38, 12)) AS amt
         FROM rx_rows
         UNION ALL
-        SELECT cohortgrp, patid, indexdt, ov,
+        SELECT cohortgrp, patid, indexdt, ov, 1,
                CAST(rxamt * ov / rxsup AS DECIMAL(38, 12)) FROM other
     )
     GROUP BY 1, 2, 3
@@ -454,7 +465,80 @@ totals AS (
 SELECT
     f.*,
     COALESCE(t.totrxsup, 0)   AS episode_totrxsup,
-    COALESCE(t.totrxamt, 0.0) AS episode_totrxamt
+    COALESCE(t.totrxamt, 0.0) AS episode_totrxamt,
+    COALESCE(t.rawdisp, 0)      AS episode_rawdisp,
+    COALESCE(t.adjusteddisp, 0) AS episode_adjusteddisp
 FROM cohort_final f
 LEFT JOIN totals t
   ON t.cohortgrp = f.cohortgrp AND t.patid = f.patid AND t.indexdt = f.indexdt;
+
+-- ------------------------------------------------------------------
+-- A table of its own, not more columns on cohort_final: cohort_final is
+-- already rebuilt twice in this file and again in 62_mstr_wide.sql, and
+-- a stage reading it sees whichever version ran last.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE TABLE episode_flags AS
+SELECT
+    f.cohortgrp, f.patid, f.indexdt,
+-- Follow-up and censoring flags, per episode. ONE definition, read by
+    -- the master list (62_mstr_wide.sql) and the censoring table
+    -- (70_outputs.sql). SAS computes them in two
+    -- passes over two dates (ms_finalizeptsmasterlist.sas:305-357), each
+    -- flag an INDEPENDENT equality test, so several can be 1 at once:
+    --   cens_*  against the censor date: min(Enr_End, death, query end,
+    --           DP end), ignoring the episode's own end and events;
+    --   fup_*   against the follow-up end: min(EpisodeEndDt, Enr_End,
+    --           FEventDt).
+    -- They used to come from one exit_reason, with cens_* a copy of
+    -- fup_* (a misreading of a rename at line 393 that belongs to
+    -- another output): on wp307 cens_elig differed on 22,660 episodes.
+    -- Eligibility is reset when death falls on the same day (SAS's
+    -- enrend_death = 'C'); DP end counts only when it differs from the
+    -- query end (Censor_DPEnd).
+    CASE WHEN fl.fup_end = f.enr_end
+          AND NOT (f.deathdt IS NOT NULL AND fl.fup_end = f.deathdt)
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_elig,
+    CASE WHEN f.deathdt IS NOT NULL AND fl.fup_end = f.deathdt
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_dth,
+    CASE WHEN fl.fup_end = DATE '{end_date}'
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_qryend,
+    CASE WHEN fl.fup_end = DATE '{censor_date}'
+          AND DATE '{censor_date}' <> DATE '{end_date}'
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_dpend,
+    -- the ORIGINAL (pre-truncation) episode end, or the maximum
+    -- episode duration; POINT studies use only the latter
+    CASE WHEN (fl.point IS DISTINCT FROM 'Y' AND fl.fup_end = f.origepisenddt)
+           OR (fl.max_epis_dur >= 0
+               AND fl.fup_end = f.indexdt + CAST(fl.max_epis_dur - 1 AS INTEGER))
+           -- cut short by the maximum cumulative dose (lines 357-359)
+           OR (fl.maxdose_dt IS NOT NULL AND fl.fup_end < f.origepisenddt
+               AND fl.fup_end = fl.maxdose_dt)
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_episend,
+    CASE WHEN f.trunkdt IS NOT NULL AND fl.fup_end = f.trunkdt
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_spec,
+    CASE WHEN f.feventdt IS NOT NULL AND fl.fup_end = f.feventdt
+         THEN 1 ELSE 0 END::SMALLINT                AS fup_event,
+    CASE WHEN fl.cens_end = f.enr_end
+          AND NOT (f.deathdt IS NOT NULL AND fl.cens_end = f.deathdt)
+         THEN 1 ELSE 0 END::SMALLINT                AS cens_elig,
+    CASE WHEN f.deathdt IS NOT NULL AND fl.cens_end = f.deathdt
+         THEN 1 ELSE 0 END::SMALLINT                AS cens_dth,
+    CASE WHEN fl.cens_end = DATE '{end_date}'
+         THEN 1 ELSE 0 END::SMALLINT                AS cens_qryend,
+    CASE WHEN fl.cens_end = DATE '{censor_date}'
+          AND DATE '{censor_date}' <> DATE '{end_date}'
+         THEN 1 ELSE 0 END::SMALLINT                AS cens_dpend
+FROM cohort_final f
+-- the two pass dates and per-cohort settings the flags above test against
+CROSS JOIN LATERAL (
+    SELECT
+        least(f.episodeenddt, f.enr_end,
+              coalesce(f.feventdt, DATE '9999-12-31'))          AS fup_end,
+        least(f.enr_end, coalesce(f.deathdt, DATE '9999-12-31'),
+              DATE '{end_date}', DATE '{censor_date}')          AS cens_end,
+        (SELECT k.max_epis_dur FROM cfg_cohort k WHERE k.cohortgrp = f.cohortgrp) AS max_epis_dur,
+        (SELECT k.point FROM cfg_cohort k WHERE k.cohortgrp = f.cohortgrp)        AS point,
+        (SELECT d.censordate_maxdose FROM {dose_rel} d
+         WHERE d.cohortgrp = f.cohortgrp AND d.patid = f.patid
+           AND d.indexdt = f.indexdt)                                     AS maxdose_dt
+) fl;

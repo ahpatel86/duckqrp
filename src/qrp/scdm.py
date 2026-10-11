@@ -25,6 +25,8 @@ into a run.
 
 from __future__ import annotations
 
+from .engine import first_value
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -457,9 +459,9 @@ def probe(indata: str | Path, sample_rows: bool = True,
         n = 0
         if sample_rows:
             try:
-                n = con.execute(
+                n = first_value(con.execute(
                     f"SELECT count(*) FROM {reader(glob)}('{glob}')"
-                ).fetchone()[0]
+                ).fetchone())
             except Exception:
                 n = -1
 

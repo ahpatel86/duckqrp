@@ -91,6 +91,10 @@
            table=distindexmap,  bycohort=N);
     %_emit(stage=followuptime, ds=msoc.&runid._followuptime_cida,
            table=followuptime,  bycohort=N);
+    %_emit(stage=baseline,     ds=msoc.&runid._baseline_1,
+           table=baseline,      bycohort=N);
+    %_emit(stage=mfu,          ds=msoc.&runid._mfu,
+           table=mfu,           bycohort=Y);
 
     /* ---- intermediates: optional, but they localise a divergence -- */
     %_emit(stage=stockpiling,   ds=_Stockpiled,

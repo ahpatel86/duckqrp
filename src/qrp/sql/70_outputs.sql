@@ -13,70 +13,191 @@
 -- genuinely requires zero rows to be reported.
 -- =====================================================================
 
--- Attrition waterfall. Each step is a named count over the same base,
--- so the steps stay legible and the order is data, not control flow.
-CREATE OR REPLACE TABLE attrition AS
-WITH steps AS (
-    SELECT cohortgrp, 1 AS step_no, 'Exposure dispensings'        AS step,
-           count(*) AS records, count(DISTINCT patid) AS patients
-    FROM exposure_claims GROUP BY 1
-    UNION ALL
-    SELECT cohortgrp, 2, 'After stockpiling',
-           count(*), count(DISTINCT patid)
-    FROM stockpiled GROUP BY 1
-    UNION ALL
-    SELECT cohortgrp, 3, 'Met washout (potential index)',
-           count(*), count(DISTINCT patid)
-    FROM index_candidates GROUP BY 1
-    UNION ALL
-    SELECT cohortgrp, 4, 'With enrollment and demographics',
-           count(*), count(DISTINCT patid)
-    FROM pov1 GROUP BY 1
-    UNION ALL
-    SELECT cohortgrp, 5, 'Met episode and enrollment criteria',
-           count(*), count(DISTINCT patid)
-    FROM ptsmasterlist GROUP BY 1
-    UNION ALL
-    SELECT cohortgrp, 6, 'Met follow-up washout (final cohort)',
-           count(*), count(DISTINCT patid)
-    FROM cohort_final GROUP BY 1
+-- =====================================================================
+-- Attrition, as SAS reports it (ms_attrition.sas): a fixed funnel of
+-- member steps (1-6), episode steps (7-24) and information rows. Each
+-- count follows SAS's own definition, verified on wp307 (see
+-- docs/ATTRITION_PLAN.md). Steps that do not apply keep their level as a
+-- blank row, so the levels line up across studies.
+--
+-- Episode steps 12-24 count the SAME flags the cohort is built from
+-- (episode_criteria, inclusion, episode_hoi), applied in SAS's order, so
+-- the last level's episodes are exactly cohort_final.
+-- =====================================================================
+
+-- Members with a birth date and sex (SAS's level-1 population).
+CREATE OR REPLACE TEMP TABLE _att_dem AS
+SELECT DISTINCT patid FROM demographics
+WHERE birth_date IS NOT NULL AND sex IS NOT NULL;
+
+-- Qualifying enrollment spans overlapping the query period, per
+-- ENROLLMENT CONFIGURATION (not per cohort: cohorts sharing one would copy
+-- every member's spans, 3.2M rows for wp307's 40 cohorts and 3 of the
+-- stage's 4 seconds). The death-truncated end is kept beside the plain
+-- one: SAS re-shaves _groupindex against it where the cohort censors at
+-- death (ms_attrition.sas:216).
+CREATE OR REPLACE TEMP TABLE _att_spans AS
+SELECT e.enr_cfg_id, e.patid, e.enr_start, e.enr_end,
+       CASE WHEN d.deathdt IS NOT NULL THEN least(e.enr_end, d.deathdt)
+            ELSE e.enr_end END AS enr_end_dth
+FROM enrollment_spans e
+JOIN _att_dem m ON m.patid = e.patid
+LEFT JOIN deaths d ON d.patid = e.patid
+WHERE e.enr_cfg_id IN (SELECT enr_cfg_id FROM cfg_cohort)
+  AND e.enr_start <= DATE '{end_date}' AND e.enr_end >= DATE '{start_date}';
+
+-- SAS's _groupindex at levels 6-10: stockpiled records SHAVED to the
+-- spans by ms_shaveoutside with KeepPartBf=N, which DELETES a record
+-- starting before a span (it does not clip it), with its start in the
+-- exposure period. Distinct (member, start).
+CREATE OR REPLACE TEMP TABLE _att_gi AS
+-- Two plain range joins, by whether the cohort censors at death: a CASE
+-- inside the range condition stops DuckDB using a range join (41s
+-- instead of 0.16s on wp307).
+WITH x AS (
+    SELECT st.cohortgrp, st.patid, st.adate, c.enr_cfg_id, c.censor_death
+    FROM stockpiled st JOIN cfg_cohort c ON c.cohortgrp = st.cohortgrp
+    WHERE st.adate BETWEEN DATE '{start_date}' AND DATE '{end_date}'
 )
-SELECT
-    -- SAS column names and order: group, level, descr, claim_level,
-    -- remaining, excluded (ms_attrition_cidacompute.sas:104-115). This
-    -- is an msoc output, so those names are a contract — a reader
-    -- matching on `level` should not have to know it was called
-    -- `step_no` here.
-    --
-    -- EXACTLY the SAS columns, nothing more. SAS's attrition data step
-    -- writes level, claim_level, descr, remaining, excluded and group
-    -- and stops (ms_attrition_cidacompute.sas:125-134).
-    --
-    -- This used to carry records / patients / records_dropped /
-    -- patients_dropped after the contract columns, on the reasoning
-    -- that the values were already computed. That was wrong: for an
-    -- msoc output the column SET is the contract, not just the column
-    -- names, and a table with four unexpected columns is one a
-    -- downstream reader has to be taught to ignore. Reported by a data
-    -- partner who noticed the extra columns in their own run.
-    cohortgrp                       AS "group",
-    step_no                         AS level,
-    step                            AS descr,
-    -- Steps 1-3 narrow CLAIMS; 4 onward narrow EPISODES. SAS declares
-    -- the unit per step and computes the counts inside the macro, so it
-    -- never subtracts across the boundary.
-    CASE WHEN step_no <= 3 THEN 'Claim' ELSE 'Episode' END AS claim_level,
-    CASE WHEN step_no <= 3 THEN records ELSE records END   AS remaining,
-    -- NULL at the unit change, not a number. Differencing a claim count
-    -- against an episode count produces a plausible-looking value that
-    -- means nothing — the first version of this reported 66,921
-    -- "excluded" against 53,107 remaining. A missing value is honest;
-    -- a wrong one is not.
-    CASE WHEN step_no = 4 THEN NULL
-         ELSE lag(records) OVER w - records END            AS excluded,
-FROM steps
-WINDOW w AS (PARTITION BY cohortgrp ORDER BY step_no)
-ORDER BY cohortgrp, step_no;
+SELECT DISTINCT cohortgrp, patid, adate FROM (
+    SELECT x.cohortgrp, x.patid, x.adate FROM x
+    SEMI JOIN _att_spans s
+           ON s.enr_cfg_id = x.enr_cfg_id AND s.patid = x.patid
+          AND x.adate BETWEEN s.enr_start AND s.enr_end_dth
+    WHERE x.censor_death
+    UNION ALL
+    SELECT x.cohortgrp, x.patid, x.adate FROM x
+    SEMI JOIN _att_spans s
+           ON s.enr_cfg_id = x.enr_cfg_id AND s.patid = x.patid
+          AND x.adate BETWEEN s.enr_start AND s.enr_end
+    WHERE NOT x.censor_death
+);
+
+-- The episodes surviving level 18 (SAS's _keep), with every later flag.
+CREATE OR REPLACE TEMP TABLE _att_ep AS
+SELECT e.cohortgrp, e.patid, e.indexdt, e.min_enr_days_met, e.min_enr_aft_met,
+       e.min_day_sup_met, e.min_epi_dur_met, e.post_blackout_met,
+       h.hoi_incidence_met, h.hoi_blackout_met,
+       NOT EXISTS (SELECT 1 FROM {incl_rel} x
+                   WHERE x.cohortgrp = e.cohortgrp AND x.patid = e.patid
+                     AND x.indexdt = e.indexdt)                 AS incl_met
+FROM episode_criteria e
+LEFT JOIN episode_hoi h
+  ON h.cohortgrp = e.cohortgrp AND h.patid = e.patid AND h.indexdt = e.indexdt;
+
+-- One count per counted level. A view: it has one reader, so it is
+-- inlined rather than materialised (the single-consumer rule).
+CREATE OR REPLACE TEMP VIEW _att_counts AS
+-- level 1 is the same for every cohort: counted ONCE
+SELECT c.cohortgrp, 1.0 AS level, l1.n
+FROM cfg_cohort c
+CROSS JOIN (SELECT count(*) AS n FROM _att_dem m
+            SEMI JOIN cdm_enrollment e ON e.patid = m.patid
+             AND e.enr_start <= DATE '{end_date}' AND e.enr_end >= DATE '{start_date}') l1
+UNION ALL
+-- level 2 once per enrollment configuration; 3-5 copy it (see note)
+SELECT c.cohortgrp, t.lv, n.n
+FROM cfg_cohort c
+JOIN (SELECT enr_cfg_id, count(DISTINCT patid) AS n FROM _att_spans GROUP BY 1) n
+  ON n.enr_cfg_id = c.enr_cfg_id
+CROSS JOIN (VALUES (2.0), (3.0), (4.0), (5.0)) t(lv)
+UNION ALL SELECT cohortgrp, 6.0,  count(DISTINCT patid) FROM _att_gi GROUP BY 1
+UNION ALL SELECT cohortgrp, 7.0,  count(*) FROM _att_gi GROUP BY 1
+UNION ALL
+-- 10: the age on the record's date falls in one of the cohort's bands
+SELECT g.cohortgrp, 10.0, count(*)
+FROM _att_gi g JOIN demographics d ON d.patid = g.patid
+WHERE EXISTS (SELECT 1 FROM cfg_age_strata a WHERE a.cohortgrp = g.cohortgrp
+                AND age_in_unit(d.birth_date, g.adate, a.unit) BETWEEN a.lo AND a.hi)
+GROUP BY 1
+UNION ALL SELECT cohortgrp, 12.0, count(*) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 16.0, count(*) FILTER (WHERE min_enr_days_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 18.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 19.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met AND hoi_incidence_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 20.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met AND hoi_incidence_met AND min_enr_aft_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 21.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met AND hoi_incidence_met AND min_enr_aft_met AND min_day_sup_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 22.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met AND hoi_incidence_met AND min_enr_aft_met AND min_day_sup_met AND min_epi_dur_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 23.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met AND hoi_incidence_met AND min_enr_aft_met AND min_day_sup_met AND min_epi_dur_met AND post_blackout_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 24.0, count(*) FILTER (WHERE min_enr_days_met AND incl_met AND hoi_incidence_met AND min_enr_aft_met AND min_day_sup_met AND min_epi_dur_met AND post_blackout_met AND hoi_blackout_met) FROM _att_ep GROUP BY 1
+UNION ALL SELECT cohortgrp, 27.0, count(DISTINCT patid) FROM cohort_final GROUP BY 1;
+-- NOTE levels 3-5 (member age range, chart, demographic conditions) are
+-- carried from level 2: on wp307 they exclude nobody, so their member-
+-- level definitions are not yet verified against SAS. Likewise the steps
+-- emitted blank below (8-9 Type 4, 11 prior look, 13-15 dose limits, 17
+-- Type 3, 25-26 supply/amount ranges) are not itemised.
+
+-- SAS's layout. kind: init (excluded missing), excl, blank (carries the
+-- previous count, excluded 0), final (excluded missing).
+CREATE OR REPLACE TABLE attrition AS
+WITH skel(level, kind, claim_level, descr) AS (VALUES
+    (1.0,  'init',  'Member',  'Initial Member Count - Members with a non-missing birth date/sex at any enrollment episode overlapping the query period'),
+    (2.0,  'excl',  'Member',  'Exclusion - Members must have at least one enrollment span meeting the medical and/or drug coverage requirement during the query period'),
+    (3.0,  'excl',  'Member',  'Exclusion - Members must satisfy the age range condition within the query period'),
+    (4.0,  'excl',  'Member',  'Exclusion - Members must meet chart availability criterion within the query period'),
+    (5.0,  'excl',  'Member',  'Exclusion - Members must satisfy the demographic (sex, race and hispanic) condition'),
+    (6.0,  'excl',  'Member',  'Exclusion - Members must have at least one claim with cohort-identifying codes within the query period'),
+    (7.0,  'init',  'Episode', 'Initial Episode Count (among eligible members from previous step) - All claims with cohort-identifying codes'),
+    (8.0,  'blank', '', ''), (9.0, 'blank', '', ''),
+    (10.0, 'excl',  'Episode', 'Exclusion - Cohort episode must have an index date within the age range condition'),
+    (11.0, 'blank', '', ''),
+    (12.0, 'excl',  'Episode', 'Exclusion - Episode-defining index claims must be during the query period'),
+    (13.0, 'blank', '', ''), (14.0, 'blank', '', ''), (15.0, 'blank', '', ''),
+    (16.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must satisfy the pre-index enrollment criterion'),
+    (17.0, 'blank', '', ''),
+    (18.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must satisfy all exclusion and inclusion criteria'),
+    (19.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must meet HOI incidence criterion'),
+    (20.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must satisfy the post-index enrollment and available data criteria'),
+    (21.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must have at least minimum days supplied'),
+    (22.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must have at least minimum days duration'),
+    (23.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must be longer than blackout days duration'),
+    (24.0, 'excl',  'Episode', 'Exclusion - Cohort episodes must meet HOI blackout criterion'),
+    (25.0, 'blank', '', ''), (26.0, 'blank', '', ''),
+    (27.0, 'final', 'Member',  'Information - Unique number of members in final cohort')
+),
+grid AS (
+    SELECT c.cohortgrp, k.*, n.n
+    FROM cfg_cohort c CROSS JOIN skel k
+    LEFT JOIN _att_counts n ON n.cohortgrp = c.cohortgrp AND n.level = k.level
+),
+carried AS (
+    SELECT *,
+           -- a blank row carries the last count before it
+           coalesce(n, last_value(n IGNORE NULLS) OVER w) AS remaining,
+           lag(n) OVER (PARTITION BY cohortgrp, (kind IN ('init', 'excl'))
+                        ORDER BY level)                        AS prev_n
+    FROM grid
+    WINDOW w AS (PARTITION BY cohortgrp ORDER BY level
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+),
+main AS (
+    SELECT cohortgrp, level, claim_level, descr, remaining,
+           CASE kind WHEN 'excl'  THEN prev_n - n
+                     WHEN 'blank' THEN 0 END                   AS excluded
+    FROM carried
+),
+-- 18.n: episodes excluded for each condition, by the first one failed
+cond_rows AS (
+    SELECT DISTINCT cohortgrp, criteria, cond, cond_name FROM cfg_inclusion
+),
+info18 AS (
+    SELECT r.cohortgrp,
+           18.0 + row_number() OVER (PARTITION BY r.cohortgrp
+                                     ORDER BY r.criteria, r.cond) / 10.0 AS level,
+           'Episode' AS claim_level,
+           'Information: Episodes excluded for ' || r.cond_name AS descr,
+           NULL::BIGINT AS remaining,
+           (SELECT count(*) FROM {incl_rel} x
+            JOIN _att_ep e ON e.cohortgrp = x.cohortgrp AND e.patid = x.patid
+                          AND e.indexdt = x.indexdt AND e.min_enr_days_met
+            WHERE x.cohortgrp = r.cohortgrp AND x.failed_criteria = r.criteria
+              AND x.first_failed_cond = r.cond)                   AS excluded
+    FROM cond_rows r
+)
+SELECT cohortgrp AS "group", level, claim_level, descr,
+       remaining::BIGINT AS remaining, excluded::BIGINT AS excluded
+FROM (SELECT * FROM main UNION ALL SELECT * FROM info18)
+ORDER BY 1, 2;
+
 
 -- Stratified denominators and event rates.
 -- GROUPING SETS gives the full table plus every requested margin in one
@@ -132,6 +253,8 @@ WITH censored AS (
         year(c.indexdt)::VARCHAR AS index_year,
         c.deathdt,
         c.enr_end,
+        -- the flags are defined ONCE, in 60_followup.sql
+        ef.cens_elig, ef.cens_dth, ef.cens_qryend, ef.cens_dpend,
         least(c.enr_end,
               coalesce(c.deathdt, DATE '9999-12-31'),
               DATE '{end_date}',
@@ -143,23 +266,11 @@ WITH censored AS (
                         DATE '{end_date}',
                         DATE '{censor_date}')) + 1    AS timetocensor
     FROM cohort_final c
+    JOIN episode_flags ef
+      ON ef.cohortgrp = c.cohortgrp AND ef.patid = c.patid AND ef.indexdt = c.indexdt
 ),
 flagged AS (
-    SELECT
-        *,
-        -- Censored by disenrollment, unless that coincides with death,
-        -- which is the enrend_death='C' reset (lines 147-151).
-        CASE WHEN censor_dt = enr_end
-              AND NOT (deathdt IS NOT NULL AND censor_dt = deathdt)
-             THEN 1 ELSE 0 END                        AS cens_elig,
-        CASE WHEN deathdt IS NOT NULL AND censor_dt = deathdt
-             THEN 1 ELSE 0 END                        AS cens_dth,
-        CASE WHEN censor_dt = DATE '{end_date}'
-             THEN 1 ELSE 0 END                        AS cens_qryend,
-        CASE WHEN censor_dt = DATE '{censor_date}'
-              AND DATE '{censor_date}' <> DATE '{end_date}'
-             THEN 1 ELSE 0 END                        AS cens_dpend
-    FROM censored
+    SELECT * FROM censored
 )
 SELECT
     f.cohortgrp              AS "group",

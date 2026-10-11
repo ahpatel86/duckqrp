@@ -95,10 +95,22 @@ qrp --help
 ### No internet access
 
 Installing from the folder still downloads DuckDB (and a build tool)
-from the internet. Without access, use one of the offline routes in
-**[DEPLOYMENT.md](DEPLOYMENT.md)**: a pre-built offline bundle, a single
-executable, or a Docker image — prepared by someone with internet on
-the same operating system and Python version as your site.
+from the internet. Without access, use the **offline bundle**: a file
+named like `qrp-offline-linux-py3.12.tar.gz`, prepared for you by someone
+with internet on the same operating system and Python version as your
+site. Unpack it and run its installer:
+
+```bash
+tar -xzf qrp-offline-linux-py3.12.tar.gz
+bash qrp-offline/INSTALL.sh            # installs into ~/qrp-env
+~/qrp-env/bin/qrp doctor               # checks the install
+```
+
+It installs only from the files in the bundle and never touches the
+network: it either succeeds completely or fails with an error.
+
+To *build* a bundle, or for the single-executable and Docker routes,
+see DEPLOYMENT.md in the full package.
 
 There is no separate database to set up, no server to start, no Java —
 one package and its engine.
@@ -305,34 +317,51 @@ qrp show --out results/
 ```
 Result tables in results/:
 
-  attrition                           12 rows
-  censoring                           10 rows
-  cohort_final                    68,845 rows
-  denominators                       138 rows
-  ptsmasterlist                   75,960 rows
+  attrition                           54 rows
+  baseline                             2 rows
+  censoring                        2,969 rows
+  cohort_final                    61,815 rows
+  distindex                          162 rows
+  distindexmap                       802 rows
+  runtimes                            14 rows
+  signature                            1 rows
 ```
 
 **Read `attrition` first — this is the sanity check:**
 
 ```bash
-qrp show --out results/ attrition
+qrp show --out results/ attrition --where "\"group\" = 'lisinopril'"
 ```
 
 ```
-cohortgrp     step_no  step                            records  patients  records_dropped
-lisinopril          1  Exposure dispensings            145,008    76,639
-lisinopril          2  After stockpiling               138,091    76,639            6,917
-lisinopril          3  Met washout (potential index)   119,779    76,639           18,312
-lisinopril          4  With enrollment and demographi   53,213    41,652           66,566
-lisinopril          5  Met episode and enrollment cri   38,003    31,999           15,210
-lisinopril          6  Met follow-up washout (final c   34,449    29,495            3,554
+group       level  claim_level  descr                           remaining  excluded
+lisinopril   1.00  Member       Initial Member Count - Members    100,000
+lisinopril   2.00  Member       Exclusion - Members must have      99,510       490
+lisinopril   6.00  Member       Exclusion - Members must have      48,935    50,575
+lisinopril   7.00  Episode      Initial Episode Count (among e     67,936
+lisinopril   8.00                                                  67,936         0
+lisinopril  10.00  Episode      Exclusion - Cohort episode mus     53,816    14,120
+lisinopril  12.00  Episode      Exclusion - Episode-defining i     40,630    13,186
+lisinopril  16.00  Episode      Exclusion - Cohort episodes mu     31,936     8,694
+lisinopril  19.00  Episode      Exclusion - Cohort episodes mu     28,955     2,981
+lisinopril  24.00  Episode      Exclusion - Cohort episodes mu     28,955         0
+lisinopril  27.00  Member       Information - Unique number of     25,486
 ```
 
-Each row is a filter. Read down the `records` column and ask whether
-each drop is plausible. **If 99% of patients disappear at one step,
-something is wrong** — with the data or with the study definition — and
-this table tells you exactly which step to investigate. It is far
-cheaper to catch that here than after the numbers have been reported.
+(Excerpt: every cohort has the same 27 levels.) This is SAS's attrition
+table, level for level. Levels **1-6 count members**, **7-24 count
+episodes**, and **27** is the members in the final cohort. Each
+`Exclusion` row is one criterion: `excluded` is how many it removed.
+Blank rows are steps this study does not use — they keep their level
+number so tables from different studies line up. `18.1`, `18.2`, ...
+rows, when present, name each inclusion/exclusion condition and how many
+episodes it removed.
+
+Read down `remaining` and ask whether each drop is plausible. **If 99%
+disappear at one step, something is wrong** — with the data or with the
+study definition — and this table tells you exactly which step to
+investigate. Level 24's `remaining` is always the number of episodes in
+the final cohort.
 
 **Look at the rates:**
 

@@ -570,6 +570,9 @@ class InclusionRule:
     criteria: str = "INC"        # INC | EXC | IEV | EEV
     subcond: int = 1
     condlevel: int = 1
+    # the condition's label as the study gives it (SAS's CONDLEVEL text),
+    # reported in attrition's 'Episodes excluded for <label>' rows
+    cond_name: str = ""
     codecat: str = "DX"
     condfrom: int = -365
     condto: int = -1
@@ -794,10 +797,10 @@ class StudyConfig:
                     stacklevel=2,
                 )
         for sub_key, acc in by_sub.items():
-            for field, values in acc.items():
+            for fld, values in acc.items():
                 if len(values) > 1:
                     _warnings.warn(
-                        f"different {field} values within one subcondlevel "
+                        f"different {fld} values within one subcondlevel "
                         f"{sub_key}: {sorted(values)} — SAS expects "
                         f"exactly one",
                         stacklevel=2,
@@ -1301,6 +1304,7 @@ def _parse_inclusions(
             cohortgrp=grp,
             cond=cond,
             subcond=subcond,
+            cond_name=clvl,
             condlevel=_int(r.get("condlevel"), 1) if str(
                 r.get("condlevel") or "").isdigit() else cond,
             criteria=crit,

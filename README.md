@@ -33,6 +33,8 @@ pip install -e ".[dev]"            # to DEVELOP it: editable, plus pytest, mypy,
 qrp doctor                         # checks the install on generated data
 qrp validate --study study/demo_type2.json
 qrp run --study study/demo_type2.json --indata /path/to/cdm_parquet --out results/
+# Keep --out at results/ (git-ignored) or OUTSIDE this folder: a run
+# writes hundreds of thousands of lines, which a `git add -A` would commit.
 
 # Outputs split into dplocal/ (patient-level, stays local) and msoc/
 # (aggregate, shareable), named <runid>_<table>. --layout flat for one

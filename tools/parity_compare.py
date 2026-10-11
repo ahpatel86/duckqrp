@@ -1,6 +1,10 @@
 """Compare a SAS parity dump against a DuckDB one.
 
-    python tools/parity_compare.py SAS_DIR DUCK_DIR [--tolerance 1e-9]
+    python tools/parity_compare.py SAS_DIR DUCK_DIR [--tolerance 1e-6]
+
+The default relative tolerance, 1e-6, absorbs SAS's lower-precision
+storage of some reals (34.5333251953125 vs 34.5333333...) while still
+flagging real differences, such as means rounded to 4 decimals.
 
 `qrp run --parity-dump` writes the DuckDB side. This reads both trees,
 matches tables by their path, and reports where they differ.
@@ -44,22 +48,64 @@ from pathlib import Path
 # Key columns per table, used to align rows before comparing values.
 # Without these a diff can only say "these files differ", which is not
 # actionable on a 60,000-row master list.
+# Keys use SAS's column names; DuckDB's are mapped onto them (ALIASES).
 KEYS: dict[str, tuple[str, ...]] = {
-    "stockpiled": ("cohortgrp", "patid", "adate"),
-    "index_candidates": ("cohortgrp", "patid", "adate"),
-    "pov1": ("cohortgrp", "patid", "indexdt"),
-    "ptsmasterlist": ("cohortgrp", "patid", "indexdt"),
-    "cohort_final": ("cohortgrp", "patid", "indexdt"),
+    "stockpiled": ("group", "patid", "adate"),
+    "index_candidates": ("group", "patid", "adate"),
+    "pov1": ("group", "patid", "indexdt"),
+    "ptsmasterlist": ("group", "patid", "indexdt"),
+    "cohort_final": ("group", "patid", "indexdt"),
     "attrition": ("group", "level"),
-    "denominators": ("cohortgrp", "agegroup", "sex", "index_year"),
+    "denominators": ("group", "agegroup", "sex", "index_year"),
     "censoring": ("group", "level", "censdays_value_cat"),
     "followuptime": ("group", "level", "fupdays_value_cat"),
     "t2_cida": ("group", "level", "agegroup", "sex"),
     "numcounts": ("group", "level", "agegroup", "sex"),
     "denomcounts": ("group", "level", "agegroup", "sex"),
     "distindex": ("group", "distindextype", "distindexlist"),
-    "distindexmap": ("group", "distindextype", "code"),
+    # by id: stockgroup rows carry no code, so (type, code) collided
+    "distindexmap": ("group", "distindextype", "distindexid"),
+    "baseline": ("group",),
+    # by code, not rank: SAS orders tied codes in no reproducible way
+    "mfu": ("group", "analysisnum", "code"),
 }
+
+# DuckDB column names that mean the same as SAS's. Without this the
+# master list was keyed on `cohortgrp`, which SAS calls `Group`: every
+# SAS row got a blank key and no row was actually compared.
+ALIASES: dict[str, str] = {"cohortgrp": "group"}
+
+_MON = {m: i for i, m in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1)}
+
+
+def norm(v: str | None) -> str:
+    """One canonical form for a cell, so keys and values compare.
+
+    SAS's CSV export writes dates in their display format (01JAN2020,
+    01/01/2020) and numbers as floats (1.0); DuckDB writes ISO dates and
+    integers. Codes with a leading zero are left alone.
+    """
+    s = (v or "").strip()
+    if s in (".", "NA", "NULL", "NaN", "nan"):
+        return ""
+    u = s.upper()
+    if len(u) == 9 and u[:2].isdigit() and u[2:5] in _MON and u[5:].isdigit():
+        return f"{u[5:]}-{_MON[u[2:5]]:02d}-{u[:2]}"                    # DATE9.
+    if len(s) == 10 and s[2] == "/" and s[5] == "/" and s.replace("/", "").isdigit():
+        return f"{s[6:]}-{s[:2]}-{s[3:5]}"                              # MMDDYY10.
+    if len(s) >= 19 and s[4] == "-" and s[10] in " T" and s[11:19] == "00:00:00":
+        return s[:10]                                                   # midnight timestamp
+    if s[:1] == "0" and len(s) > 1 and s[1:2].isdigit():
+        return s                                                        # a code, e.g. 0636
+    try:
+        f = float(s)
+    except ValueError:
+        return s
+    if math.isfinite(f) and f == int(f) and abs(f) < 1e15:
+        return str(int(f))
+    return s
 
 # Columns with no SAS counterpart, or whose difference is not a defect.
 IGNORE: dict[str, frozenset[str]] = {
@@ -69,9 +115,13 @@ IGNORE: dict[str, frozenset[str]] = {
 
 
 def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """Rows with lower-cased, aliased column names and normalised cells."""
     with path.open(newline="") as fh:
         reader = csv.DictReader(fh)
-        return list(reader.fieldnames or []), list(reader)
+        names = {c: ALIASES.get(c.lower(), c.lower()) for c in reader.fieldnames or []}
+        rows = [{names[k]: norm(v) for k, v in r.items() if k in names}
+                for r in reader]
+        return list(names.values()), rows
 
 
 def find_tables(root: Path) -> dict[str, Path]:
@@ -129,7 +179,9 @@ def compare_table(name: str, sas: Path, duck: Path,
     if missing:
         issues.append(f"MISSING COLUMN  {name}: {missing}")
     if extra:
-        issues.append(f"EXTRA COLUMN    {name}: {extra}")
+        # A note: SAS's table is the contract, and DuckDB's master list
+        # legitimately carries internal columns beyond SAS's.
+        notes.append(f"EXTRA COLUMN    {name}: {extra}")
 
     if len(sas_rows) != len(duck_rows):
         issues.append(
@@ -196,7 +248,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sas_dir")
     ap.add_argument("duck_dir")
-    ap.add_argument("--tolerance", type=float, default=1e-9,
+    ap.add_argument("--tolerance", type=float, default=1e-6,
                     help="relative tolerance for numeric comparison")
     ap.add_argument("--max-examples", type=int, default=20,
                     help="cap on reported examples per table")
@@ -212,12 +264,13 @@ def main() -> int:
     duck_tables = find_tables(duck_root)
 
     issues: list[str] = []
+    notes: list[str] = []
     for name in sorted(set(sas_tables) - set(duck_tables)):
         issues.append(f"MISSING TABLE   {name}: in SAS, absent from DuckDB")
     for name in sorted(set(duck_tables) - set(sas_tables)):
-        issues.append(f"EXTRA TABLE     {name}: in DuckDB, absent from SAS")
+        # a note: the SAS export skips tables it did not produce
+        notes.append(f"EXTRA TABLE     {name}: in DuckDB, absent from SAS")
 
-    notes: list[str] = []
     shared = sorted(set(sas_tables) & set(duck_tables))
     for name in shared:
         found, said = compare_table(name, sas_tables[name],

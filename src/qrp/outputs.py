@@ -16,7 +16,7 @@ import platform
 import shutil as _shutil
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 from .config import StudyConfig
@@ -213,9 +213,6 @@ def _run_metadata(eng: Engine, study: StudyConfig, seconds: float) -> None:
     provenance that travels with the results. The data already exists in
     the event log; this just materialises it in the expected shape.
     """
-    import platform
-    import sys
-    from datetime import date, datetime
 
     import duckdb as _ddb
 
@@ -335,7 +332,6 @@ def _write_split_layout(eng: Engine, study: StudyConfig, out: Path,
 
     # A manifest, so `qrp show` and any downstream tool can find tables by
     # their logical name without having to parse the SAS convention.
-    import json as _json
 
     manifest = {
         "runid": study.run_id,

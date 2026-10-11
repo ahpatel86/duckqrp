@@ -16,17 +16,15 @@ That single change removes, at a stroke:
 
 from __future__ import annotations
 
-import re as _re
 from datetime import date, timedelta
 import time
 from dataclasses import dataclass
 import hashlib
-import shutil as _shutil
 import warnings
 from pathlib import Path
 
 from .config import StudyConfig
-from .engine import Engine, sql_str
+from .engine import Engine, first_value
 # Output naming, disclosure routing and writing live in outputs.py.
 # Re-exported here because callers and tests import them from the
 # pipeline, and moving a name is not the point of the split.
@@ -88,9 +86,9 @@ def _check_exposure(eng: Engine, study: StudyConfig, indata) -> None:
 
     # Distinguish "these codes are absent" from "there are no claims at
     # all", because the fix is different.
-    total_claims = eng.con.execute(
+    total_claims = first_value(eng.con.execute(
         "SELECT count(*) FROM cdm_dispensing"
-    ).fetchone()[0]
+    ).fetchone())
     sample = eng.con.execute(
         "SELECT code FROM cfg_codes WHERE role = 'DEF' LIMIT 3"
     ).fetchall()
@@ -119,7 +117,6 @@ def _check_exposure(eng: Engine, study: StudyConfig, indata) -> None:
     eng.emit(LogMessage(level=Level.WARNING, message=reason, detail=hint))
 
 
-_SAFE_LEVEL = _re.compile(r"[^A-Za-z0-9]")
 
 
 def _covar_strata(study: StudyConfig) -> tuple[int, ...]:
@@ -256,173 +253,6 @@ def _mstr_extra_columns(eng: Engine, study: StudyConfig) -> tuple[str, str]:
             "AND rs.patid = f.patid AND rs.indexdt = f.indexdt")
         cols.extend(f',\n    rs."{n}" AS "{n}"' for n in scores)
     return "".join(cols), "".join(joins)
-
-
-def _baseline_dummies(eng: Engine, study: StudyConfig) -> str:
-    """Widen `baseline` with one column per OBSERVED category level.
-
-    SAS emits Sex_F, Sex_M, Race_1.., Hispanic_Y, Age<bucket> and
-    covar1..covarN as 0/1 dummies summed per group
-    (ms_createdistbaselinetable.sas:455-470), then SQUARES the result so
-    a level absent from one group is 0 rather than missing.
-
-    The levels are read from the data rather than hardcoded: a race code
-    or age band the study did not anticipate would otherwise vanish
-    silently. Level values are sanitised to `[A-Za-z0-9]` before
-    becoming identifiers — they come from claims data, so they are
-    never interpolated raw.
-    """
-    dummies: list[str] = []
-    # SAS sums these dummy groups: patient, Age:, Sex_:, year_:,
-    # race_:, hispanic_:, covar1..N, and cb_reg_:/sdi_: when geography
-    # is on (ms_createdistbaselinetable.sas:457-460). `year_` was
-    # missing here — an index-year distribution the study asked for and
-    # did not get.
-    for column, prefix in (("sex", "Sex"), ("race", "Race"),
-                           ("hispanic", "Hispanic"), ("agegroup", "Age"),
-                           ):
-        rows = eng.con.execute(
-            f"SELECT DISTINCT {column} FROM cohort_final "
-            f"WHERE {column} IS NOT NULL ORDER BY 1"
-        ).fetchall()
-        seen: set[str] = set()
-        for (value,) in rows:
-            safe = _SAFE_LEVEL.sub("_", str(value))
-            if not safe:
-                continue
-            # Two levels can sanitise to the same identifier — 'A-B' and
-            # 'A_B' both become 'A_B' — which would emit a duplicate
-            # column. Disambiguate rather than silently drop one.
-            base, n = safe, 2
-            while f"{prefix}_{safe}" in seen:
-                safe = f"{base}_{n}"
-                n += 1
-            seen.add(f"{prefix}_{safe}")
-            # COUNT over a filtered CASE, so an absent level sums to 0
-            # rather than NULL — that is the squaring.
-            # The IDENTIFIER is sanitised; the LITERAL must be escaped.
-            # A level value of O'BRIEN would otherwise emit
-            # `c.race = 'O'BRIEN'` — invalid SQL. These values come from
-            # claims data, so the assumption that they contain no quotes
-            # is not one to rely on. Reported in review.
-            dummies.append(
-                f"sum(CASE WHEN c.{column} = {sql_str(value)} "
-                f"THEN 1 ELSE 0 END) AS \"{prefix}_{safe}\""
-            )
-
-    # Index-year dummies. Derived, not a stored column, so built
-    # separately from the categorical ones above.
-    years = eng.con.execute(
-        "SELECT DISTINCT year(indexdt) FROM cohort_final "
-        "WHERE indexdt IS NOT NULL ORDER BY 1").fetchall()
-    for (yr,) in years:
-        dummies.append(
-            f"sum(CASE WHEN year(c.indexdt) = {int(yr)} "
-            f"THEN 1 ELSE 0 END) AS \"year_{int(yr)}\"")
-
-    # Geography dummies, only when the geography stage ran — SAS gates
-    # these on `&geog = Y` for the same reason.
-    for column, prefix in (("cb_reg", "cb_reg"), ("sdi_cat", "sdi")):
-        try:
-            rows = eng.con.execute(
-                f"SELECT DISTINCT {column} FROM cohort_final "
-                f"WHERE {column} IS NOT NULL ORDER BY 1").fetchall()
-        except Exception:
-            continue                      # column absent: stage not run
-        for (value,) in rows:
-            safe = _SAFE_LEVEL.sub("_", str(value))
-            if not safe:
-                continue
-            dummies.append(
-                f"sum(CASE WHEN c.{column} = {sql_str(value)} "
-                f"THEN 1 ELSE 0 END) AS \"{prefix}_{safe}\"")
-
-    # Covariates and per-episode measures are JOINED, not looked up per
-    # row. The first version emitted a correlated EXISTS per covariate
-    # and a scalar subquery per mean/std column inside the aggregation —
-    # the master-list flaw again, in a step that runs outside any timed
-    # stage. See test_baseline_uses_one_lookup_per_source.
-    joins: list[str] = []
-    covnums = sorted({int(cov.covarnum) for cov in study.covariates})
-    if covnums:
-        flags = ",\n        ".join(
-            f'max((v.covarnum = {k})::SMALLINT) AS "COVAR{k}"' for k in covnums)
-        joins.append(
-            "LEFT JOIN (\n    SELECT v.cohortgrp, v.patid, v.indexdt,\n"
-            f"        {flags}\n    FROM covariates_long v\n"
-            "    GROUP BY v.cohortgrp, v.patid, v.indexdt\n"
-            ") cv ON cv.cohortgrp = c.cohortgrp AND cv.patid = c.patid "
-            "AND cv.indexdt = c.indexdt")
-    for cov in study.covariates:
-        dummies.append(
-            f'sum(coalesce(cv."COVAR{int(cov.covarnum)}", 0)) '
-            f'AS "covar{int(cov.covarnum)}"')
-
-    # Continuous variables get mean_ and std_, not a sum
-    # (ms_createdistbaselinetable.sas:474-500). SAS lists Age, the risk
-    # scores, and the utilization counts NumAV/NumOA/NumIP/NumIS/NumED
-    # and NumGeneric/NumClass/NumRx. Age is in 96_baseline.sql; the
-    # others are added here when their optional stage produced them,
-    # exactly as SAS gates them.
-    # (source column, SAS name). The two differ: the utilization stage
-    # names its encounter counts enc_av/enc_oa/..., SAS calls them
-    # NumAV/NumOA/.... An earlier version listed only the SAS names and
-    # the `continue` below silently skipped five of the eight — the
-    # exact failure this mapping exists to prevent.
-    for table, cols in (
-        ("utilization", (("enc_av", "NumAV"), ("enc_oa", "NumOA"),
-                         ("enc_ip", "NumIP"), ("enc_is", "NumIS"),
-                         ("enc_ed", "NumED"), ("numgeneric", "NumGeneric"),
-                         ("numclass", "NumClass"), ("numrx", "NumRx"))),
-        ("risk_scores", (("score", "RiskScore"),)),
-    ):
-        try:
-            have = {d[0].lower() for d in eng.con.execute(
-                f"SELECT * FROM {table} LIMIT 0").description}
-        except Exception:
-            continue                      # optional stage did not run
-        missing = [src for src, _ in cols if src not in have]
-        if missing:
-            # Loud, not silent: a column the stage was expected to
-            # produce and did not is a defect, not a configuration.
-            warnings.warn(
-                f"baseline: {table} is missing {missing}; those "
-                f"mean_/std_ columns will be absent from the baseline "
-                f"table", stacklevel=2)
-        present = [(src, sas) for src, sas in cols if src in have]
-        if not present:
-            continue
-        # One row per episode is what the old scalar subquery assumed (it
-        # raised on a second row); a join would silently double-count
-        # instead, so check explicitly.
-        dup = eng.con.execute(
-            f"SELECT count(*) FROM (SELECT 1 FROM {table} "
-            f"GROUP BY cohortgrp, patid, indexdt HAVING count(*) > 1)"
-        ).fetchone()
-        if dup and dup[0]:
-            raise ValueError(
-                f"baseline: {table} has more than one row for {dup[0]} "
-                f"episode(s); the per-episode mean/std columns need one")
-        alias = "tu" if table == "utilization" else "tr"
-        joins.append(
-            f"LEFT JOIN {table} {alias} ON {alias}.cohortgrp = c.cohortgrp "
-            f"AND {alias}.patid = c.patid AND {alias}.indexdt = c.indexdt")
-        for src, sas in present:
-            dummies.append(f"round(avg({alias}.{src}), 4) AS \"mean_{sas}\"")
-            dummies.append(
-                f"round(stddev_samp({alias}.{src}), 4) AS \"std_{sas}\"")
-
-    if not dummies:
-        return ""
-    return (
-        "CREATE OR REPLACE TABLE baseline AS\n"
-        "SELECT b.*, " + ",\n       ".join(dummies) + "\n"
-        "FROM baseline b\n"
-        "JOIN cohort_final c ON c.cohortgrp = b.\"group\"\n"
-        + "".join(j + "\n" for j in joins) +
-        "GROUP BY ALL\n"
-        "ORDER BY 1;"
-    )
 
 
 def _combo_sql(study: StudyConfig) -> str:
@@ -952,6 +782,11 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "has_hispanic": "hispanic" in lv.levelvars,
                 "has_year": "index_year" in lv.levelvars
                             or "year" in lv.levelvars,
+                # the follow-up-time table's own level variables: exact days,
+                # or SAS's category (which brings censorcat_sort with it,
+                # ms_createcensortable.sas:63-66)
+                "has_censdays_value": "censdays_value" in lv.levelvars,
+                "has_censdays_cat": "censdays_value_cat" in lv.levelvars,
                 # USERSTRATA levelvars beginning with "covar" stratify
                 # the table by a COVARIATE — SAS's `&covarstrat.`
                 # (ms_cidatables.sas:403-412). Stored as a space-joined
@@ -972,6 +807,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         ],
         """level_id VARCHAR, has_agegroup BOOLEAN, has_sex BOOLEAN,
            has_race BOOLEAN, has_hispanic BOOLEAN, has_year BOOLEAN,
+           has_censdays_value BOOLEAN, has_censdays_cat BOOLEAN,
            covarstrat VARCHAR, tableid VARCHAR""",
     )
 
@@ -1000,6 +836,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "subcond": r.subcond,
                 "subcond_inclusion": r.subcond_inclusion,
                 "condlevel": r.condlevel, "criteria": r.criteria,
+                "cond_name": r.cond_name,
                 "codecat": r.codecat, "condfrom": r.condfrom,
                 "condto": r.condto, "codedays": r.codedays,
                 "condfromanchor": r.condfromanchor,
@@ -1018,7 +855,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
            criteria VARCHAR, codecat VARCHAR, condfrom INTEGER,
            condto INTEGER, codedays INTEGER, minrxdays INTEGER,
            condfromanchor VARCHAR, condtoanchor VARCHAR,
-           mincumdose DOUBLE, minafdd DOUBLE, maxafdd DOUBLE""",
+           mincumdose DOUBLE, minafdd DOUBLE, maxafdd DOUBLE,
+           cond_name VARCHAR""",
     )
 
     eng.register(
@@ -1308,7 +1146,9 @@ def run(
         # the discharge date bounds an inpatient stay for enveloping; an
         # extract without it (or without an encounter table) gets NULL,
         # i.e. one-day stays, rather than a BinderException
-        ("read_encounter", ("ddate",)),
+        # discharge_status marks deaths in hospital (EX = expired); an
+        # extract without it simply has no encounter-derived deaths
+        ("read_encounter", ("ddate", "discharge_status")),
     ):
         optional_cols.update(_optional(key, *cols))
     chart_col = optional_cols["chart"]
@@ -1324,6 +1164,22 @@ def run(
         "indata": str(Path(indata)).rstrip("/"),
         "start_date": study.start_date.isoformat(),
         "run_envelope": int(study.run_envelope),
+        # the dose-censoring dates, when that stage runs (its own gate);
+        # otherwise an empty typed relation, so static SQL can name it
+        # each episode's index-code lists, when the code-distribution stage
+        # runs (its own gate); otherwise an empty typed relation
+        "di_rel": "distindex_episodes" if study.any_code_distribution else
+                  "(SELECT NULL::VARCHAR AS cohortgrp, NULL::BIGINT AS patid, "
+                  "NULL::DATE AS indexdt, NULL::VARCHAR AS distindexexp, "
+                  "NULL::VARCHAR AS distindexhoi WHERE FALSE)",
+        # inclusion failures, when that stage runs (its own gate)
+        "incl_rel": "inclusion_excluded" if study.any_inclusions else
+                    "(SELECT NULL::VARCHAR AS cohortgrp, NULL::BIGINT AS patid, "
+                    "NULL::DATE AS indexdt, NULL::INTEGER AS first_failed_cond, "
+                    "NULL::VARCHAR AS failed_criteria WHERE FALSE)",
+        "dose_rel": "dose_censor" if study.any_dose_censoring else
+                    "(SELECT NULL::VARCHAR AS cohortgrp, NULL::BIGINT AS patid, "
+                    "NULL::DATE AS indexdt, NULL::DATE AS censordate_maxdose WHERE FALSE)",
         "end_date": study.end_date.isoformat(),
         "censor_date": study.effective_censor_date.isoformat(),
         # Claims outside the widest possible lookback can never matter.
@@ -1512,10 +1368,33 @@ def run(
                 eng.con.execute(_stmt.sql)
 
         # The SAS baseline distribution table: wide, one row per group.
-        eng.script_stage("baseline", "96_baseline.sql", **fmt)
-        widen = _baseline_dummies(eng, study)
-        if widen:
-            eng.con.execute(widen)
+        # Long-form analytics then SAS's wide layout, all in static SQL.
+        # The optional utilization / risk-score stages become empty typed
+        # relations when they did not run.
+        _have = {r[0] for r in eng.con.execute(
+            "SELECT table_name FROM duckdb_tables()").fetchall()}
+        eng.script_stage(
+            "baseline", "96_baseline.sql",
+            util_rel="utilization" if "utilization" in _have else
+            "(SELECT NULL::VARCHAR AS cohortgrp, NULL::BIGINT AS patid, "
+            "NULL::DATE AS indexdt, NULL::DOUBLE AS enc_av, NULL::DOUBLE AS enc_oa, "
+            "NULL::DOUBLE AS enc_ip, NULL::DOUBLE AS enc_is, NULL::DOUBLE AS enc_ed, "
+            "NULL::DOUBLE AS numgeneric, NULL::DOUBLE AS numclass, "
+            "NULL::DOUBLE AS numrx WHERE FALSE)",
+            risk_rel="risk_scores" if "risk_scores" in _have else
+            "(SELECT NULL::VARCHAR AS cohortgrp, NULL::BIGINT AS patid, "
+            "NULL::DATE AS indexdt, NULL::VARCHAR AS riskscore, "
+            "NULL::DOUBLE AS score WHERE FALSE)",
+            **fmt)
+        # A demographic value outside SAS's declared levels is reported as
+        # its own column; say so, since SAS itself would not count it.
+        for (_stat,) in eng.con.execute(
+                "SELECT DISTINCT stat FROM baseline_long "
+                "WHERE kind = 'undeclared' ORDER BY 1").fetchall():
+            warnings.warn(
+                f"baseline: {_stat} is not one of SAS's declared levels; it is "
+                f"reported as its own column, but SAS would not count it",
+                stacklevel=2)
 
     # Widen the master list once everything it references exists.
     _mx = _mstr_extra_columns(eng, study)

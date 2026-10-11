@@ -585,7 +585,7 @@ def test_show_lists_and_prints_tables(study, tmp_path):
     assert "attrition" in listing and "rows" in listing
 
     body = show(tmp_path, "attrition")
-    assert "Exposure dispensings" in body
+    assert "Initial Member Count" in body
     assert "remaining" in body
 
     # a partitioned table resolves too, and truncates
@@ -593,7 +593,7 @@ def test_show_lists_and_prints_tables(study, tmp_path):
     assert "showing first 5" in big
 
     filtered = show(tmp_path, "attrition", where="level = 1")
-    assert "Exposure dispensings" in filtered
+    assert "Initial Member Count" in filtered
 
     csvs = to_csv(tmp_path, tmp_path / "csv")
     assert any(p.name == "attrition.csv" for p in csvs)
@@ -601,7 +601,7 @@ def test_show_lists_and_prints_tables(study, tmp_path):
     # claim_level, remaining, excluded) — it is an msoc output and those
     # names are a contract.
     assert (tmp_path / "csv" / "attrition.csv").read_text().startswith(
-        "group,level,descr,claim_level,remaining,excluded"
+        "group,level,claim_level,descr,remaining,excluded"
     )
 
 
@@ -1393,7 +1393,8 @@ def test_naming_modes_write_the_same_data(study, tmp_path):
             eng.close()
         # lookup by LOGICAL name works regardless of on-disk naming
         assert "ptsmasterlist" in available(out)
-        assert "Exposure dispensings" in show(out, "attrition")
+        # SAS's level-1 wording (attrition follows ms_attrition.sas)
+        assert "Initial Member Count" in show(out, "attrition")
         con = duckdb.connect()
         counts[names] = con.execute(
             f"SELECT count(*) FROM read_parquet("
@@ -1484,7 +1485,7 @@ def test_manifest_decouples_readers_from_the_naming(study, tmp_path):
     names = available(tmp_path)
     assert {"attrition", "ptsmasterlist", "signature"} <= set(names)
     body = show(tmp_path, "attrition")
-    assert "Exposure dispensings" in body
+    assert "Initial Member Count" in body
 
 
 def test_flat_layout_still_available(study, tmp_path):
@@ -1500,7 +1501,7 @@ def test_flat_layout_still_available(study, tmp_path):
 
     assert (tmp_path / "attrition.parquet").is_file()
     assert not (tmp_path / "msoc").exists()
-    assert "Exposure dispensings" in show(tmp_path, "attrition")
+    assert "Initial Member Count" in show(tmp_path, "attrition")
 
 
 # ---------------------------------------------------------------------
@@ -2425,11 +2426,14 @@ def test_geography_skipped_without_zipfile(study, baseline):
 
 
 def test_code_distribution_reconciles_with_the_master_list(baseline):
-    """Every episode is defined by exactly one code combination, so the
-    episode counts must sum to the master list."""
+    """Every FINAL episode has exactly one index-code combination, so the
+    exp counts sum to cohort_final. (They once summed to ptsmasterlist,
+    the episodes before inclusion criteria; SAS counts final episodes —
+    with that, wp307's distindex matches SAS exactly.) Placeholder rows
+    carry no count."""
     total = baseline.con.execute(
-        "SELECT sum(episodes) FROM distindex").fetchone()[0]
-    assert total == baseline.count("ptsmasterlist")
+        "SELECT sum(episodes) FROM distindex WHERE distindextype = 'exp'").fetchone()[0]
+    assert total == baseline.count("cohort_final")
 
 
 def test_code_lists_are_canonically_ordered(baseline):
@@ -2440,33 +2444,32 @@ def test_code_lists_are_canonically_ordered(baseline):
     bucket. Without the ORDER BY inside the aggregate they would
     scatter.
     """
+    # SAS sorts the id as CHARACTER ('12' before '2'); the master list's
+    # lists, in that order, match SAS on every wp307 episode
     unsorted = baseline.con.execute("""
         SELECT count(*) FROM (
-            SELECT list_transform(str_split(distindexlist, '_'),
-                                  x -> CAST(x AS INT)) AS ids
-            FROM distindex)
+            SELECT str_split(distindexlist, '_') AS ids
+            FROM distindex WHERE distindexlist <> '')
         WHERE ids <> list_sort(ids)
     """).fetchone()[0]
-    assert unsorted == 0, "code lists are not in ascending ID order"
-    # and multi-code combinations must actually occur, or the test
-    # above is vacuous
-    multi = baseline.con.execute(
-        "SELECT count(*) FROM distindex "
-        "WHERE distindexlist LIKE '%!_%' ESCAPE '!'"
-    ).fetchone()[0]
-    assert multi > 0, "no multi-code combinations; ordering untested"
+    assert unsorted == 0, "code lists are not in SAS's character order"
+    # With SAS's numbering (one entity per drug stockgroup) the demo has no
+    # multi-entity lists, so this check cannot fail here; the ordering
+    # itself is tested on hand-built claims by
+    # test_distindex_numbering_follows_ms_codedistribution ('2_20').
 
 
 def test_distindexmap_covers_every_code_used(baseline):
     """A list is undecodable if any ID is missing from the map."""
     orphans = baseline.con.execute("""
         WITH used AS (
-            SELECT DISTINCT "group",
+            SELECT DISTINCT "group", distindextype,
                    unnest(str_split(distindexlist, '_'))::INT AS id
-            FROM distindex)
+            FROM distindex WHERE distindexlist <> '')   -- skip placeholders
         SELECT count(*) FROM used u
         LEFT JOIN distindexmap m
-               ON m."group" = u."group" AND m.distindexid = u.id
+               ON m."group" = u."group" AND m.distindextype = u.distindextype
+              AND m.distindexid = u.id
         WHERE m.distindexid IS NULL
     """).fetchone()[0]
     assert orphans == 0, "distindexlist references IDs not in the map"
@@ -3698,7 +3701,6 @@ def test_dose_needs_a_strength_lookup():
     mincumdose rule emptied the cohort — and the cause was that the test
     used codes absent from `codestrength`.
     """
-    from qrp.config import load_study_dict
 
     base = json.loads((STUDY.parent / "demo_full.json").read_text())
     coded = {c["code"] for c in base["codestrength"]}
@@ -3760,7 +3762,6 @@ def test_lab_codetype_dispatches_the_extraction_path():
 def test_lab_result_type_gates_the_criterion():
     """`substr(codetype,3,1)` is the result type the criterion applies
     to. A numeric criterion must not constrain a character result."""
-    from qrp.config import parse_lab_result
 
     # the parse is unchanged; what matters is that resulttyp is carried
     from qrp.config import load_study_dict
@@ -3772,7 +3773,6 @@ def test_lab_result_type_gates_the_criterion():
         "cohortfile": base["cohortfile"],
         "type2file": base["type2file"],
         "cohortcodes": base["cohortcodes"],
-        "codestrength": base["codestrength"],
         "codestrength": base["codestrength"],
         "labcodes": [{"group": "lisinopril", "code": "L1",
                       "codetype": "01C", "labresult": ">=5"}],
@@ -4290,11 +4290,13 @@ def test_followuptime_levels_reconcile_and_every_episode_is_censored():
                 [level]).fetchone()[0]
             assert got == total, (level, got, total)
 
-        flags = ("cens_elig + cens_dth + cens_qryend + cens_dpend + "
-                 "cens_episend + cens_spec + cens_event")
+        # Every episode has a reason its follow-up ended. Checked on
+        # episode_flags, where all seven flags live: SAS's follow-up-time
+        # table carries only five of them (no cens_dth / cens_qryend).
         unexplained = eng.con.execute(
-            f"SELECT sum(episodes) - sum(least(1, {flags}) * episodes) "
-            f"FROM followuptime WHERE level = '1'").fetchone()[0]
+            "SELECT count(*) FROM episode_flags WHERE fup_elig + fup_dth + "
+            "fup_qryend + fup_dpend + fup_episend + fup_spec + fup_event = 0"
+        ).fetchone()[0]
         assert unexplained == 0, f"{unexplained} episodes with no reason"
     finally:
         eng.close()
@@ -4414,53 +4416,57 @@ def test_censoring_flags_are_independent_not_exclusive():
         eng.close()
 
 
-def test_attrition_uses_sas_column_names_and_units():
-    """msoc.<runid>_attrition is `group level descr claim_level
-    remaining excluded` (ms_attrition_cidacompute.sas:104-115).
+def test_attrition_follows_sas_layout_and_reconciles_with_the_cohort():
+    """msoc.<runid>_attrition in SAS's layout (ms_attrition.sas): levels
+    1-6 count MEMBERS, 7-24 EPISODES, 27 the final members; skipped steps
+    are blank rows that keep their level number; 18.n rows count the
+    episodes excluded per inclusion condition.
 
-    `claim_level` says which unit remaining/excluded are counted in.
-    Steps 1-3 narrow CLAIMS; 4 onward narrow EPISODES, and SAS never
-    subtracts across that boundary because each step declares its own
-    unit and computes its own counts.
-
-    An earlier version lagged across the change and reported 66,921
-    excluded against 53,107 remaining — a plausible-looking number that
-    meant nothing. The boundary is NULL instead.
+    The episode steps count the SAME flags the cohort is built from, so the
+    last episode level must equal cohort_final, and level 27 its members.
+    On wp307 every level matches SAS except 7 and 12 (a few records).
     """
     from qrp import Engine
 
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        cols = {d[0] for d in eng.con.execute(
-            "SELECT * FROM attrition LIMIT 0").description}
-        for required in ("group", "level", "descr", "claim_level",
-                         "remaining", "excluded"):
-            assert required in cols, (required, sorted(cols))
-
+        cols = [d[0] for d in eng.con.execute("SELECT * FROM attrition LIMIT 0").description]
+        assert cols == ["group", "level", "claim_level", "descr", "remaining", "excluded"], cols
         rows = eng.con.execute("""
-            SELECT level, claim_level, remaining, excluded
-            FROM attrition
-            WHERE "group" = (SELECT min("group") FROM attrition)
-            ORDER BY level
-        """).fetchall()
-
-        # remaining never increases WITHIN a unit
-        for unit in ("Claim", "Episode"):
-            vals = [r[2] for r in rows if r[1] == unit]
-            assert vals == sorted(vals, reverse=True), (unit, vals)
-
-        # excluded is NULL exactly where the unit changes, and reconciles
-        # with the drop in remaining everywhere else
-        by_level = {r[0]: r for r in rows}
-        for lvl, (_, unit, remaining, excluded) in by_level.items():
-            prev = by_level.get(lvl - 1)
-            if prev is None or prev[1] != unit:
-                assert excluded is None, (lvl, excluded)
-            else:
-                assert excluded == prev[2] - remaining, (lvl, excluded)
+            SELECT "group", level, claim_level, descr, remaining, excluded
+            FROM attrition ORDER BY 1, 2""").fetchall()
+        final = dict(eng.con.execute(
+            "SELECT cohortgrp, count(*) FROM cohort_final GROUP BY 1").fetchall())
+        members = dict(eng.con.execute(
+            "SELECT cohortgrp, count(DISTINCT patid) FROM cohort_final GROUP BY 1").fetchall())
     finally:
         eng.close()
+    by_group: dict = {}
+    for r in rows:
+        by_group.setdefault(r[0], []).append(r)
+    assert by_group, "no attrition rows"
+    for g, rs in by_group.items():
+        lv = {r[1]: r for r in rs}
+        assert {float(i) for i in range(1, 28)} <= set(lv), (g, sorted(lv))
+        for lo, hi in ((1, 6), (7, 24)):           # never increases within a unit
+            vals = [lv[float(i)][4] for i in range(lo, hi + 1)]
+            assert vals == sorted(vals, reverse=True), (g, lo, vals)
+        for i in (1.0, 7.0, 27.0):
+            assert lv[i][5] is None, (g, i, lv[i])
+        prev = None
+        for i in range(1, 25):
+            r = lv[float(i)]
+            if r[2] == "":                          # blank: carried, excluded 0
+                assert r[5] == 0 and r[4] == prev, (g, i, r, prev)
+            elif i not in (1, 7):
+                assert r[5] == prev - r[4], (g, i, r, prev)
+            prev = r[4]
+        assert lv[24.0][4] == final.get(g, 0), (g, lv[24.0][4], final.get(g))
+        assert lv[27.0][4] == members.get(g, 0), (g, lv[27.0][4], members.get(g))
+        info = [r for r in rs if 18 < r[1] < 19]
+        if info:
+            assert sum(r[5] for r in info) == lv[18.0][5], (g, info, lv[18.0])
 
 
 def test_output_column_names_match_the_sas_contract():
@@ -4483,7 +4489,9 @@ def test_output_column_names_match_the_sas_contract():
         "distindex": ["group", "distindextype", "distindexlist",
                       "episodes"],
         # ms_attrition_cidacompute.sas:125-134
-        "attrition": ["group", "level", "descr", "claim_level",
+        # the order in SAS's actual r01_attrition.sas7bdat (its metadata),
+        # not the order the macro assembles them in
+        "attrition": ["group", "level", "claim_level", "descr",
                       "remaining", "excluded"],
         # ms_createcensortable.sas:246-250 — the keep is
         # `group level <censorstrat> episodes <msocflaglist>`, and
@@ -4717,19 +4725,23 @@ def test_mstr_carries_the_sas_column_names():
 
 
 def test_followuptime_agrees_between_mstr_and_the_cida_table():
-    """`followuptime` is computed twice — once onto mstr, once in
-    94_followuptime.sql. Two independent expressions of the same SAS
-    formula must agree, or one of them is wrong."""
+    """The follow-up-time table's exact-days level must add up to the
+    episodes' total follow-up. It was once a second, independent copy of
+    the formula; it now reads the master list's single definition, and
+    this checks the table's aggregation (including SAS's squared shell
+    rows, which carry 0 episodes) loses nothing."""
     from qrp import Engine
 
+    # a level that breaks follow-up down by exact days (SAS's
+    # censdays_value); a level without it reports no day values at all
     s = _fup_study([{"tableid": "t2followuptime", "levelid": "1",
-                     "levelvars": ""}])
+                     "levelvars": "censdays_value"}])
     eng = Engine(verbose=False)
     try:
         run(s, DATA, engine=eng, verbose=False)
         on_mstr, in_table = eng.con.execute("""
             SELECT (SELECT sum(followuptime) FROM cohort_final),
-                   (SELECT sum(CAST(fupdays_value_cat AS BIGINT) * episodes)
+                   (SELECT sum(censdays_value * episodes)
                     FROM followuptime WHERE level = '1')
         """).fetchone()
         assert on_mstr == in_table, (on_mstr, in_table)
@@ -4888,13 +4900,17 @@ def test_baseline_is_wide_one_row_per_group():
         # one column per observed level, not a hardcoded list
         assert any(c.startswith("Sex_") for c in cols), cols
         assert any(c.startswith("Race_") for c in cols), cols
-        assert any(c.startswith("Age_") for c in cols), cols
+        assert any(c.startswith("AGE") for c in cols), cols   # SAS: AGE0_20, AGE85
 
-        # dummies are counts: they must sum to the episode count
+        # SAS counts demographics once per PATIENT (first episode;
+        # ms_createdistbaselinetable.sas:437-449), not per episode
         bad = eng.con.execute(
-            'SELECT count(*) FROM baseline WHERE "Sex_F" + "Sex_M" '
-            '<> n_episodes').fetchone()[0]
-        assert bad == 0, "sex dummies do not sum to n_episodes"
+            'SELECT count(*) FROM baseline WHERE "Sex_F" + "Sex_M" + "Sex_O" '
+            '<> patient').fetchone()[0]
+        assert bad == 0, "sex dummies do not sum to the patient count"
+        assert eng.con.execute(
+            "SELECT count(*) FROM baseline WHERE patient < n_episodes").fetchone()[0] > 0, (
+            "no cohort has repeat episodes: the per-patient rule is untested")
 
         total = eng.con.execute(
             "SELECT sum(n_episodes) FROM baseline").fetchone()[0]
@@ -5300,7 +5316,8 @@ def test_failed_rerun_leaves_previous_results_intact():
     before = len(list(out.rglob("*.parquet")))
     assert before > 0
 
-    with pytest.raises(Exception):
+    # the specific error: a blind Exception would also pass on unrelated bugs
+    with pytest.raises(FileNotFoundError):
         _run(_runid_study("rr"), "/nonexistent/input/path",
              output_dir=str(out), names="sas", verbose=False)
 
@@ -5392,11 +5409,12 @@ def test_baseline_carries_the_sas_dummy_groups():
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
         cols = [d[0] for d in eng.con.execute(
             "SELECT * FROM baseline LIMIT 0").description]
-        for prefix in ("Sex_", "Race_", "Hispanic_", "Age_", "year_"):
+        # SAS's names: AGE<band> (AGE0_20, AGE85) and Year_<n>
+        for prefix in ("Sex_", "Race_", "Hispanic_", "AGE", "Year_"):
             assert any(c.startswith(prefix) for c in cols), (prefix, cols)
 
         # each dummy group is a partition: it sums to n_episodes
-        years = [c for c in cols if c.startswith("year_")]
+        years = [c for c in cols if c.startswith("Year_")]
         total = " + ".join(f'"{c}"' for c in years)
         bad = eng.con.execute(
             f"SELECT count(*) FROM baseline WHERE {total} <> n_episodes"
@@ -5443,7 +5461,8 @@ def test_baseline_continuous_means_use_sas_names_and_the_right_population():
         # the mean must be over cohort_final, not over every master-list
         # episode — the two differ, and both look plausible
         want = dict(eng.con.execute("""
-            SELECT u.cohortgrp, round(avg(u.enc_ip), 4)
+            -- SAS does not round means or SDs
+            SELECT u.cohortgrp, avg(u.enc_ip)
             FROM utilization u
             JOIN cohort_final c USING (cohortgrp, patid, indexdt)
             GROUP BY 1
@@ -6349,7 +6368,7 @@ def test_bulk_registration_matches_row_by_row_exactly():
                     # row count, per-column non-null count, and the rows
                     # themselves
                     counts = eng.con.execute(
-                        f"SELECT count(*), "
+                        "SELECT count(*), "
                         + ", ".join(f"count({c})" for c in cols)
                         + f" FROM {tbl}").fetchone()
                     rows = eng.con.execute(
@@ -7309,37 +7328,18 @@ def test_master_list_columns_use_one_lookup_per_source():
     assert cols.count(' AS "COVAR') == n_cov
 
 
-def test_baseline_uses_one_lookup_per_source():
-    """The baseline table's covariate counts and mean/std columns must
-    come from ONE covariate pivot and one join per measure table, not a
-    correlated lookup per column per episode.
-
-    The first version put a correlated EXISTS per covariate and a scalar
-    subquery per mean/std column inside the aggregation — the same flaw
-    as the master list, in a step that runs outside any timed stage. Its
-    replacement produces an identical baseline (every column and value,
-    on wp307 and the 600k-code study). Like the master list, the SQL is
-    generated in Python, so the static join test cannot see it.
+def test_baseline_is_static_sql_without_per_level_lookups():
+    """The baseline used to be widened by SQL generated in Python
+    (_baseline_dummies), which once used a correlated lookup per row.
+    It is now static SQL in 96_baseline.sql: long-form statistics, then a
+    PIVOT for SAS's wide layout. Counts per level are a GROUP BY joined to
+    the declared levels, never a scalar subquery per cohort x level.
     """
-    from qrp import Engine
-    from qrp.config import load_study_dict
-    from qrp.pipeline import _baseline_dummies
-
-    base = json.loads((STUDY.parent / "demo_full.json").read_text())
-    study = load_study_dict({**base, "utilfile": [
-        {"group": g, "utiltype": "MED", "utilfrom": -183, "utilto": -1}
-        for g in ("lisinopril", "beta_blocker")]})
-    eng = Engine(verbose=False)
-    try:
-        run(study, DATA, engine=eng, verbose=False)
-        sql = _baseline_dummies(eng, study)
-    finally:
-        eng.close()
-    assert len({c.covarnum for c in study.covariates}) > 1
-    assert sql.count("covariates_long") == 1, sql
-    assert sql.count("JOIN utilization") == 1, sql
-    assert "EXISTS" not in sql and "(SELECT u." not in sql, (
-        "per-row correlated lookups are back in the baseline")
+    import qrp.pipeline as pl
+    sql = (Path(qrp.__file__).parent / "sql" / "96_baseline.sql").read_text()
+    assert not hasattr(pl, "_baseline_dummies"), "the Python generator is back"
+    assert "(SELECT count(*) FROM" not in sql, "per-level correlated lookups are back"
+    assert "PIVOT" in sql and "baseline_long" in sql
 
 
 def test_combo_covariates_are_evaluated_in_order():
@@ -7672,17 +7672,17 @@ def test_supply_and_amount_replay_wp307_patients():
     try:
         eng.register("cohort_final", [
             dict(zip(("cohortgrp", "patid", "indexdt", "episodeenddt",
-                      "feventdt", "enr_end"), e)) for e in eps],
+                      "feventdt", "enr_end"), e, strict=False)) for e in eps],
             "cohortgrp VARCHAR, patid BIGINT, indexdt DATE, episodeenddt DATE, "
             "feventdt DATE, enr_end DATE")
         eng.register("stockpiled", [
             dict(zip(("cohortgrp", "patid", "stockgroup", "orig_adate", "adate",
-                      "expiredt", "rxsup", "rxamt"), r)) for r in stock],
+                      "expiredt", "rxsup", "rxamt"), r, strict=False)) for r in stock],
             "cohortgrp VARCHAR, patid BIGINT, stockgroup VARCHAR, orig_adate DATE, "
             "adate DATE, expiredt DATE, rxsup INTEGER, rxamt DOUBLE")
         eng.register("exposure_claims", [
             dict(zip(("cohortgrp", "patid", "stockgroup", "adate", "rxsup",
-                      "rxamt", "codecat"), r)) for r in raw],
+                      "rxamt", "codecat"), r, strict=False)) for r in raw],
             "cohortgrp VARCHAR, patid BIGINT, stockgroup VARCHAR, adate DATE, "
             "rxsup INTEGER, rxamt DOUBLE, codecat VARCHAR")
         eng.con.execute(stmt)
@@ -7896,7 +7896,8 @@ def test_distindex_numbering_follows_ms_codedistribution():
     from qrp.sqlsplit import split_statements
 
     D = dt.date(2023, 3, 1)
-    sql = (Path(qrp.__file__).parent / "sql" / "62_mstr_wide.sql").read_text()
+    # the numbering lives in 72_codedistribution.sql, its one definition
+    sql = (Path(qrp.__file__).parent / "sql" / "72_codedistribution.sql").read_text()
     stmts = [s.sql for s in split_statements(sql)
              if s.target in ("_di_claims", "_di_ids", "_di_exp", "_di_hoi")]
     assert len(stmts) == 4, [s.target for s in split_statements(sql)]
@@ -8171,3 +8172,479 @@ def test_truncation_claims_only_for_patients_in_the_cohort():
     assert outsiders > 0, "no outsider has these dispensings: the test proves nothing"
     assert rows > 0, "no truncation claims were built at all"
     assert stray == 0, f"{stray} truncation rows belong to patients outside the cohort"
+
+
+def test_deaths_come_from_the_death_table_and_expired_encounters():
+    """SAS takes deaths from the death table AND from encounters discharged
+    as expired (discharge_status 'EX'), dated at discharge or else
+    admission; when a patient has both, the DEATH TABLE's date is kept,
+    even if later (ms_extractdeaths.sas). These deaths drive censoring.
+    Reading only the death table missed patients who died in hospital
+    without a death-table record. An extract without discharge_status has
+    no encounter deaths, rather than failing.
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date
+    sql = (Path(qrp.__file__).parent / "sql" / "10_normalize.sql").read_text()
+    stmt = next(st.sql for st in split_statements(sql) if st.target == "deaths")
+
+    def deaths(with_status=True):
+        eng = Engine(verbose=False)
+        try:
+            eng.register("dth", [
+                {"patid": 1, "deathdt": D(2023, 5, 10)},
+                {"patid": 3, "deathdt": D(2023, 7, 20)}],
+                "patid BIGINT, deathdt DATE")
+            eng.register("enc", [
+                {"patid": 2, "adate": D(2023, 3, 1), "ddate": D(2023, 3, 4), "discharge_status": "EX"},
+                {"patid": 3, "adate": D(2023, 7, 10), "ddate": D(2023, 7, 15), "discharge_status": "EX"},
+                {"patid": 4, "adate": D(2023, 2, 2), "ddate": None, "discharge_status": "ex"},
+                {"patid": 5, "adate": D(2023, 1, 1), "ddate": D(2023, 1, 3), "discharge_status": "HO"}],
+                "patid BIGINT, adate DATE, ddate DATE, discharge_status VARCHAR")
+            eng.con.execute(stmt.replace("{read_death}", "dth").replace("{read_encounter}", "enc")
+                                .replace("{opt_ddate}", "ddate")
+                                .replace("{opt_discharge_status}",
+                                         "discharge_status" if with_status else "NULL"))
+            return {p: (d.month, d.day) for p, d in
+                    eng.con.execute("SELECT patid, deathdt FROM deaths").fetchall()}
+        finally:
+            eng.close()
+
+    assert deaths() == {1: (5, 10), 2: (3, 4), 3: (7, 20), 4: (2, 2)}, deaths()
+    assert deaths(with_status=False) == {1: (5, 10), 3: (7, 20)}
+
+
+def test_parity_compare_reads_sas_export_conventions(tmp_path):
+    """tools/parity_compare.py must align SAS's and DuckDB's dumps despite
+    SAS's conventions: `Group` where DuckDB has `cohortgrp`, dates in
+    display formats (01JAN2020), numbers as floats (1.0). Before, the master
+    list was keyed on `cohortgrp`, so every SAS row got a blank key and no
+    row was compared; and SAS dates never matched ISO ones.
+
+    Identical content in the two conventions must report nothing; one real
+    difference must still be reported.
+    """
+    import subprocess
+    import sys as _sys
+
+    def dump(root, header, rows):
+        d = root / "_dbg_pov56/pt001/g/iter_00/cohort_final"
+        d.mkdir(parents=True)
+        (d / "cohort_final.csv").write_text(
+            header + "\n" + "\n".join(rows) + "\n")
+
+    sas, duck = tmp_path / "sas", tmp_path / "duck"
+    dump(sas, "Group,PatID,IndexDt,episodes",
+         ["g,1.0,01JAN2020,3.0", "g,2.0,15MAR2021,1.0"])
+    dump(duck, "cohortgrp,patid,indexdt,episodes",
+         ["g,1,2020-01-01,3", "g,2,2021-03-15,1"])
+    tool = Path(__file__).resolve().parent.parent / "tools" / "parity_compare.py"
+
+    def run_tool():
+        r = subprocess.run([_sys.executable, str(tool), str(sas), str(duck)],
+                           capture_output=True, text=True)
+        return r.returncode, r.stdout
+    code, out = run_tool()
+    assert code == 0, out
+
+    # one real difference, which must be reported
+    dump_dir = duck / "_dbg_pov56/pt001/g/iter_00/cohort_final/cohort_final.csv"
+    dump_dir.write_text("cohortgrp,patid,indexdt,episodes\n"
+                        "g,1,2020-01-01,3\ng,2,2021-03-15,2\n")
+    code, out = run_tool()
+    assert code != 0 and "episodes" in out, out
+
+
+def test_reported_age_is_sas_yrdif_age():
+    """SAS reports age as yrdif(birth_date, date, 'AGE'): whole years plus
+    the days since the last birthday over 365 — always 365, with any
+    29 February in between not counted. Matched on all 31,464 wp307
+    episodes; dividing by the age year's actual length differed on 8,440.
+    """
+    import datetime as dt
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        eng.script_stage("macros", "00_macros.sql")
+        def age(b, d):
+            return eng.con.execute("SELECT age_yrdif(?::DATE, ?::DATE)", [b, d]).fetchone()[0]
+        # no 29 Feb since the last birthday (2024-03-10): 71 days
+        assert abs(age(dt.date(1990, 3, 10), dt.date(2024, 5, 20)) - (34 + 71 / 365)) < 1e-12
+        # the age year contains 29 Feb 2020, not yet reached: still /365
+        assert abs(age(dt.date(1990, 4, 15), dt.date(2020, 2, 3)) - (29 + 294 / 365)) < 1e-12
+        # 29 Feb 2024 passed since 2023-10-01: 232 calendar days, 231 counted
+        assert abs(age(dt.date(1990, 10, 1), dt.date(2024, 5, 20)) - (33 + 231 / 365)) < 1e-12
+    finally:
+        eng.close()
+
+
+def test_master_list_quarter_numevents_and_ttc_follow_sas():
+    """quarter was ((month - 1) / 3 + 1)::SMALLINT: `/` is float division in
+    DuckDB and the cast rounds, so every Mar/Jun/Sep/Dec index date was a
+    quarter late. SAS leaves numevents blank (not 0) without an event, and
+    ttc blank outside TreeScan analyses. All three matched SAS on wp307's
+    31,464 episodes once fixed.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        q_end, wrong_q, zero_ev, ttc = eng.con.execute("""
+            SELECT count(*) FILTER (WHERE month(indexdt) IN (3, 6, 9, 12)),
+                   count(*) FILTER (WHERE quarter <> quarter(indexdt)),
+                   count(*) FILTER (WHERE numevents = 0),
+                   count(ttc)
+            FROM cohort_final""").fetchone()
+    finally:
+        eng.close()
+    assert q_end > 0, "no quarter-end index dates: the test proves nothing"
+    assert wrong_q == 0, f"{wrong_q} episodes in the wrong quarter"
+    assert zero_ev == 0, f"{zero_ev} episodes report numevents 0, not blank"
+    assert ttc == 0, f"{ttc} episodes report ttc outside a TreeScan analysis"
+
+
+def test_episode_flags_follow_sas_two_pass_definition():
+    """SAS sets the flags in two passes (ms_finalizeptsmasterlist.sas:
+    305-357): cens_* against the censor date, min(enrolment end, death,
+    query end, DP end), IGNORING the episode's end and events; fup_*
+    against the follow-up end, min(episode end, enrolment end, event).
+    Each flag is an independent equality test, so several can be 1.
+
+    duckqrp derived every flag from one exit_reason and copied fup_* into
+    cens_*; on wp307 cens_elig differed on 22,660 of 31,464 episodes,
+    fup_spec on 11,881, fup_episend on 3,101. All 11 match now.
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date
+    sql = (Path(qrp.__file__).parent / "sql" / "60_followup.sql").read_text()
+    stmt = next(st.sql for st in split_statements(sql) if st.target == "episode_flags")
+    stmt = (stmt.replace("{end_date}", "2024-12-31").replace("{censor_date}", "2024-12-31")
+                .replace("{dose_rel}", "dose_censor"))
+    eps = [
+        # 1: event first; enrolment ends after the episode
+        dict(patid=1, indexdt=D(2023, 1, 1), episodeenddt=D(2023, 6, 30), origepisenddt=D(2023, 6, 30),
+             enr_end=D(2023, 9, 30), feventdt=D(2023, 3, 1), deathdt=None, trunkdt=None),
+        # 2: truncated; enrolment runs to the query end
+        dict(patid=2, indexdt=D(2023, 1, 1), episodeenddt=D(2023, 4, 10), origepisenddt=D(2023, 6, 30),
+             enr_end=D(2024, 12, 31), feventdt=None, deathdt=None, trunkdt=D(2023, 4, 10)),
+        # 3: death on the enrolment end date
+        dict(patid=3, indexdt=D(2023, 1, 1), episodeenddt=D(2023, 8, 1), origepisenddt=D(2023, 12, 31),
+             enr_end=D(2023, 8, 1), feventdt=None, deathdt=D(2023, 8, 1), trunkdt=None),
+        # 4: the episode runs its natural length
+        dict(patid=4, indexdt=D(2023, 1, 1), episodeenddt=D(2023, 5, 31), origepisenddt=D(2023, 5, 31),
+             enr_end=D(2024, 6, 30), feventdt=None, deathdt=None, trunkdt=None),
+        # 5: cut short by the maximum cumulative dose (SAS lines 357-359)
+        dict(patid=5, indexdt=D(2023, 1, 1), episodeenddt=D(2023, 4, 15), origepisenddt=D(2023, 6, 30),
+             enr_end=D(2024, 6, 30), feventdt=None, deathdt=None, trunkdt=None),
+    ]
+    eng = Engine(verbose=False)
+    try:
+        eng.register("cohort_final", [{"cohortgrp": "g", **e} for e in eps],
+                     "cohortgrp VARCHAR, patid BIGINT, indexdt DATE, episodeenddt DATE, "
+                     "origepisenddt DATE, enr_end DATE, feventdt DATE, deathdt DATE, trunkdt DATE")
+        eng.register("cfg_cohort", [{"cohortgrp": "g", "max_epis_dur": None, "point": "N"}],
+                     "cohortgrp VARCHAR, max_epis_dur INTEGER, point VARCHAR")
+        eng.register("dose_censor", [{"cohortgrp": "g", "patid": 5,
+                                      "indexdt": D(2023, 1, 1), "censordate_maxdose": D(2023, 4, 15)}],
+                     "cohortgrp VARCHAR, patid BIGINT, indexdt DATE, censordate_maxdose DATE")
+        eng.con.execute(stmt)
+        cols = ["fup_elig", "fup_dth", "fup_qryend", "fup_episend", "fup_spec", "fup_event",
+                "cens_elig", "cens_dth", "cens_qryend"]
+        got = {r[0]: dict(zip(cols, r[1:], strict=False)) for r in eng.con.execute(
+            f"SELECT patid, {', '.join(cols)} FROM episode_flags ORDER BY patid").fetchall()}
+    finally:
+        eng.close()
+    on = {p: {c for c, v in f.items() if v == 1} for p, f in got.items()}
+    assert on[1] == {"fup_event", "cens_elig"}, on[1]
+    assert on[2] == {"fup_spec", "cens_elig", "cens_qryend"}, on[2]
+    assert on[3] == {"fup_dth", "cens_dth"}, on[3]
+    assert on[4] == {"fup_episend", "cens_elig"}, on[4]
+    assert on[5] == {"fup_episend", "cens_elig"}, on[5]   # the dose limit
+
+
+def test_dispensing_counts_cover_every_record_in_the_episode():
+    """SAS counts dispensings in the same summary as supply and amount
+    (ms_finalizeptsmasterlist.sas:128-133): AdjustedDisp = stockpiled
+    records overlapping the episode, RawDisp = the raw dispensings they
+    combine. The master list reported the index record's count for both,
+    and t2_cida a constant 1 for AdjustedDisp; both now match SAS on all
+    31,464 wp307 episodes.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    # a t2cida stratum, so t2_cida is built (it is skipped without one)
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    study = load_study_dict({**base, "userstrata": [
+        {"tableid": "t2cida", "levelid": "1", "levelvars": ""}]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        multi, raw_below, = eng.con.execute("""
+            SELECT count(*) FILTER (WHERE "AdjustedDisp" > 1),
+                   count(*) FILTER (WHERE "RawDisp" < "AdjustedDisp")
+            FROM cohort_final""").fetchone()
+        above = eng.con.execute(
+            "SELECT count(*) FROM t2_cida WHERE adjustedcodecount > episodes").fetchone()[0]
+    finally:
+        eng.close()
+    assert multi > 0, "no episode with several dispensings: the test proves nothing"
+    assert raw_below == 0, f"{raw_below} episodes with fewer raw than stockpiled dispensings"
+    assert above > 0, "t2_cida adjustedcodecount never exceeds episodes: counted once per episode"
+
+
+def test_t2_cida_sums_the_episodes_followuptime():
+    """t2_cida summed person_days, which omits SAS's follow-up adjustments
+    (blackout, at-risk start), and computed its own timetocensor: a third
+    definition. It now sums the master list's values, which match SAS;
+    t2_cida then matched SAS on wp307 with no differences.
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    # a 7-day blackout makes SAS's follow-up differ from person_days;
+    # without one the two are identical and the test proves nothing
+    study = load_study_dict({**base,
+        "type2file": [{**r, "blackoutper": 7} for r in base["type2file"]],
+        "userstrata": [{"tableid": "t2cida", "levelid": "1", "levelvars": ""}]})
+    eng = Engine(verbose=False)
+    try:
+        run(study, DATA, engine=eng, verbose=False)
+        distinct, mismatched = eng.con.execute("""
+            WITH ep AS (SELECT cohortgrp, sum(followuptime) AS fut,
+                               sum(person_days) AS pd
+                        FROM cohort_final GROUP BY 1)
+            SELECT count(*) FILTER (WHERE ep.fut <> ep.pd),
+                   count(*) FILTER (WHERE t.followuptime IS DISTINCT FROM ep.fut)
+            FROM ep JOIN t2_cida t ON t."group" = ep.cohortgrp""").fetchone()
+    finally:
+        eng.close()
+    assert distinct > 0, "person_days equals followuptime here: the test proves nothing"
+    assert mismatched == 0, f"{mismatched} cohorts' t2_cida follow-up is not the episodes' sum"
+
+
+def test_followuptime_levels_follow_sas_and_are_squared():
+    """SAS's follow-up-time levels (USERSTRATA t2followuptime): one by
+    exact days (censdays_value), one by category (censdays_value_cat,
+    with censorcat_sort). Both are SQUARED with a shell row per cohort
+    (ms_createcensortable.sas:170-185): every category appears, and every
+    cohort has a row at 1 day, with 0 episodes where none occur. duckqrp
+    gave both levels the exact-days breakdown and no shell rows; on wp307
+    the table now matches SAS row for row (9,558 rows).
+    """
+    from qrp import Engine
+
+    from qrp.config import load_study_dict
+
+    # A third cohort whose only code matches no claim: it has NO episodes,
+    # so its rows can come only from SAS's shell. Without it every demo
+    # cohort has episodes at 1 day and in every category, and the test
+    # passed with the shell rows removed.
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    lis = "lisinopril"
+    s = load_study_dict({
+        "qrp_parameters_scalars": {"type": 2, "runid": "fup",
+                                   "startdate": "2011-01-01", "enddate": "2015-06-30"},
+        "cohortfile": base["cohortfile"] + [
+            {**r, "cohortgrp": "empty_grp"} for r in base["cohortfile"] if r["cohortgrp"] == lis],
+        "type2file": base["type2file"] + [
+            {**r, "group": "empty_grp"} for r in base["type2file"] if r["group"] == lis],
+        "cohortcodes": base["cohortcodes"] + [
+            {"group": "empty_grp", "indexcriteria": "DEF", "code": "NOSUCHCODE", "codecat": "RX"}],
+        # the copied settings carry a dose restriction: the code needs a strength
+        "codestrength": base["codestrength"] + [{**{'strength': 7.5}, "code": "NOSUCHCODE"}],
+        "userstrata": [
+            {"tableid": "t2followuptime", "levelid": "700", "levelvars": "censdays_value"},
+            {"tableid": "t2followuptime", "levelid": "701", "levelvars": "censdays_value_cat"}],
+    })
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        assert eng.con.execute(
+            "SELECT count(*) FROM cohort_final WHERE cohortgrp = 'empty_grp'").fetchone()[0] == 0, (
+            "the empty cohort has episodes: the test cannot see the shell rows")
+        cohorts = eng.con.execute("SELECT count(*) FROM cfg_cohort").fetchone()[0]
+        assert cohorts == 3, cohorts
+        total = eng.count("cohort_final")
+        cat_rows, day1_rows, eps700, eps701 = eng.con.execute("""
+            SELECT count(*) FILTER (WHERE level = '701'),
+                   count(DISTINCT "group") FILTER (WHERE level = '700' AND censdays_value = 1),
+                   sum(episodes) FILTER (WHERE level = '700'),
+                   sum(episodes) FILTER (WHERE level = '701')
+            FROM followuptime""").fetchone()
+    finally:
+        eng.close()
+    assert cat_rows == cohorts * 3, (cat_rows, cohorts)
+    assert day1_rows == cohorts, (day1_rows, cohorts)
+    assert eps700 == total and eps701 == total, (eps700, eps701, total)
+
+
+def test_distindex_output_rules_follow_sas(baseline):
+    """SAS's output rules for the index-code distribution (read from its
+    wp307 output, where both tables now match exactly):
+      * a (cohort, type) with any id list reports only its non-empty lists;
+      * one with none reports ONE placeholder row: blank list, no count;
+      * the map lists hoi entities only for a cohort with a first event,
+        otherwise one blank hoi row.
+    """
+    con = baseline.con
+    bad_mix = con.execute("""
+        SELECT count(*) FROM (
+            SELECT "group", distindextype,
+                   count(*) FILTER (WHERE distindexlist = '') AS blank,
+                   count(*) AS n
+            FROM distindex GROUP BY 1, 2)
+        WHERE blank > 0 AND n > 1""").fetchone()[0]
+    assert bad_mix == 0, "a blank list beside real lists: placeholders must stand alone"
+    counted_blank = con.execute(
+        "SELECT count(*) FROM distindex WHERE distindexlist = '' AND episodes IS NOT NULL"
+    ).fetchone()[0]
+    assert counted_blank == 0, "a placeholder row carries a count"
+    with_ev, placeholders, hoi_map_wrong = con.execute("""
+        WITH ev AS (SELECT DISTINCT cohortgrp FROM cohort_final WHERE feventdt IS NOT NULL)
+        SELECT (SELECT count(*) FROM ev),
+               (SELECT count(*) FROM distindex WHERE distindextype = 'hoi' AND distindexlist = ''),
+               (SELECT count(*) FROM distindexmap m WHERE m.distindextype = 'hoi'
+                  AND ((m."group" IN (SELECT cohortgrp FROM ev)) <> (m.distindexid IS NOT NULL)))
+    """).fetchone()
+    assert with_ev > 0, "no cohort with an event: the hoi rules are untested"
+    groups = con.execute("SELECT count(DISTINCT cohortgrp) FROM cohort_final").fetchone()[0]
+    assert placeholders == groups - with_ev, (placeholders, groups, with_ev)
+    assert hoi_map_wrong == 0, "hoi map rows disagree with which cohorts have events"
+
+
+def test_washout_ignores_fills_outside_qualifying_enrollment():
+    """SAS runs the washout on _groupindex, which ms_shaveoutside
+    (KeepPartBf=N) has stripped of every record starting outside the
+    member's enrollment spans: a fill in an enrollment gap cannot block a
+    later index date. duckqrp counted such fills, keeping a few index
+    dates out of the candidates; SAS counts them at attrition level 12
+    and excludes them at level 16 (on wp307 every output was unchanged).
+    """
+    import datetime as dt
+    from qrp import Engine
+    from qrp.sqlsplit import split_statements
+
+    D = dt.date
+    sql = (Path(qrp.__file__).parent / "sql" / "40_index.sql").read_text()
+    stmt = next(st.sql for st in split_statements(sql) if st.target == "index_candidates")
+    rec = lambda p, a, x: {"cohortgrp": "g", "stockgroup": "s", "patid": p, "adate": a,
+                           "expiredt": x, "orig_adate": a, "rxsup": 30, "rxamt": 30.0,
+                           "numdispensing": 1}
+    eng = Engine(verbose=False)
+    try:
+        eng.register("stockpiled", [
+            # 1: prior fill in a GAP (span starts 2023-03-01); its supply
+            #    reaches the later fill's 183-day washout window
+            rec(1, D(2023, 2, 1), D(2023, 4, 30)), rec(1, D(2023, 6, 1), D(2023, 6, 30)),
+            # 2: the same, but the prior fill is INSIDE the span
+            rec(2, D(2023, 2, 1), D(2023, 4, 30)), rec(2, D(2023, 6, 1), D(2023, 6, 30))],
+            "cohortgrp VARCHAR, stockgroup VARCHAR, patid BIGINT, adate DATE, expiredt DATE, "
+            "orig_adate DATE, rxsup INTEGER, rxamt DOUBLE, numdispensing INTEGER")
+        eng.register("cfg_cohort", [{"cohortgrp": "g", "enr_cfg_id": "e", "wash_per": 183}],
+                     "cohortgrp VARCHAR, enr_cfg_id VARCHAR, wash_per INTEGER")
+        eng.register("enrollment_spans", [
+            {"enr_cfg_id": "e", "patid": 1, "enr_start": D(2023, 3, 1), "enr_end": D(2024, 12, 31)},
+            {"enr_cfg_id": "e", "patid": 2, "enr_start": D(2022, 1, 1), "enr_end": D(2024, 12, 31)}],
+            "enr_cfg_id VARCHAR, patid BIGINT, enr_start DATE, enr_end DATE")
+        eng.con.execute(stmt)
+        got = {(p, a.month) for p, a in eng.con.execute(
+            "SELECT patid, adate FROM index_candidates").fetchall()}
+    finally:
+        eng.close()
+    assert (1, 6) in got, "a fill in an enrollment gap blocked a later index date"
+    assert (2, 6) not in got, "a prior fill inside the span no longer blocks: washout broken"
+
+
+def test_inclusion_is_evaluated_at_sas_attrition_step():
+    """SAS applies inclusion/exclusion at attrition level 18, after prior
+    enrollment (level 16) but BEFORE the post-index criteria (levels
+    20-23). So the conditions are evaluated on episode_criteria's level-16
+    survivors, not on the final ptsmasterlist; an episode failing both is
+    SAS's level-18 exclusion. With this, levels 18 and 18.1 match SAS in
+    all 40 wp307 cohorts and every output is unchanged.
+    """
+    from qrp.sqlsplit import split_statements
+    sql = (Path(qrp.__file__).parent / "sql" / "52_inclusion.sql").read_text()
+    stmts = {st.target: st.sql for st in split_statements(sql)}
+    assert "min_enr_days_met" in stmts["_incl_episodes"], stmts["_incl_episodes"]
+    assert "FROM episode_criteria" in stmts["_incl_episodes"]
+    assert "FROM ptsmasterlist" not in stmts["inclusion_excluded"], (
+        "inclusion evaluated on the final list again: SAS's level 18 would be miscounted")
+
+
+def test_fills_are_shaved_to_enrollment_before_stockpiling():
+    """SAS shaves the raw fills to enrollment BEFORE stockpiling
+    (ms_cidanum.sas:1408; ms_shaveoutside KeepPartBf=N, shaverx=Y): a fill
+    starting outside the member's enrollment spans is dropped, and supply
+    beyond a span's end trimmed. duckqrp chained the raw fills, so a fill
+    in an enrollment gap could push later fills to dates SAS never has.
+    With the shave, attrition level 7 matches SAS in all 40 wp307 cohorts
+    (was 24) and every output is unchanged.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        outside, stray = eng.con.execute("""
+            WITH inside AS (
+                SELECT x.cohortgrp, x.patid, x.adate FROM exposure_claims x
+                JOIN cfg_cohort c ON c.cohortgrp = x.cohortgrp
+                SEMI JOIN enrollment_spans e
+                       ON e.enr_cfg_id = c.enr_cfg_id AND e.patid = x.patid
+                      AND x.adate BETWEEN e.enr_start AND e.enr_end
+                WHERE x.codecat = 'RX')
+            SELECT
+              (SELECT count(*) FROM exposure_claims x WHERE x.codecat = 'RX'
+                 AND NOT EXISTS (SELECT 1 FROM inside i WHERE i.cohortgrp = x.cohortgrp
+                                   AND i.patid = x.patid AND i.adate = x.adate)),
+              (SELECT count(*) FROM stockpiled s
+                 WHERE NOT EXISTS (SELECT 1 FROM inside i WHERE i.cohortgrp = s.cohortgrp
+                                     AND i.patid = s.patid AND i.adate = s.orig_adate))
+        """).fetchone()
+    finally:
+        eng.close()
+    assert outside > 0, "no fill outside enrollment: the test proves nothing"
+    assert stray == 0, f"{stray} stockpiled records come from fills outside enrollment"
+
+
+def test_stockpiled_records_are_reshaved_to_enrollment():
+    """SAS re-shaves after stockpiling (ms_cidanum.sas:1641-1650: 'Need to
+    reshave because Stockpiling may have pushed claims outside enrollment
+    period'): a record pushed to a start outside the member's spans is
+    dropped, and supply running past a span's end trimmed there. Without
+    it, a pushed supply crossing an enrollment gap could block the washout
+    of a later index date SAS accepts; with it, every wp307 attrition level
+    matches SAS and every output is unchanged.
+    """
+    from qrp import Engine
+
+    eng = Engine(verbose=False)
+    try:
+        run(load_study(STUDY), DATA, engine=eng, verbose=False)
+        outside, past_end = eng.con.execute("""
+            SELECT count(*) FILTER (WHERE e.patid IS NULL),
+                   count(*) FILTER (WHERE e.patid IS NOT NULL AND s.expiredt > e.enr_end)
+            FROM stockpiled s
+            JOIN cfg_cohort c ON c.cohortgrp = s.cohortgrp
+            LEFT JOIN enrollment_spans e
+                   ON e.enr_cfg_id = c.enr_cfg_id AND e.patid = s.patid
+                  AND s.adate BETWEEN e.enr_start AND e.enr_end
+            WHERE s.stockgroup IS NOT NULL
+              AND EXISTS (SELECT 1 FROM exposure_claims x WHERE x.cohortgrp = s.cohortgrp
+                            AND x.patid = s.patid AND x.adate = s.orig_adate AND x.codecat = 'RX')
+        """).fetchone()
+    finally:
+        eng.close()
+    assert outside == 0, f"{outside} stockpiled dispensings start outside enrollment"
+    assert past_end == 0, f"{past_end} stockpiled dispensings run past their span's end"

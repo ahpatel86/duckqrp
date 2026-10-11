@@ -67,7 +67,8 @@ SELECT
     d.rxsup, d.rxamt, d.numdispensing,
     d.enr_start, d.enr_end,
     d.birth_date, d.sex, d.race, d.hispanic, d.zip, d.zip_date,
-    age_years(d.birth_date, d.indexdt) AS age,
+    -- reported age, as SAS's yrdif(..., 'AGE'); groups use age_in_unit
+    age_yrdif(d.birth_date, d.indexdt) AS age,
     a.label   AS agegroup,
     a.ordinal AS agegroupnum,
     dth.deathdt

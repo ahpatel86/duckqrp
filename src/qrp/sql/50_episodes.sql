@@ -126,7 +126,14 @@ WHERE c.point;
 -- Written as a single projection, the precedence is visible in one place
 -- instead of being spread over 60 lines of imperative reassignment.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE TABLE ptsmasterlist AS
+-- ------------------------------------------------------------------
+-- Every candidate episode (an index date that starts an episode, in the
+-- query period) with EACH criterion as a flag: SAS's _MasterEpisode
+-- (ms_attrition.sas:376-460). ptsmasterlist is the rows where every flag
+-- holds; the attrition table counts the same flags in SAS's order, so
+-- the two cannot disagree.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE TABLE episode_criteria AS
 WITH joined AS (
     SELECT
         p.* EXCLUDE (cohortgrp),
@@ -179,6 +186,8 @@ censored AS (
     SELECT
         j.*,
         j.raw_episodeenddt AS origepisenddt,
+        -- kept for fup_spec, which tests the follow-up end against it
+        tr.trunkdt,
         -- Censoring precedence, innermost first:
         --   study censor date, death (when censoring on death),
         --   end of enrollment, max episode duration.
@@ -209,39 +218,45 @@ SELECT
     indexdt AS episodestartdt,
     episodeenddt,
     origepisenddt,
+    trunkdt,   -- the FUT truncation date, for fup_spec
     CASE WHEN at_risk_start > 0 THEN indexdt + at_risk_start ELSE indexdt END
         AS atriskindexdt,
     dataavail_dt,
     span_days(indexdt, episodeenddt) AS episode_days,
     age, agegroup, agegroupnum, sex, race, hispanic, zip, zip_date,
     birth_date, deathdt, enr_start, enr_end,
-    rxsup, rxamt, numdispensing, episode_rxsup
+    rxsup, rxamt, numdispensing, episode_rxsup,
+    -- SAS: MinEnrdays (minimum prior enrollment)
+    enr_start <= indexdt - enr_days                                    AS min_enr_days_met,
+    -- SAS: MinEnrAft (observable days after index and after episode end,
+    -- and enrollment covering the minimum duration: FUEnrolMet)
+    (dataavail_dt >= indexdt      + greatest(0, req_days_aft_ind)
+     AND dataavail_dt >= episodeenddt + greatest(0, req_days_aft_epi)
+     AND (min_epis_dur <= 0
+          OR (enr_start <= indexdt AND indexdt + (min_epis_dur - 1) <= enr_end)))
+                                                                       AS min_enr_aft_met,
+    -- SAS: MinDaySupMet (minimum days of supply within the episode)
+    (min_days_supp <= 0 OR episode_rxsup >= min_days_supp)            AS min_day_sup_met,
+    -- SAS: MinEpiDurMet (minimum episode duration)
+    span_days(indexdt, episodeenddt) >= min_epis_dur                    AS min_epi_dur_met,
+    -- SAS: PostBlackoutper (the blackout must fit inside the episode)
+    (blackout_per <= 0
+     OR date_diff('day', indexdt, episodeenddt) - blackout_per >= 0)  AS post_blackout_met
 FROM censored
 WHERE
-    -- minimum prior enrollment
-        enr_start <= indexdt - enr_days
-    -- required observable days after index and after episode end
-    AND dataavail_dt >= indexdt      + greatest(0, req_days_aft_ind)
-    AND dataavail_dt >= episodeenddt + greatest(0, req_days_aft_epi)
-    -- minimum episode duration, and enrollment covering it
-    AND span_days(indexdt, episodeenddt) >= min_epis_dur
-    AND (min_epis_dur <= 0
-         OR (enr_start <= indexdt
-             AND indexdt + (min_epis_dur - 1) <= enr_end))
-    -- blackout must fit inside the episode
-    AND (blackout_per <= 0
-         OR date_diff('day', indexdt, episodeenddt) - blackout_per >= 0)
-    -- minimum days of supply within the episode
-    AND (min_days_supp <= 0 OR episode_rxsup >= min_days_supp)
-    AND indexdt <= episodeenddt
-    -- The index claim must fall INSIDE the query period. SAS reports
-    -- this as its own attrition step — "Episode-defining index claims
-    -- must be during the query period" — and on the study compared it
-    -- removes 8,450 of 10,270 episodes for a single cohort, by far the
-    -- largest single exclusion.
-    --
-    -- Nothing here applied it. Claims are extracted from
-    -- start_date MINUS the widest lookback, so that a covariate or
-    -- washout window can see history; without this filter those
-    -- lookback claims could themselves become index dates.
+    -- SAS deletes these from _MasterEpisode before counting: an index
+    -- date after the (death-truncated) end of enrollment
+    indexdt <= episodeenddt
+    -- The index claim must fall INSIDE the query period (SAS's level 12,
+    -- "Episode-defining index claims must be during the query period").
+    -- Claims are extracted from start_date MINUS the widest lookback, so
+    -- that a covariate or washout window can see history; without this
+    -- filter those lookback claims could themselves become index dates.
     AND indexdt BETWEEN DATE '{start_date}' AND DATE '{end_date}';
+
+CREATE OR REPLACE TABLE ptsmasterlist AS
+SELECT * EXCLUDE (min_enr_days_met, min_enr_aft_met, min_day_sup_met,
+                  min_epi_dur_met, post_blackout_met)
+FROM episode_criteria
+WHERE min_enr_days_met AND min_enr_aft_met AND min_day_sup_met
+  AND min_epi_dur_met AND post_blackout_met;

@@ -38,17 +38,23 @@ WITH base AS (
         -- numdispensing is the count of same-day-collapsed claims that
         -- formed the index dispensing; SAS's RawDisp is the raw claim
         -- count and AdjustedDisp the post-stockpiling count.
-        c.numdispensing                               AS rawdisp,
-        1                                             AS adjusteddisp,
+        -- counted once, with supply and amount, in 60_followup.sql
+        c.episode_rawdisp                             AS rawdisp,
+        c.episode_adjusteddisp                        AS adjusteddisp,
         -- clipped to the episode window; see 60_followup.sql
         c.episode_totrxsup                            AS totrxsup,
         c.episode_totrxamt                            AS totrxamt,
         c.numevents                                   AS numevents,
         c.has_event                                   AS hadevent,
-        c.person_days                                 AS followuptime,
+        -- the master list's value, which matches SAS: max(0, min(episode
+        -- end, enrolment end, event) - index - blackout - at-risk start + 1).
+        -- person_days, summed here before, omits those adjustments
+        c.followuptime                                AS followuptime,
         -- time from index to the end of available data, which is what
         -- SAS calls timetocensor
-        span_days(c.indexdt, c.dataavail_dt)          AS timetocensor{covar_base}
+        -- likewise one definition: min(enrolment end, death, query end,
+        -- DP end) - index + 1, not a span to the data-availability date
+        c.timetocensor                                AS timetocensor{covar_base}
     FROM cohort_final c
 )
 SELECT
@@ -69,7 +75,7 @@ SELECT
     sum(b.rawdisp)                                     AS rawcodecount,
     sum(b.totrxsup)                                    AS daysupp,
     sum(b.totrxamt)                                    AS amtsupp,
-    sum(b.numevents)                                   AS all_events,
+    coalesce(sum(b.numevents), 0)                      AS all_events,
     sum(b.hadevent)                                    AS eps_wevents,
     sum(b.followuptime)                                AS followuptime,
     sum(b.timetocensor)                                AS timetocensor

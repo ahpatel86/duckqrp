@@ -10,7 +10,28 @@ on **dataset name**. A plausible-looking rename is a breakage, not a
 cosmetic difference. Every msoc output is therefore either named exactly
 as SAS names it, or carries a `note` in `manifest.json` saying why not.
 
-### `attrition` — column names and units corrected
+### `attrition` — SAS's funnel (current)
+
+`attrition` now reproduces SAS's table (`ms_attrition.sas`): 27 levels
+per cohort — members at 1-6, episodes at 7-24, final members at 27 —
+with SAS's wording and `claim_level`, blank rows for steps a study does
+not use, and `18.n` rows naming each inclusion/exclusion condition.
+Columns are `group level claim_level descr remaining excluded`: the order
+in SAS's actual `r01_attrition.sas7bdat`, which differs from the order
+the macro assembles them in (cited below).
+
+Each count follows SAS's definition and the episode steps count the same
+flags the cohort is built from (`episode_criteria`, inclusion,
+`episode_hoi`), so level 24 is always the final cohort. On wp307 every
+level matches SAS in all 40 cohorts; closing levels 7 and 12 meant
+shaving dispensings to enrollment before and after stockpiling, as SAS
+does (`30_exposure.sql`). The definitions, and what is
+not yet verified, are in `docs/ATTRITION_PLAN.md`.
+
+### `attrition` — column names and units corrected (superseded)
+
+*Historical: the design below was replaced by SAS's funnel, above.*
+
 
 SAS emits `group level descr claim_level remaining excluded`
 (`ms_attrition_cidacompute.sas:104-115`). This was

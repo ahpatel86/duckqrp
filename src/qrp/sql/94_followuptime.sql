@@ -1,146 +1,72 @@
--- =====================================================================
--- 94_followuptime.sql — msoc.<runid>_followuptime_cida
+-- ==================================================================
+-- Follow-up time table (msoc <runid>_followuptime_cida), as SAS builds
+-- it in ms_createcensortable.sas.
 --
--- Requested via USERSTRATA `tableid='t2followuptime'`
--- (ms_cidanum.sas:2826-2831). Same macro as censor_cida with different
--- parameters:
+-- Per-episode values come from their ONE definition each: followuptime,
+-- fupdays_value_cat and Censorcat_sort from the master list, the fup_*
+-- flags from episode_flags (60_followup.sql). This file used to recompute
+-- all of them; its copy drifted (follow-up days on some episodes) and
+-- hard-coded fup_spec to 0.
 --
---            censor                 followuptime
---   convar   timetocensor           followuptime
---   catvar   censdays_value_cat     fupdays_value_cat
---   flags    cens_elig cens_dth     adds fup_episend fup_spec fup_event
---            cens_dpend cens_qryend
+-- SAS reports the fup_* flags under cens_* names here: the rename at
+-- ms_finalizeptsmasterlist.sas:393 belongs to THIS output.
 --
--- Despite the docstring saying "every day of follow-up", rows are NOT
--- one per day. `fupdays_value_cat` buckets the follow-up duration, and
--- the table is grouped `by group level <censorstrat>` exactly as
--- censor_cida is (ms_createcensortable.sas:240-246).
---
--- Note the flag RENAME: dplocal carries `fup_*`, msoc carries `cens_*`
--- (the dplocalflaglist/msocflaglist pair at ms_cidanum.sas:2829-2830).
--- So the msoc column names are identical to censor_cida's, and only the
--- meaning of the underlying censor date differs.
--- =====================================================================
-
+-- Levels come from USERSTRATA (tableid t2followuptime): censdays_value
+-- groups by exact follow-up days; censdays_value_cat by SAS's category,
+-- which brings censorcat_sort with it (lines 63-66), with values from
+-- fupdays_value_cat (line 227). Shell rows square the table (see ep).
+-- Other level variables stratify as in
+-- t2_cida. Without USERSTRATA the table is still produced, unstratified,
+-- at level 1.
+-- ==================================================================
 CREATE OR REPLACE TABLE followuptime AS
-WITH censored AS (
-    SELECT
-        c.cohortgrp,
-        c.patid,
-        c.indexdt,
-        c.episode,
-        c.agegroup,
-        c.sex,
-        c.race,
-        c.hispanic,
-        year(c.indexdt)::VARCHAR AS index_year,
-        cfg.blackout_per,
-        cfg.at_risk_start,
-        cfg.max_epis_dur,
-        c.origepisenddt,
-        c.deathdt,
-        c.enr_end,
-        -- For FOLLOWUPTIME the censor date is the earliest of episode
-        -- end, disenrollment and the event — NOT the censoring date
-        -- used by censor_cida, which ignores the event and uses the
-        -- query/DP end instead (ms_finalizeptsmasterlist.sas:312).
-        least(c.episodeenddt, c.enr_end,
-              coalesce(c.eventdt, DATE '9999-12-31'))  AS censor_dt,
-        c.eventdt,
-        -- followuptime = Max(0, censor_dt - IndexDt - BLACKOUTPER
-        --                       - ATRISKSTART + 1)   (line 300)
-        greatest(0,
-            date_diff('day', c.indexdt,
-                      least(c.episodeenddt, c.enr_end,
-                            coalesce(c.eventdt, DATE '9999-12-31')))
-            - cfg.blackout_per - cfg.at_risk_start + 1
-        )                                             AS followuptime
+WITH ep AS (
+    SELECT c.cohortgrp, c.agegroup, c.sex, c.race, c.hispanic,
+           year(c.indexdt)::VARCHAR AS index_year,
+           c.followuptime, c."Censorcat_sort" AS censorcat_sort, c.fupdays_value_cat,
+           f.fup_elig, f.fup_dpend, f.fup_episend, f.fup_spec, f.fup_event,
+           1 AS epi
     FROM cohort_final c
-    JOIN cfg_cohort cfg ON cfg.cohortgrp = c.cohortgrp
-),
-flagged AS (
-    SELECT
-        *,
-        -- Censored due to enrollment. Reset when the episode was
-        -- truncated by death and enrollment did not end on the death
-        -- date — `enrend_death='C'` (lines 147-151). This package
-        -- truncates enr_end at death, so the two coincide and the reset
-        -- is expressed as "not also a death".
-        CASE WHEN censor_dt = enr_end
-              AND NOT (deathdt IS NOT NULL AND censor_dt = deathdt)
-             THEN 1 ELSE 0 END                        AS fup_elig,
-        CASE WHEN deathdt IS NOT NULL AND censor_dt = deathdt
-             THEN 1 ELSE 0 END                        AS fup_dth,
-        CASE WHEN censor_dt = DATE '{end_date}'
-             THEN 1 ELSE 0 END                        AS fup_qryend,
-        CASE WHEN censor_dt = DATE '{censor_date}'
-              AND DATE '{censor_date}' <> DATE '{end_date}'
-             THEN 1 ELSE 0 END                        AS fup_dpend,
-        -- Episode ended of its own accord, either at its natural end or
-        -- at the maximum episode duration (lines 349-350).
-        CASE WHEN censor_dt = origepisenddt
-               OR (max_epis_dur >= 0
-                   AND censor_dt = indexdt + max_epis_dur - 1)
-             THEN 1 ELSE 0 END                        AS fup_episend,
-        -- Requester-defined truncation. `trunkdt` is the mock
-        -- surveillance IndexLookEndDt, which this package does not
-        -- model, so this is structurally 0 rather than omitted — the
-        -- column must exist for the output to match.
-        0                                             AS fup_spec,
-        CASE WHEN eventdt IS NOT NULL AND censor_dt = eventdt
-             THEN 1 ELSE 0 END                        AS fup_event
-    FROM censored
-),
-bucketed AS (
-    SELECT
-        f.*,
-        -- fupdays_value_cat: the follow-up duration bucketed by the
-        -- study's FOLLOWUPTIME_OUTPUT_CAT cut points
-        -- (ms_createcensortable.sas:54). With no cut points supplied
-        -- the value is reported ungrouped, which is what SAS does when
-        -- the parameter is blank.
-        CAST(f.followuptime AS VARCHAR) AS fupdays_value_cat
-    FROM flagged f
+    JOIN episode_flags f
+      ON f.cohortgrp = c.cohortgrp AND f.patid = c.patid AND f.indexdt = c.indexdt
+    UNION ALL
+    -- SAS's squared shell (ms_createcensortable.sas:170-185): one row per
+    -- cohort in the cohort file, episode indicator 0, censdays_value = 1,
+    -- crossed with every follow-up category. So every cohort has a row at
+    -- 1 day and every category, with 0 episodes where none occur. The
+    -- categories are the master list's buckets (62_mstr_wide.sql); both
+    -- should come from the study's FOLLOWUPTIME_OUTPUT_CAT (follow-up).
+    SELECT k.cohortgrp, NULL, NULL, NULL, NULL, NULL,
+           1, cat.sort, cat.label, 0, 0, 0, 0, 0, 0
+    FROM cfg_cohort k
+    CROSS JOIN (VALUES ('0-90', 1), ('91-180', 2), ('181+', 3)) cat(label, sort)
 )
 SELECT
-    b.cohortgrp              AS "group",
-    lv.level_id              AS level,
-    b.fupdays_value_cat,
-    -- Stratum values are NULL for a level that does not stratify on
-    -- them — the same shape t2_cida produces.
-    -- ALL the USERSTRATA levelvars, not just two. `censorstrat` is
-    -- the levelvars (ms_cidanum.sas:123), so race, hispanic and year
-    -- stratify this table exactly as agegroup and sex do. Honouring
-    -- only agegroup and sex meant a level asking for `year` got the
-    -- UNSTRATIFIED totals labelled as that level — every level came
-    -- back with identical row counts. The production study seen
-    -- stratifies on `year`.
-    CASE WHEN lv.has_agegroup THEN b.agegroup END AS agegroup,
-    CASE WHEN lv.has_sex      THEN b.sex      END AS sex,
-    CASE WHEN lv.has_race     THEN b.race     END AS race,
-    CASE WHEN lv.has_hispanic THEN b.hispanic END AS hispanic,
-    CASE WHEN lv.has_year     THEN b.index_year END AS "year",
-    count(*)                 AS episodes,
-    -- msoc carries the cens_* names even for followuptime; the rename
-    -- is in the macro call, not in the data.
-    sum(b.fup_elig)          AS cens_elig,
-    sum(b.fup_dth)           AS cens_dth,
-    sum(b.fup_qryend)        AS cens_qryend,
-    sum(b.fup_dpend)         AS cens_dpend,
-    sum(b.fup_episend)       AS cens_episend,
-    sum(b.fup_spec)          AS cens_spec,
-    sum(b.fup_event)         AS cens_event
-FROM bucketed b
--- USERSTRATA is optional; SAS still produces the table, unstratified,
--- at level 1 (`_censorlevels` always has a row). Without this fallback
--- the CROSS JOIN yields NOTHING for a study that defines no strata —
--- an msoc output silently absent rather than unstratified.
+    ep.cohortgrp                                            AS "group",
+    lv.level_id                                             AS level,
+    CASE WHEN lv.has_censdays_value THEN ep.followuptime END       AS censdays_value,
+    CASE WHEN lv.has_censdays_cat   THEN ep.censorcat_sort END     AS censorcat_sort,
+    CASE WHEN lv.has_censdays_cat   THEN ep.fupdays_value_cat END  AS censdays_value_cat,
+    CASE WHEN lv.has_agegroup THEN ep.agegroup END          AS agegroup,
+    CASE WHEN lv.has_sex      THEN ep.sex END               AS sex,
+    CASE WHEN lv.has_race     THEN ep.race END              AS race,
+    CASE WHEN lv.has_hispanic THEN ep.hispanic END          AS hispanic,
+    CASE WHEN lv.has_year     THEN ep.index_year END        AS "year",
+    sum(ep.epi)                                             AS episodes,
+    sum(ep.fup_elig)                                        AS cens_elig,
+    sum(ep.fup_dpend)                                       AS cens_dpend,
+    sum(ep.fup_episend)                                     AS cens_episend,
+    sum(ep.fup_spec)                                        AS cens_spec,
+    sum(ep.fup_event)                                       AS cens_event
+FROM ep
 CROSS JOIN (
-    SELECT level_id, has_agegroup, has_sex, has_race,
-           has_hispanic, has_year FROM cfg_strata WHERE tableid = 't2followuptime'
+    SELECT level_id, has_agegroup, has_sex, has_race, has_hispanic, has_year,
+           has_censdays_value, has_censdays_cat
+    FROM cfg_strata WHERE tableid = 't2followuptime'
     UNION ALL
-    SELECT '1', FALSE, FALSE, FALSE, FALSE, FALSE
+    -- no USERSTRATA: unstratified, at level 1 (SAS's _censorlevels)
+    SELECT '1', FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE
     WHERE NOT EXISTS (SELECT 1 FROM cfg_strata)
 ) lv
 GROUP BY ALL
-ORDER BY 1, 2, 3;
+ORDER BY 1, 2, 3, 4;

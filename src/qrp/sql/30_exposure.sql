@@ -150,8 +150,16 @@ WITH sameday AS (
         x.stockgroup,
         x.patid,
         x.adate,
-        sum(x.rxsup)::INTEGER AS rxsup,
-        sum(x.rxamt)          AS rxamt,
+        -- SHAVED to enrollment first, as SAS does before stockpiling
+        -- (ms_cidanum.sas:1408, ms_shaveoutside KeepPartBf=N shaverx=Y): a
+        -- fill must START inside one of the cohort's enrollment spans
+        -- (others are dropped), and a supply running past the span's end
+        -- keeps only the days up to it, its amount prorated. Chaining the
+        -- raw fills let a fill in an enrollment gap, or days beyond a
+        -- span, push later fills to dates SAS never has.
+        sum(least(x.rxsup, date_diff('day', x.adate, e.enr_end) + 1))::INTEGER AS rxsup,
+        sum(x.rxamt * least(x.rxsup, date_diff('day', x.adate, e.enr_end) + 1)
+            / x.rxsup)                                                      AS rxamt,
         count(*)::INTEGER     AS numdispensing
     -- DISPENSINGS ONLY. SAS stockpiles `_ITDrugs`
     -- (ms_cidanum.sas:1545); procedure- and diagnosis-sourced exposure
@@ -161,6 +169,9 @@ WITH sameday AS (
     -- J-code administrations became a six-day run.
     FROM exposure_claims x
     JOIN cfg_cohort cc ON cc.cohortgrp = x.cohortgrp
+    JOIN enrollment_spans e
+      ON e.enr_cfg_id = cc.enr_cfg_id AND e.patid = x.patid
+     AND x.adate BETWEEN e.enr_start AND e.enr_end
     WHERE x.codecat = 'RX'
       -- A dispensing joins the stockpile chain only if its SUPPLY
       -- still runs at the start of the required prior-enrolment
@@ -214,6 +225,21 @@ solved AS (
         ) AS running_anchor
     FROM running
 )
+-- RE-SHAVED to enrollment after stockpiling, as SAS does
+-- (ms_cidanum.sas:1641-1650, "Need to reshave because Stockpiling may have
+-- pushed claims outside enrollment period"): a record PUSHED to a start
+-- outside the member's spans is dropped, and one whose supply now runs
+-- past its span's end is trimmed there, amount prorated. Unshaved, a pushed
+-- supply running through an enrollment gap could block the washout of a
+-- later index date that SAS accepts.
+SELECT r.cohortgrp, r.stockgroup, r.patid, r.adate,
+       least(r.expiredt, e.enr_end)                                       AS expiredt,
+       r.orig_adate,
+       (date_diff('day', r.adate, least(r.expiredt, e.enr_end)) + 1)::INTEGER AS rxsup,
+       r.rxamt * (date_diff('day', r.adate, least(r.expiredt, e.enr_end)) + 1)
+           / r.rxsup                                                      AS rxamt,
+       r.numdispensing
+FROM (
 SELECT
     cohortgrp,
     stockgroup,
@@ -227,6 +253,11 @@ SELECT
     rxamt,
     numdispensing
 FROM solved
+) r
+JOIN cfg_cohort cc ON cc.cohortgrp = r.cohortgrp
+JOIN enrollment_spans e
+  ON e.enr_cfg_id = cc.enr_cfg_id AND e.patid = r.patid
+ AND r.adate BETWEEN e.enr_start AND e.enr_end
 
 UNION ALL
 

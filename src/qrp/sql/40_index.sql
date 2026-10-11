@@ -32,8 +32,20 @@ CREATE OR REPLACE TABLE index_candidates AS
 WITH deduped AS (
     -- SAS: proc sort nodupkey by patid adate descending expiredt.
     -- QUALIFY expresses "keep the longest supply per patient-day".
-    SELECT *
-    FROM stockpiled
+    SELECT s.* EXCLUDE (enr_cfg_id)
+    FROM (SELECT st.*, c.enr_cfg_id FROM stockpiled st
+          JOIN cfg_cohort c USING (cohortgrp)) s
+    -- Only records that START inside one of the member's qualifying
+    -- enrollment spans: SAS runs the washout on _groupindex, which
+    -- ms_shaveoutside (KeepPartBf=N) has already stripped of every record
+    -- starting before or between spans. A fill dated in an enrollment gap
+    -- therefore cannot block a later index date. Counting such fills here
+    -- kept a few index dates out of the cohort's candidates altogether,
+    -- where SAS counts them at attrition level 12 and excludes them at 16.
+    -- (a semi join on the span range, not a correlated EXISTS: cheaper)
+    SEMI JOIN enrollment_spans e
+           ON e.enr_cfg_id = s.enr_cfg_id AND e.patid = s.patid
+          AND s.adate BETWEEN e.enr_start AND e.enr_end
     -- Total order: expiredt DESC is the SAS rule, but the remaining
     -- columns break residual ties deterministically so the same input
     -- always yields the same row.

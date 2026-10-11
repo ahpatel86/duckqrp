@@ -31,6 +31,34 @@ CREATE OR REPLACE MACRO age_years(birth_date, as_of) AS
     - CASE WHEN (month(as_of), day(as_of)) < (month(birth_date), day(birth_date))
            THEN 1 ELSE 0 END;
 
+-- 1 if 29 February of year y falls in (lo, hi], else 0.
+CREATE OR REPLACE MACRO leap_day_in(lo, hi, y) AS
+    CASE WHEN (y % 4 = 0 AND (y % 100 <> 0 OR y % 400 = 0))
+          AND CAST(make_date(y, 3, 1) - INTERVAL 1 DAY AS DATE) > lo
+          AND CAST(make_date(y, 3, 1) - INTERVAL 1 DAY AS DATE) <= hi
+         THEN 1 ELSE 0 END;
+
+-- Age as SAS reports it: yrdif(birth_date, date, 'AGE'). Whole years,
+-- plus the days since the last birthday over 365 — always 365, with any
+-- 29 February in between NOT counted. (Dividing by the age year's actual
+-- length, 365 or 366, differed from SAS on 8,440 of 31,464 wp307
+-- episodes; this matches.) age_years (whole years) still drives age
+-- groups and age criteria; this is the reported value only.
+CREATE OR REPLACE MACRO age_yrdif(birth_date, as_of) AS
+    age_years(birth_date, as_of)
+    + (date_diff('day',
+                 CAST(birth_date + to_years(age_years(birth_date, as_of)) AS DATE),
+                 as_of)
+       - leap_day_in(CAST(birth_date + to_years(age_years(birth_date, as_of)) AS DATE),
+                     as_of,
+                     year(CAST(birth_date + to_years(age_years(birth_date, as_of)) AS DATE)))
+       - CASE WHEN year(as_of)
+                   <> year(CAST(birth_date + to_years(age_years(birth_date, as_of)) AS DATE))
+              THEN leap_day_in(CAST(birth_date + to_years(age_years(birth_date, as_of)) AS DATE),
+                               as_of, year(as_of))
+              ELSE 0 END
+      ) / 365.0;
+
 -- Exact age in a named unit. Age strata are declared as data (see
 -- age_strata table) rather than parsed from a space-delimited macro
 -- string at runtime.

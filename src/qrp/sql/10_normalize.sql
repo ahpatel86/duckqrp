@@ -157,13 +157,31 @@ SELECT r.* REPLACE (
 FROM _cdm_diagnosis_raw r
 LEFT JOIN _ip_days i ON i.patid = r.patid AND i.day = r.adate;
 
+-- Deaths, as SAS extracts them (ms_extractdeaths.sas): from the death
+-- table AND from encounters discharged as expired (discharge_status
+-- 'EX'), dated at discharge or, without one, admission. When a patient
+-- has both, the death table's date is kept — even if it is later. These
+-- deaths drive censoring, so reading only the death table under-censored
+-- any patient who died in hospital without a death-table record.
 CREATE OR REPLACE TABLE deaths AS
-SELECT
-    CAST(patid AS BIGINT) AS patid,
-    min(CAST(deathdt AS DATE)) AS deathdt
-FROM {read_death}
-WHERE deathdt IS NOT NULL
-GROUP BY 1;
+WITH from_table AS (
+    SELECT CAST(patid AS BIGINT) AS patid, min(CAST(deathdt AS DATE)) AS deathdt
+    FROM {read_death}
+    WHERE deathdt IS NOT NULL
+    GROUP BY 1
+),
+from_encounters AS (
+    SELECT CAST(patid AS BIGINT) AS patid,
+           min(coalesce(CAST({opt_ddate} AS DATE), CAST(adate AS DATE))) AS deathdt
+    FROM {read_encounter}
+    WHERE upper(trim(CAST({opt_discharge_status} AS VARCHAR))) = 'EX'
+      AND adate IS NOT NULL
+    GROUP BY 1
+)
+SELECT patid, deathdt FROM from_table
+UNION ALL
+SELECT e.patid, e.deathdt FROM from_encounters e
+WHERE NOT EXISTS (SELECT 1 FROM from_table t WHERE t.patid = e.patid);
 
 -- Procedures. Real input files use codecat='PX' freely — 150 of 1,124
 -- cohort codes, 80 covariate codes and 30 inclusion codes in the study

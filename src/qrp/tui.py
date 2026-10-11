@@ -26,7 +26,7 @@ from typing import ClassVar
 
 from textual import on, work
 from textual.app import App, ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import (
@@ -98,7 +98,7 @@ class QRPApp(App):
     # path Input has focus. Plain letters would be swallowed as text —
     # found by driving the app headlessly, which is exactly the class of
     # bug that never shows up in a manual click-through.
-    BINDINGS: ClassVar[list[Binding]] = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+r", "run", "Run", priority=True),
         Binding("ctrl+t", "inspect", "Inspect", priority=True),
         Binding("escape", "cancel", "Cancel", priority=True),
@@ -360,8 +360,8 @@ class QRPApp(App):
         for table_id in ("stages", "results"):
             self.query_one(f"#{table_id}", DataTable).clear()
 
-        mem = self._field("memory") or ""
-        mem = None if mem.lower() in ("", "auto") else mem
+        raw_mem = self._field("memory") or ""
+        mem = None if raw_mem.lower() in ("", "auto") else raw_mem
         threads = self._choice("threads")
         tempdir = self._field("tempdir") or None
 
@@ -487,7 +487,7 @@ class QRPApp(App):
                 self.log_line(f"[yellow]{ev.hint}[/yellow]")
             self._empty_reason = ev.reason
             try:
-                self.query_one("TabbedContent").active = "tab_log"
+                self.query_one("TabbedContent", TabbedContent).active = "tab_log"
             except Exception:
                 pass
 

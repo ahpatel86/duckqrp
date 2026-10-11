@@ -14,6 +14,8 @@ pandas and numpy and failed for every base-install user.
 
 from __future__ import annotations
 
+from .engine import first_value
+
 from pathlib import Path
 
 import duckdb
@@ -87,9 +89,9 @@ def show(out: str | Path, table: str | None = None, limit: int = 50,
         for name in tables:
             src = _source(out, name)
             try:
-                n = con.execute(
+                n = first_value(con.execute(
                     f"SELECT count(*) FROM read_parquet('{src}')"
-                ).fetchone()[0]
+                ).fetchone())
                 lines.append(f"  {name:<24}{n:>14,} rows")
             except Exception:
                 lines.append(f"  {name:<24}{'unreadable':>14}")
@@ -111,9 +113,9 @@ def show(out: str | Path, table: str | None = None, limit: int = 50,
         # this must NOT be passed through unchanged. See
         # docs/SECURITY.md.
         clause = f"WHERE {where}" if where else ""
-        total = con.execute(
+        total = first_value(con.execute(
             f"SELECT count(*) FROM read_parquet('{src}') {clause}"
-        ).fetchone()[0]
+        ).fetchone())
         cur = con.execute(
             f"SELECT * FROM read_parquet('{src}') {clause} LIMIT {int(limit)}"
         )

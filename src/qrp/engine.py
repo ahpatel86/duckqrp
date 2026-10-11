@@ -103,6 +103,16 @@ _BULK_LOAD_ROWS = 5_000
 _NULL_TOKEN = "\\N@qrp"
 
 
+
+def first_value(row: tuple | None, what: str = "query") -> Any:
+    """The first column of a row that a query must return: count(*),
+    current_setting(), an aggregate. Raises a clear error instead of
+    `'NoneType' object is not subscriptable` if it ever does not."""
+    if row is None:
+        raise RuntimeError(f"{what} returned no row")
+    return row[0]
+
+
 @dataclass
 class Engine:
     """Owns the DuckDB connection and the stage log."""
@@ -224,9 +234,9 @@ class Engine:
     def _parse_limit(self) -> int:
         """Resolve the effective memory limit to bytes."""
         try:
-            raw = str(self.con.execute(
+            raw = str(first_value(self.con.execute(
                 "SELECT current_setting('memory_limit')"
-            ).fetchone()[0]).strip()
+            ).fetchone(), "current_setting('memory_limit')")).strip()
         except Exception:
             return 0
         units = {"KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4,
@@ -264,11 +274,13 @@ class Engine:
         used = spilled = 0
         if self._monitor is not None:
             try:
-                used, spilled = self._monitor.execute(
+                row = self._monitor.execute(
                     "SELECT coalesce(sum(memory_usage_bytes), 0), "
                     "       coalesce(sum(temporary_storage_bytes), 0) "
                     "FROM duckdb_memory()"
                 ).fetchone()
+                if row is not None:          # otherwise both stay 0
+                    used, spilled = row
             except Exception:
                 pass
         self.peak_memory_bytes = max(self.peak_memory_bytes, int(used))
@@ -361,7 +373,8 @@ class Engine:
         self.con.execute(self.read_sql(name))
 
     def count(self, table: str) -> int:
-        return int(self.con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+        return int(first_value(
+            self.con.execute(f"SELECT count(*) FROM {table}").fetchone(), f"count of {table}"))
 
     def shape(self, name: str) -> tuple[int, int]:
         """(rows, columns) for a table or view.
@@ -427,7 +440,7 @@ class Engine:
         import csv
         import tempfile
 
-        spec = ", ".join(f"'{c}': '{t}'" for c, t in zip(cols, types))
+        spec = ", ".join(f"'{c}': '{t}'" for c, t in zip(cols, types, strict=False))
         fd, path = tempfile.mkstemp(suffix=".csv", prefix="qrp_cfg_")
         try:
             with os.fdopen(fd, "w", newline="") as fh:

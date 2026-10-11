@@ -40,6 +40,8 @@ STAGE_TABLES: dict[str, tuple[str, ...]] = {
     "CIDA": ("t2_cida", "numcounts", "denomcounts"),
     "CODEDIST": ("distindex", "distindexmap"),
     "FOLLOWUPTIME": ("followuptime",),
+    "BASELINE": ("baseline",),
+    "MFU": ("mfu",),
 }
 
 # Columns excluded from parity comparison: derived diagnostics that have
