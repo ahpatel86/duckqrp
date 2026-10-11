@@ -1,0 +1,407 @@
+{
+ "QRP_PARAMETERS": [
+  {
+   "parameter": "runid",
+   "run1": "real"
+  },
+  {
+   "parameter": "type",
+   "run1": "2"
+  },
+  {
+   "parameter": "startdate",
+   "run1": 18993
+  },
+  {
+   "parameter": "enddate",
+   "run1": 23375
+  },
+  {
+   "parameter": "censordate",
+   "run1": 23375
+  },
+  {
+   "parameter": "cohortfile",
+   "run1": "cf"
+  },
+  {
+   "parameter": "type2file",
+   "run1": "t2"
+  },
+  {
+   "parameter": "cohortcodes",
+   "run1": "cc"
+  },
+  {
+   "parameter": "userstrata",
+   "run1": "us"
+  }
+ ],
+ "cf": [
+  {
+   "cohortgrp": "drug_a",
+   "enrollmentnum": 1,
+   "coverage": "MD",
+   "enrolgap": 45,
+   "chartres": "N",
+   "enrdays": 183,
+   "agestrat": "18-44 45-64 65-74 75+",
+   "reqdaysaftind": 0
+  },
+  {
+   "cohortgrp": "drug_b",
+   "enrollmentnum": 1,
+   "coverage": "MD",
+   "enrolgap": 45,
+   "chartres": "N",
+   "enrdays": 183,
+   "agestrat": "18-44 45-64 65-74 75+",
+   "reqdaysaftind": 0
+  }
+ ],
+ "t2": [
+  {
+   "group": "drug_a",
+   "t2washper": 183,
+   "point": "N",
+   "episodegap": 15,
+   "episodegaptype": "F",
+   "expextper": 0,
+   "minepisdur": 1,
+   "maxepisdur": 365,
+   "mindaysupp": 0,
+   "t2atriskstart": 0,
+   "blackoutper": 0,
+   "t2fupwashper": 183,
+   "eventcount": 1,
+   "reqdaysaftepi": 0,
+   "censor_dth": "Y"
+  },
+  {
+   "group": "drug_b",
+   "t2washper": 183,
+   "point": "N",
+   "episodegap": 30,
+   "episodegaptype": "F",
+   "expextper": 0,
+   "minepisdur": 1,
+   "maxepisdur": 365,
+   "mindaysupp": 0,
+   "t2atriskstart": 0,
+   "blackoutper": 0,
+   "t2fupwashper": 183,
+   "eventcount": 1,
+   "reqdaysaftepi": 0,
+   "censor_dth": "Y"
+  }
+ ],
+ "cc": [
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00054327099"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "59310057922"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "60505082901"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00173068220"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00781261305"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "59762306001"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00406035705"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "55111015810"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00186504031"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "59746000103"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "68180051403"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00781185220"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "68180012202"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "50383070016"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "53746027205"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00088221905"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "59310057920"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00093310905"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00173069600"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "DEF",
+   "code": "00310075190"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "I10"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "4019"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "2724"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "25000"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "E119"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "42731"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "I4891"
+  },
+  {
+   "group": "drug_a",
+   "indexcriteria": "EVENT",
+   "code": "I509"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00172208380"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "68180051503"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "68180098003"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00172541211"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "68180051303"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00093007401"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00085128801"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00093714618"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00603459315"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "65862042005"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "68180047903"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "65162062711"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "50111099001"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00000000000"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00052027303"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "53885024510"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "68180098103"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00555901658"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00555901858"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "DEF",
+   "code": "00093317431"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "I10"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "4019"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "2724"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "25000"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "E119"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "42731"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "I4891"
+  },
+  {
+   "group": "drug_b",
+   "indexcriteria": "EVENT",
+   "code": "I509"
+  }
+ ],
+ "us": [
+  {
+   "tableid": "t2cida",
+   "levelid": "1",
+   "levelvars": ""
+  },
+  {
+   "tableid": "t2cida",
+   "levelid": "2",
+   "levelvars": "agegroup"
+  },
+  {
+   "tableid": "t2cida",
+   "levelid": "3",
+   "levelvars": "agegroup*sex"
+  },
+  {
+   "tableid": "t2cida",
+   "levelid": "4",
+   "levelvars": "sex race"
+  },
+  {
+   "tableid": "t2its",
+   "levelid": "9",
+   "levelvars": "sex"
+  }
+ ]
+}

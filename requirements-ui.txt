@@ -1,0 +1,6 @@
+# NOT a lockfile — textual is a floor, not a pin. Renamed from
+# requirements-ui.lock, which promised more than it delivered:
+# the DuckDB base below is pinned, this is not. Reported in review.
+# Optional: terminal UI. Not needed for CLI-only operation.
+-r requirements.lock
+textual>=0.80
