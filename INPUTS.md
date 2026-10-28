@@ -71,10 +71,38 @@ feature area: CIDA, covariates, geography, inclusion, labs, MFU, risk
 scores, utilization and SCDM columns. A test loads every file in
 `study/` so they cannot silently stop working.
 
-### Recognised but NOT implemented
+### `STOCKPILINGFILE`
 
-`STOCKPILINGFILE`. Stockpiling uses SAS's defaults. If your study
-supplies one, tell me and I'll wire it.
+How each cohort's dispensings are stockpiled (SAS: `ms_stockpiling.sas`).
+One row per cohort **and** stockgroup; a stockgroup without a row keeps
+SAS's defaults, which is also what a study without the file gets.
+
+```json
+"stockpilingfile": [
+  {"group": "lisinopril", "stockgroup": "lis", "sameday": "ax",
+   "suprange": "1-90", "amtrange": "0<-HIGH", "percentdays": 0.25}
+]
+```
+
+| column | meaning | default |
+|---|---|---|
+| `group` | the cohort | required |
+| `stockgroup` | the drug group within it, as named in the cohort's codes (`stockgroup` column) | **required**, as in SAS |
+| `sameday` | how same-day dispensings combine: 1st letter for days supplied, 2nd for amount — `a` sum, `n` min, `x` max, `m` mean | `aa` |
+| `suprange` | allowed days supplied, in SAS range syntax: `1-90`, `0<-HIGH` (above 0), `30-<90` (below 90); several pieces separated by spaces. A dispensing outside every piece is excluded | `0<-HIGH` |
+| `amtrange` | the same, for the amount dispensed | `0<-HIGH` |
+| `percentdays` | a refill overlapping the previous supply is pushed forward only if the overlap is at most this **fraction** of the previous days supplied (0.25 = 25%). Above it, the refill keeps its own date, starting a new sequence, and the previous one is cut short the day before, its amount prorated | empty: always pushed |
+
+Notes:
+
+* A stockgroup that the cohort's codes do not use is an error, not
+  ignored. A stockgroup used only by **covariates** is accepted with a
+  warning: covariate stockpiling settings are not applied yet.
+* A `sameday` letter other than `a`, `n`, `x`, `m` falls back to `a`, as
+  in SAS, with a warning. `percentdays` above 1 is warned about: it is a
+  fraction, so it would let every overlap be pushed.
+* A mean (`m`) supply is rounded to whole days; SAS carries the
+  fraction.
 
 ### One gap worth naming
 

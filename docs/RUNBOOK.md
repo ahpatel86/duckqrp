@@ -24,7 +24,7 @@ Nothing is modified in your source data. It is opened read-only.
 
 ## One-time setup
 
-You need Python 3.10 or newer:
+You need Python 3.11 or newer (DuckDB 2.0 requires it):
 
 ```bash
 python3 --version

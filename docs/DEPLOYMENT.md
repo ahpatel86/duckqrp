@@ -102,7 +102,7 @@ cache or silently reaches the network.
 
 ```
 qrp-duckdb   0.1.0 (a51bd9bc)
-duckdb       1.5.5
+duckdb       2.0.0
 textual      8.2.8
 python       3.12.3
 platform     Linux-6.18.44-fc-v32-x86_64-with-glibc2.39
@@ -213,3 +213,16 @@ Do not send patient-level output. Nothing in the three items above
 contains any: `doctor` uses generated data, and the run log records
 counts and timings only. Database errors have quoted values redacted
 before they are logged, for exactly this reason.
+
+## DuckDB 2.0
+
+duckqrp requires DuckDB 2.0 (and so Python 3.11+). Against 1.5 it gives
+the same results — every count, date and flag identical; a few means and
+summed amounts differ only in their last binary digits (< 4e-15 relative)
+— and runs about 26% faster on the studies measured.
+
+One thing to know if you keep a persistent database file with `--db`: a
+file DuckDB 2.0 writes cannot be opened by DuckDB 1.5. Runs normally use
+an in-memory database and temporary spill files, which this does not
+affect. To share a database file with a 1.5 installation, open it with
+DuckDB's `storage_compatibility_version` set to `v1.5.0`.

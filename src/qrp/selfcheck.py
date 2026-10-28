@@ -23,6 +23,7 @@ import platform
 import sys
 import tempfile
 from pathlib import Path
+from .engine import fetch_one
 
 RELEASE = "0.1.0"
 
@@ -121,7 +122,7 @@ def _tiny_extract(out: Path) -> Path:
     def write(name: str, sql: str) -> None:
         (out / name).mkdir(exist_ok=True)
         con.execute(
-            f"COPY ({sql}) TO '{out / name / 'data.parquet'}' (FORMAT PARQUET)")
+            f"COPY ({sql}) TO '{out / name / 'data.parquet'}' (FORMAT PARQUET)").fetchall()
 
     write("demographic", """
         SELECT patid, DATE '1950-01-01' + CAST(random()*18000 AS INTEGER)
@@ -213,16 +214,16 @@ def doctor(keep: bool = False) -> int:
             episodes = eng.count("cohort_final")
             check("produced episodes", episodes > 0, f"got {episodes}")
 
-            row = eng.con.execute("""
+            row = fetch_one(eng.con.execute("""
                 SELECT count(*) FROM cohort_final
                 WHERE indexdt < enr_start OR episodeenddt > enr_end
-            """).fetchone()
+            """))
             bad = row[0] if row else -1
             check("episodes lie within enrollment", bad == 0, f"{bad} outside")
 
-            row = eng.con.execute(
+            row = fetch_one(eng.con.execute(
                 "SELECT count(*) FROM attrition WHERE excluded < 0"
-            ).fetchone()
+            ))
             neg = row[0] if row else -1
             check("attrition never increases", neg == 0)
         finally:

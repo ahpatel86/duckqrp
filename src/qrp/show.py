@@ -19,6 +19,7 @@ from .engine import first_value
 from pathlib import Path
 
 import duckdb
+from .engine import fetch_one
 
 def _manifest(out: Path) -> dict:
     """Read the manifest written by the SAS layout, if there is one.
@@ -89,9 +90,9 @@ def show(out: str | Path, table: str | None = None, limit: int = 50,
         for name in tables:
             src = _source(out, name)
             try:
-                n = first_value(con.execute(
+                n = first_value(fetch_one(con.execute(
                     f"SELECT count(*) FROM read_parquet('{src}')"
-                ).fetchone())
+                )))
                 lines.append(f"  {name:<24}{n:>14,} rows")
             except Exception:
                 lines.append(f"  {name:<24}{'unreadable':>14}")
@@ -113,9 +114,9 @@ def show(out: str | Path, table: str | None = None, limit: int = 50,
         # this must NOT be passed through unchanged. See
         # docs/SECURITY.md.
         clause = f"WHERE {where}" if where else ""
-        total = first_value(con.execute(
+        total = first_value(fetch_one(con.execute(
             f"SELECT count(*) FROM read_parquet('{src}') {clause}"
-        ).fetchone())
+        )))
         cur = con.execute(
             f"SELECT * FROM read_parquet('{src}') {clause} LIMIT {int(limit)}"
         )
@@ -211,7 +212,7 @@ def to_csv(out: str | Path, dest: str | Path,
             con.execute(
                 f"COPY (SELECT * FROM read_parquet('{src}')) "
                 f"TO '{target}' (FORMAT CSV, HEADER)"
-            )
+            ).fetchall()
             written.append(target)
     finally:
         con.close()

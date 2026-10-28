@@ -24,6 +24,7 @@ import pytest
 import qrp
 
 from qrp import Engine, load_study, run
+from qrp.engine import fetch_one
 
 STUDY = Path(__file__).resolve().parents[1] / "study" / "demo_full.json"
 DATA = Path("/tmp/qrp_data/100k")
@@ -147,9 +148,9 @@ def test_unused_stages_do_not_run(study):
 def test_dose_restriction_actually_excludes(study, baseline):
     """The dose path must remove rows, or it isn't being exercised."""
     assert study.any_dose
-    excluded = baseline.con.execute(
+    excluded = fetch_one(baseline.con.execute(
     "SELECT count(*) FROM dose_excluded"
-    ).fetchone()[0]
+    ))[0]
     assert excluded > 0, "dose restriction excluded nothing"
     # only the cohort that declares a limit may lose rows
     cohorts = {
@@ -176,10 +177,10 @@ def test_attrition_is_monotonic(baseline):
 
 
 def test_episodes_lie_within_enrollment(baseline):
-    bad = baseline.con.execute("""
+    bad = fetch_one(baseline.con.execute("""
         SELECT count(*) FROM cohort_final
         WHERE indexdt < enr_start OR episodeenddt > enr_end
-    """).fetchone()[0]
+    """))[0]
     assert bad == 0
 
 
@@ -187,18 +188,18 @@ def test_person_time_is_positive(baseline):
     # Uses the shared run: reads only, no config variation. Tests that
     # vary config still build their own engine — sharing state between
     # tests that mutate it is how a suite starts depending on order.
-    bad = baseline.con.execute(
+    bad = fetch_one(baseline.con.execute(
         "SELECT count(*) FROM cohort_final WHERE person_days <= 0"
-    ).fetchone()[0]
+    ))[0]
     assert bad == 0
 
 
 def test_events_fall_inside_the_at_risk_window(baseline):
-    bad = baseline.con.execute("""
+    bad = fetch_one(baseline.con.execute("""
         SELECT count(*) FROM cohort_final
         WHERE eventdt IS NOT NULL
           AND (eventdt < atriskindexdt OR eventdt > episodeenddt)
-    """).fetchone()[0]
+    """))[0]
     assert bad == 0
 
 
@@ -291,14 +292,14 @@ def test_dose_filter_precedes_pov1():
         s = load_study(REALISTIC)
     eng = Engine(verbose=False)
     run(s, DATA, engine=eng, verbose=False)
-    orphans = eng.con.execute("""
+    orphans = fetch_one(eng.con.execute("""
         SELECT count(*) FROM pov1 p
         LEFT JOIN index_candidates i
                ON i.cohortgrp = p.cohortgrp
               AND i.patid     = p.patid
               AND i.adate     = p.indexdt
         WHERE i.patid IS NULL
-    """).fetchone()[0]
+    """))[0]
     assert orphans == 0, "pov1 contains index dates the dose stage removed"
     eng.close()
 
@@ -392,12 +393,12 @@ def test_extension_autoload_is_disabled_by_default():
     try:
         for setting in ("autoinstall_known_extensions",
                         "autoload_known_extensions"):
-            val = eng.con.execute(
+            val = fetch_one(eng.con.execute(
                 f"SELECT current_setting('{setting}')"
-            ).fetchone()[0]
+            ))[0]
             assert str(val).lower() in ("false", "0"), f"{setting} is on"
         # and the statically-linked extensions still work
-        assert eng.con.execute("SELECT 1").fetchone()[0] == 1
+        assert fetch_one(eng.con.execute("SELECT 1"))[0] == 1
     finally:
         eng.close()
 
@@ -456,7 +457,7 @@ def test_study_values_never_reach_sql_as_text(study):
         hostile = "x'; DROP TABLE cfg_cohort; --"
         eng.con.execute("CREATE OR REPLACE TABLE probe (v VARCHAR)")
         eng.con.executemany("INSERT INTO probe VALUES (?)", [[hostile]])
-        got = eng.con.execute("SELECT v FROM probe").fetchone()[0]
+        got = fetch_one(eng.con.execute("SELECT v FROM probe"))[0]
         assert got == hostile
         assert eng.count("cfg_cohort") > 0, "cfg_cohort was dropped"
     finally:
@@ -1200,13 +1201,13 @@ def test_inclusion_requires_the_code_to_be_present(study):
     eng = Engine(verbose=False)
     try:
         run(s, DATA, engine=eng, verbose=False)
-        violations = eng.con.execute("""
+        violations = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist p WHERE NOT EXISTS (
                 SELECT 1 FROM cdm_diagnosis d
                 WHERE d.patid = p.patid
                   AND d.code IN ('X00001','X00002')
                   AND d.adate BETWEEN p.indexdt - 365 AND p.indexdt - 1)
-        """).fetchone()[0]
+        """))[0]
         assert violations == 0, "kept an episode lacking the required code"
     finally:
         eng.close()
@@ -1222,12 +1223,12 @@ def test_exclusion_removes_episodes_with_the_code(study):
     eng = Engine(verbose=False)
     try:
         run(_inclusion_study(rules), DATA, engine=eng, verbose=False)
-        violations = eng.con.execute("""
+        violations = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist p WHERE EXISTS (
                 SELECT 1 FROM cdm_diagnosis d
                 WHERE d.patid = p.patid AND d.code = 'X00001'
                   AND d.adate BETWEEN p.indexdt - 365 AND p.indexdt - 1)
-        """).fetchone()[0]
+        """))[0]
         assert violations == 0, "kept an episode carrying an excluded code"
         assert eng.count("inclusion_excluded") > 0
     finally:
@@ -1396,10 +1397,10 @@ def test_naming_modes_write_the_same_data(study, tmp_path):
         # SAS's level-1 wording (attrition follows ms_attrition.sas)
         assert "Initial Member Count" in show(out, "attrition")
         con = duckdb.connect()
-        counts[names] = con.execute(
+        counts[names] = fetch_one(con.execute(
             f"SELECT count(*) FROM read_parquet("
             f"'{out / 'msoc' / (study.run_id.lower() + '_attrition.parquet')}')"
-        ).fetchone()[0]
+        ))[0]
         con.close()
 
     run_id = study.run_id.lower()
@@ -1448,10 +1449,10 @@ def test_split_layout_writes_signature_and_runtimes(study, tmp_path):
                          "n_inclusion_rules"):
             assert expected in cols
 
-        rt = con.execute(
+        rt = fetch_one(con.execute(
             f"SELECT count(*) FROM read_parquet("
             f"'{tmp_path / 'msoc' / (run_id + '_runtimes.parquet')}')"
-        ).fetchone()[0]
+        ))[0]
         assert rt >= len(RunHandleStages(study)), "a row per stage expected"
     finally:
         con.close()
@@ -1555,10 +1556,10 @@ def test_stockpiling_is_partitioned_by_stockgroup(study):
         # Splitting means less forward-pushing, so supply intervals stay
         # closer to their original dates: total supply is conserved but
         # the latest expiry cannot be later than in the merged case.
-        merged_end = one.con.execute(
-            "SELECT max(expiredt) FROM stockpiled").fetchone()[0]
-        split_end = two.con.execute(
-            "SELECT max(expiredt) FROM stockpiled").fetchone()[0]
+        merged_end = fetch_one(one.con.execute(
+            "SELECT max(expiredt) FROM stockpiled"))[0]
+        split_end = fetch_one(two.con.execute(
+            "SELECT max(expiredt) FROM stockpiled"))[0]
         assert split_end <= merged_end, (
             "splitting stockgroups must not push dates further forward"
         )
@@ -1598,7 +1599,7 @@ def test_episodes_break_on_enrollment_change(baseline):
     Asserted against the data rather than by row count: no episode may
     span more than one enrollment span.
     """
-    spanning = baseline.con.execute("""
+    spanning = fetch_one(baseline.con.execute("""
         WITH claim_span AS (
             SELECT s.cohortgrp, s.patid, s.adate, e.enr_start
             FROM stockpiled s
@@ -1619,7 +1620,7 @@ def test_episodes_break_on_enrollment_change(baseline):
              AND cs.adate BETWEEN ep.episodestartdt AND ep.episodeenddt
             GROUP BY 1, 2, 3 HAVING n > 1
         )
-    """).fetchone()[0]
+    """))[0]
     assert spanning == 0, (
         f"{spanning} episode(s) span more than one enrollment span"
     )
@@ -1664,21 +1665,21 @@ def test_maxcumdose_censors_the_episode_not_just_excludes(study):
         run(s, DATA, engine=eng, verbose=False)
         assert eng.count("dose_censor") > 0, "nothing was censored"
         # every censored episode must end at or before its censor date
-        late = eng.con.execute("""
+        late = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist m
             JOIN dose_censor x
               ON x.cohortgrp = m.cohortgrp AND x.patid = m.patid
              AND x.indexdt = m.indexdt
             WHERE m.episodeenddt > x.censordate_maxdose
-        """).fetchone()[0]
+        """))[0]
         assert late == 0
         # censored episodes must still be PRESENT — shortened, not dropped
-        survived = eng.con.execute("""
+        survived = fetch_one(eng.con.execute("""
             SELECT count(*) FROM dose_censor x
             JOIN ptsmasterlist m
               ON m.cohortgrp = x.cohortgrp AND m.patid = x.patid
              AND m.indexdt = x.indexdt
-        """).fetchone()[0]
+        """))[0]
         assert survived > 0, "censoring removed episodes instead of shortening"
     finally:
         eng.close()
@@ -1714,9 +1715,9 @@ def test_dose_comparisons_round_like_sas():
     try:
         # the SQL uses round(x); confirm DuckDB's round matches the
         # boundary behaviour the comparison depends on
-        assert con.execute("SELECT round(99.6)").fetchone()[0] == 100
-        assert con.execute("SELECT round(99.4)").fetchone()[0] == 99
-        assert con.execute("SELECT round(100.5)").fetchone()[0] == 101
+        assert fetch_one(con.execute("SELECT round(99.6)"))[0] == 100
+        assert fetch_one(con.execute("SELECT round(99.4)"))[0] == 99
+        assert fetch_one(con.execute("SELECT round(100.5)"))[0] == 101
     finally:
         con.close()
 
@@ -1774,13 +1775,13 @@ def test_missing_fupwashper_means_never_had_an_event():
     eng = Engine(verbose=False)
     try:
         run(_fupwash_study(t2fupwashper=None), DATA, engine=eng, verbose=False)
-        leaked = eng.con.execute("""
+        leaked = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final m
             WHERE EXISTS (SELECT 1 FROM event_claims e
                           WHERE e.cohortgrp = m.cohortgrp
                             AND e.patid = m.patid
                             AND e.adate < m.indexdt)
-        """).fetchone()[0]
+        """))[0]
         assert leaked == 0, f"{leaked} episode(s) kept despite a prior event"
     finally:
         eng.close()
@@ -1799,14 +1800,14 @@ def test_events_in_the_blackout_window_exclude_the_episode():
     try:
         run(_fupwash_study(t2fupwashper=183, blackoutper=30), DATA,
             engine=eng, verbose=False)
-        survivors = eng.con.execute("""
+        survivors = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final m
             WHERE EXISTS (SELECT 1 FROM event_claims e
                           WHERE e.cohortgrp = m.cohortgrp
                             AND e.patid = m.patid
                             AND e.adate BETWEEN m.indexdt
                                             AND m.indexdt + 30 - 1)
-        """).fetchone()[0]
+        """))[0]
         assert survivors == 0, (
             f"{survivors} episode(s) kept despite an event in the blackout"
         )
@@ -1891,7 +1892,7 @@ def test_care_setting_restricts_event_claims(study):
         try:
             run(_care_setting_study(csp), DATA, engine=eng, verbose=False)
             counts[label] = eng.count("event_claims")
-            unbacked = eng.con.execute("""
+            unbacked = fetch_one(eng.con.execute("""
                 SELECT count(*) FROM event_claims ec
                 WHERE NOT EXISTS (
                     SELECT 1 FROM cdm_diagnosis d
@@ -1903,7 +1904,7 @@ def test_care_setting_restricts_event_claims(study):
                      AND (cs.enctype = '**' OR cs.enctype = d.enctype)
                      AND (cs.pdx = '*' OR cs.pdx = coalesce(d.pdx, ''))
                     WHERE d.patid = ec.patid AND d.adate = ec.adate)
-            """).fetchone()[0]
+            """))[0]
             assert unbacked == 0, f"{unbacked} event(s) with no qualifying claim"
         finally:
             eng.close()
@@ -2030,10 +2031,10 @@ def test_cida_npts_is_distinct_patients(study):
         for grp, npts, eps in eng.con.execute(
             'SELECT "group", npts, episodes FROM t2_cida WHERE level = \'1\''
         ).fetchall():
-            actual = eng.con.execute(
+            actual = fetch_one(eng.con.execute(
                 "SELECT count(DISTINCT patid) FROM cohort_final "
                 "WHERE cohortgrp = ?", [grp]
-            ).fetchone()[0]
+            ))[0]
             assert npts == actual, f"{grp}: npts {npts} != {actual}"
             assert npts <= eps
     finally:
@@ -2074,9 +2075,9 @@ def test_denominator_window_matches_sas():
     try:
         run(s, DATA, engine=eng, verbose=False)
         # no eligible window may start before enr_start + enr_days
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             SELECT count(*) FROM denomcounts WHERE dennummemdays <= 0
-        """).fetchone()[0]
+        """))[0]
         assert bad == 0, "SAS keeps only positive member days"
         assert eng.count("denomcounts") > 0
     finally:
@@ -2126,16 +2127,16 @@ def test_cida_merge_keeps_strata_with_no_episodes():
     try:
         run(s, DATA, engine=eng, verbose=False)
         # every row must carry a denominator, even where episodes is 0
-        orphans = eng.con.execute("""
+        orphans = fetch_one(eng.con.execute("""
             SELECT count(*) FROM t2_cida
             WHERE dennummemdays = 0 AND dennumpts = 0 AND episodes > 0
-        """).fetchone()[0]
+        """))[0]
         assert orphans == 0, "episodes with no denominator row"
         # and no row may have negative or NULL metrics after the merge
-        nulls = eng.con.execute("""
+        nulls = fetch_one(eng.con.execute("""
             SELECT count(*) FROM t2_cida
             WHERE npts IS NULL OR dennummemdays IS NULL OR episodes IS NULL
-        """).fetchone()[0]
+        """))[0]
         assert nulls == 0, "merge left NULLs; coalesce is missing"
     finally:
         eng.close()
@@ -2204,9 +2205,9 @@ def test_risk_score_counts_a_condition_once():
     try:
         run(_risk_study(rows), DATA, engine=eng, verbose=False)
         # a patient with BOTH codes scores 5, never 7
-        assert eng.con.execute(
+        assert fetch_one(eng.con.execute(
             "SELECT max(score) FROM risk_scores"
-        ).fetchone()[0] == 5.0
+        ))[0] == 5.0
     finally:
         eng.close()
 
@@ -2224,15 +2225,15 @@ def test_risk_score_intercept_applies_to_everyone():
     eng = Engine(verbose=False)
     try:
         run(_risk_study(rows), DATA, engine=eng, verbose=False)
-        nulls = eng.con.execute(
+        nulls = fetch_one(eng.con.execute(
             "SELECT count(*) FROM risk_scores WHERE score IS NULL"
-        ).fetchone()[0]
+        ))[0]
         assert nulls == 0, "matching nothing must score the intercept"
         # every episode is scored, and the floor is the intercept
         assert eng.count("risk_scores") == eng.count("ptsmasterlist")
-        assert eng.con.execute(
+        assert fetch_one(eng.con.execute(
             "SELECT min(score) FROM risk_scores"
-        ).fetchone()[0] == -2.5
+        ))[0] == -2.5
     finally:
         eng.close()
 
@@ -2249,13 +2250,13 @@ def test_risk_score_demographic_conditions():
     eng = Engine(verbose=False)
     try:
         run(_risk_study(rows), DATA, engine=eng, verbose=False)
-        wrong = eng.con.execute("""
+        wrong = fetch_one(eng.con.execute("""
             SELECT count(*) FROM risk_scores rs
             JOIN ptsmasterlist m
               ON m.cohortgrp = rs.cohortgrp AND m.patid = rs.patid
              AND m.indexdt = rs.indexdt
             WHERE rs.score <> CASE WHEN m.sex = 'F' THEN 4.0 ELSE 0.0 END
-        """).fetchone()[0]
+        """))[0]
         assert wrong == 0
     finally:
         eng.close()
@@ -2279,9 +2280,9 @@ def test_monitor_cursor_does_not_print_a_progress_bar():
     eng = Engine(verbose=False)
     try:
         for setting in ("enable_progress_bar_print", "enable_progress_bar"):
-            val = eng._monitor.execute(
+            val = fetch_one(eng._monitor.execute(
                 f"SELECT current_setting('{setting}')"
-            ).fetchone()[0]
+            ))[0]
             assert str(val).lower() in ("false", "0"), (
                 f"monitor cursor has {setting}={val}"
             )
@@ -2325,7 +2326,7 @@ def test_sas_missing_is_null_or_blank():
         con.execute(macros)
         for value, expected in ((None, True), ("", True), ("  ", True),
                                 ("02703", False)):
-            got = con.execute("SELECT is_missing(?)", [value]).fetchone()[0]
+            got = fetch_one(con.execute("SELECT is_missing(?)", [value]))[0]
             assert got == expected, f"is_missing({value!r}) = {got}"
     finally:
         con.close()
@@ -2346,15 +2347,15 @@ def test_geography_unknown_rules_cascade():
                          "hhs_region": "1", "cb_region": "Northeast",
                          "sdi": 10.0}]),
             DATA, engine=eng, verbose=False)
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             SELECT count(*) FROM geography
             WHERE zip3 <> 'Unknown' OR state <> 'Unknown'
                OR hhs_reg <> 'Unknown' OR cb_reg <> 'Unknown'
-        """).fetchone()[0]
+        """))[0]
         assert bad == 0, "unmatched zips must cascade to all four columns"
-        assert eng.con.execute(
+        assert fetch_one(eng.con.execute(
             "SELECT count(*) FROM geography WHERE sdi_cat <> '5'"
-        ).fetchone()[0] == 0
+        ))[0] == 0
     finally:
         eng.close()
 
@@ -2376,14 +2377,14 @@ def test_geography_cb_region_other_is_unknown():
     try:
         run(_geo_study(rows), DATA, engine=eng, verbose=False)
         # state maps, but cb_reg must still be Unknown
-        mapped = eng.con.execute(
+        mapped = fetch_one(eng.con.execute(
             "SELECT count(*) FROM geography WHERE state = 'MA'"
-        ).fetchone()[0]
+        ))[0]
         assert mapped > 0, "fixture did not map any zips"
-        leaked = eng.con.execute(
+        leaked = fetch_one(eng.con.execute(
             "SELECT count(*) FROM geography "
             "WHERE state = 'MA' AND cb_reg <> 'Unknown'"
-        ).fetchone()[0]
+        ))[0]
         assert leaked == 0, "cb_region 'other' must become Unknown"
     finally:
         eng.close()
@@ -2398,7 +2399,7 @@ def test_zip_uncertain_defaults_to_yes():
     try:
         run(_geo_study([{"zip": "00000", "statecode": "MA"}]),
             DATA, engine=eng, verbose=False)
-        wrong = eng.con.execute("""
+        wrong = fetch_one(eng.con.execute("""
             SELECT count(*) FROM geography g
             JOIN ptsmasterlist m
               ON m.cohortgrp = g.cohortgrp AND m.patid = g.patid
@@ -2407,7 +2408,7 @@ def test_zip_uncertain_defaults_to_yes():
                 WHEN m.zip_date IS NULL THEN 'Y'
                 WHEN m.indexdt < m.zip_date THEN 'Y'
                 ELSE 'N' END
-        """).fetchone()[0]
+        """))[0]
         assert wrong == 0
     finally:
         eng.close()
@@ -2431,8 +2432,8 @@ def test_code_distribution_reconciles_with_the_master_list(baseline):
     the episodes before inclusion criteria; SAS counts final episodes —
     with that, wp307's distindex matches SAS exactly.) Placeholder rows
     carry no count."""
-    total = baseline.con.execute(
-        "SELECT sum(episodes) FROM distindex WHERE distindextype = 'exp'").fetchone()[0]
+    total = fetch_one(baseline.con.execute(
+        "SELECT sum(episodes) FROM distindex WHERE distindextype = 'exp'"))[0]
     assert total == baseline.count("cohort_final")
 
 
@@ -2446,12 +2447,12 @@ def test_code_lists_are_canonically_ordered(baseline):
     """
     # SAS sorts the id as CHARACTER ('12' before '2'); the master list's
     # lists, in that order, match SAS on every wp307 episode
-    unsorted = baseline.con.execute("""
+    unsorted = fetch_one(baseline.con.execute("""
         SELECT count(*) FROM (
             SELECT str_split(distindexlist, '_') AS ids
             FROM distindex WHERE distindexlist <> '')
         WHERE ids <> list_sort(ids)
-    """).fetchone()[0]
+    """))[0]
     assert unsorted == 0, "code lists are not in SAS's character order"
     # With SAS's numbering (one entity per drug stockgroup) the demo has no
     # multi-entity lists, so this check cannot fail here; the ordering
@@ -2461,7 +2462,7 @@ def test_code_lists_are_canonically_ordered(baseline):
 
 def test_distindexmap_covers_every_code_used(baseline):
     """A list is undecodable if any ID is missing from the map."""
-    orphans = baseline.con.execute("""
+    orphans = fetch_one(baseline.con.execute("""
         WITH used AS (
             SELECT DISTINCT "group", distindextype,
                    unnest(str_split(distindexlist, '_'))::INT AS id
@@ -2471,7 +2472,7 @@ def test_distindexmap_covers_every_code_used(baseline):
                ON m."group" = u."group" AND m.distindextype = u.distindextype
               AND m.distindexid = u.id
         WHERE m.distindexid IS NULL
-    """).fetchone()[0]
+    """))[0]
     assert orphans == 0, "distindexlist references IDs not in the map"
 
 
@@ -2520,17 +2521,17 @@ def test_utilization_counts_are_ordered():
     eng = Engine(verbose=False)
     try:
         run(_util_study(rows, classes), DATA, engine=eng, verbose=False)
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             SELECT count(*) FROM utilization
             WHERE numgeneric > numrx OR numclass > numgeneric
                OR enc_av + enc_oa + enc_ip + enc_is + enc_ed > enc_total
-        """).fetchone()[0]
+        """))[0]
         assert bad == 0
         # and the distinct counts must actually be smaller somewhere,
         # or the assertion above is vacuous
-        strict = eng.con.execute(
+        strict = fetch_one(eng.con.execute(
             "SELECT count(*) FROM utilization WHERE numgeneric < numrx"
-        ).fetchone()[0]
+        ))[0]
         assert strict > 0, "no episode had repeat fills; distinctness untested"
     finally:
         eng.close()
@@ -2547,9 +2548,9 @@ def test_utilization_covers_every_episode():
     try:
         run(_util_study(rows), DATA, engine=eng, verbose=False)
         assert eng.count("utilization") == eng.count("ptsmasterlist")
-        nulls = eng.con.execute(
+        nulls = fetch_one(eng.con.execute(
             "SELECT count(*) FROM utilization WHERE numrx IS NULL"
-        ).fetchone()[0]
+        ))[0]
         assert nulls == 0
     finally:
         eng.close()
@@ -2571,8 +2572,8 @@ def test_utilization_window_is_honoured():
             classes = [{"code": f"N{i:05d}", "classname": f"c{i % 5}",
                         "generic": f"g{i % 10}"} for i in range(1, 200)]
             run(_util_study(rows, classes), DATA, engine=eng, verbose=False)
-            return eng.con.execute(
-                "SELECT sum(numrx) FROM utilization").fetchone()[0]
+            return fetch_one(eng.con.execute(
+                "SELECT sum(numrx) FROM utilization"))[0]
         finally:
             eng.close()
 
@@ -2663,7 +2664,7 @@ def test_lab_criteria_bind():
         #
         # EXISTS, not a join: joining on (patid, result_num) matches
         # across records that merely share a value.
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             SELECT count(*) FROM lab_results r
             WHERE ((r.labcode = '2160-0' AND r.result_num < 100)
                 OR (r.labcode = '3094-0'
@@ -2673,14 +2674,14 @@ def test_lab_criteria_bind():
                   WHERE l.patid = r.patid AND l.lab_dt = r.adate
                     AND l.result_num IS NOT DISTINCT FROM r.result_num
                     AND l.result_type <> 'N')
-        """).fetchone()[0]
+        """))[0]
         assert bad == 0
         # and the unfiltered code must admit values outside those bounds,
         # or the test above proves nothing
-        wide = eng.con.execute(
+        wide = fetch_one(eng.con.execute(
             "SELECT count(*) FROM lab_results "
             "WHERE labcode = '2823-3' AND result_num < 50"
-        ).fetchone()[0]
+        ))[0]
         assert wide > 0, "no unfiltered results below 50; criteria untested"
     finally:
         eng.close()
@@ -2764,12 +2765,12 @@ def test_mfu_count_methods_rank_differently():
     eng = Engine(verbose=False)
     try:
         run(_mfu_study(analyses), DATA, engine=eng, verbose=False)
-        differ = eng.con.execute("""
+        differ = fetch_one(eng.con.execute("""
             SELECT count(*) FROM mfu a JOIN mfu b
               ON a.cohortgrp = b.cohortgrp AND a.rank = b.rank
              AND a.analysisnum = 1 AND b.analysisnum = 2
             WHERE a.code <> b.code
-        """).fetchone()[0]
+        """))[0]
         assert differ > 0, "count methods produced identical rankings"
     finally:
         eng.close()
@@ -2791,9 +2792,9 @@ def test_mfu_respects_topxx():
             "SELECT cohortgrp, count(*) FROM mfu GROUP BY 1").fetchall())
         assert counts["lisinopril"] <= 5
         assert counts["beta_blocker"] <= 12
-        assert eng.con.execute(
+        assert fetch_one(eng.con.execute(
             "SELECT max(rank) FROM mfu WHERE cohortgrp='lisinopril'"
-        ).fetchone()[0] <= 5
+        ))[0] <= 5
     finally:
         eng.close()
 
@@ -2899,14 +2900,14 @@ def test_iev_requires_the_code_near_the_event():
     try:
         run(_iev_study(_iev_rules("IEV")), DATA, engine=eng, verbose=False)
         assert eng.count("event_excluded") > 0, "IEV dropped nothing"
-        violations = eng.con.execute("""
+        violations = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final c
             WHERE c.eventdt IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM cdm_diagnosis d
                 WHERE d.patid = c.patid AND d.code = 'X00001'
                   AND d.adate BETWEEN c.eventdt - 30 AND c.eventdt + 30)
-        """).fetchone()[0]
+        """))[0]
         assert violations == 0, "kept an event lacking the required code"
     finally:
         eng.close()
@@ -2918,14 +2919,14 @@ def test_eev_excludes_events_carrying_the_code():
     eng = Engine(verbose=False)
     try:
         run(_iev_study(_iev_rules("EEV")), DATA, engine=eng, verbose=False)
-        violations = eng.con.execute("""
+        violations = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final c
             WHERE c.eventdt IS NOT NULL
               AND EXISTS (
                 SELECT 1 FROM cdm_diagnosis d
                 WHERE d.patid = c.patid AND d.code = 'X00001'
                   AND d.adate BETWEEN c.eventdt - 30 AND c.eventdt + 30)
-        """).fetchone()[0]
+        """))[0]
         assert violations == 0, "kept an event carrying an excluded code"
     finally:
         eng.close()
@@ -2983,14 +2984,14 @@ def test_eventcount_dedup_keys():
         eng = Engine(verbose=False)
         try:
             run(_eventcount_study(ec), DATA, engine=eng, verbose=False)
-            dup_day = eng.con.execute(
+            dup_day = fetch_one(eng.con.execute(
                 "SELECT count(*) FROM (SELECT cohortgrp, patid, adate "
                 "FROM event_claims GROUP BY 1,2,3 HAVING count(*) > 1)"
-            ).fetchone()[0]
-            dup_code = eng.con.execute(
+            ))[0]
+            dup_code = fetch_one(eng.con.execute(
                 "SELECT count(*) FROM (SELECT cohortgrp, patid, adate, code "
                 "FROM event_claims GROUP BY 1,2,3,4 HAVING count(*) > 1)"
-            ).fetchone()[0]
+            ))[0]
             seen[ec] = (eng.count("event_claims"), dup_day, dup_code)
         finally:
             eng.close()
@@ -3014,8 +3015,8 @@ def test_eventcount_changes_numevents():
         eng = Engine(verbose=False)
         try:
             run(_eventcount_study(ec), DATA, engine=eng, verbose=False)
-            totals[ec] = eng.con.execute(
-                "SELECT sum(numevents) FROM first_event").fetchone()[0]
+            totals[ec] = fetch_one(eng.con.execute(
+                "SELECT sum(numevents) FROM first_event"))[0]
         finally:
             eng.close()
     assert totals[0] > totals[2], totals
@@ -3031,9 +3032,9 @@ def test_eventcount_does_not_change_first_event():
         eng = Engine(verbose=False)
         try:
             run(_eventcount_study(ec), DATA, engine=eng, verbose=False)
-            firsts[ec] = eng.con.execute(
+            firsts[ec] = fetch_one(eng.con.execute(
                 "SELECT count(*) FROM cohort_final WHERE has_event = 1"
-            ).fetchone()[0]
+            ))[0]
         finally:
             eng.close()
     assert firsts[0] == firsts[1] == firsts[2], firsts
@@ -3098,7 +3099,7 @@ def test_ioc_codes_disqualify_episodes():
     eng = Engine(verbose=False)
     try:
         run(_ioc_study(["X00001", "X00002"]), DATA, engine=eng, verbose=False)
-        kept = eng.con.execute("""
+        kept = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final c
             JOIN cfg_cohort cfg ON cfg.cohortgrp = c.cohortgrp
             WHERE cfg.fup_wash_per > 0 AND EXISTS (
@@ -3107,7 +3108,7 @@ def test_ioc_codes_disqualify_episodes():
                   AND d.code IN ('X00001', 'X00002')
                   AND d.adate BETWEEN c.indexdt - cfg.fup_wash_per
                                   AND c.indexdt - 1)
-        """).fetchone()[0]
+        """))[0]
         assert kept == 0, f"{kept} episode(s) kept despite an IOC claim"
     finally:
         eng.close()
@@ -3168,7 +3169,7 @@ def test_minrxdays_counts_supply_days_not_claims():
     eng = Engine(verbose=False)
     try:
         run(_minrx_study(120), DATA, engine=eng, verbose=False)
-        short = eng.con.execute("""
+        short = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist p
             WHERE (SELECT coalesce(sum(overlap_days(d.adate,
                         d.adate + CAST(d.rxsup - 1 AS INTEGER),
@@ -3176,7 +3177,7 @@ def test_minrxdays_counts_supply_days_not_claims():
                    FROM cdm_dispensing d
                    WHERE d.patid = p.patid
                      AND d.code IN ('N00001','N00002','N00003')) < 120
-        """).fetchone()[0]
+        """))[0]
         assert short == 0, f"{short} survivor(s) below the supply threshold"
     finally:
         eng.close()
@@ -3429,7 +3430,7 @@ def test_inc_and_exc_at_the_same_condlevel_stay_separate():
     eng = Engine(verbose=False)
     try:
         run(_inclusion_study(rules), DATA, engine=eng, verbose=False)
-        violations = eng.con.execute("""
+        violations = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist m
             WHERE NOT EXISTS (SELECT 1 FROM cdm_diagnosis d
                     WHERE d.patid = m.patid AND d.code = 'X00001'
@@ -3439,7 +3440,7 @@ def test_inc_and_exc_at_the_same_condlevel_stay_separate():
                     WHERE d.patid = m.patid AND d.code = 'X00002'
                       AND d.adate BETWEEN m.indexdt - 365
                                       AND m.indexdt - 1)
-        """).fetchone()[0]
+        """))[0]
         assert violations == 0, (
             f"{violations} episode(s) violate INC or EXC; the two rules "
             f"are sharing codes"
@@ -3559,7 +3560,7 @@ def test_every_feature_enabled_at_once():
         assert len(plan_stages(s)) >= 12
 
         # INC satisfied, EXC not violated, on the surviving master list
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist m
             WHERE NOT EXISTS (SELECT 1 FROM cdm_diagnosis d
                     WHERE d.patid = m.patid AND d.code = 'D00008'
@@ -3567,7 +3568,7 @@ def test_every_feature_enabled_at_once():
                OR EXISTS (SELECT 1 FROM cdm_diagnosis d
                     WHERE d.patid = m.patid AND d.code = 'X00002'
                       AND d.adate BETWEEN m.indexdt-365 AND m.indexdt-1)
-        """).fetchone()[0]
+        """))[0]
         assert bad == 0, f"{bad} episode(s) violate INC/EXC"
 
         # IOC codes must not disqualify anything they should not
@@ -3642,7 +3643,7 @@ def test_mincumdose_on_inclusion_is_prorated():
     eng = Engine(verbose=False)
     try:
         run(_incl_dose_study(mincumdose=500), DATA, engine=eng, verbose=False)
-        short = eng.con.execute("""
+        short = fetch_one(eng.con.execute("""
             SELECT count(*) FROM ptsmasterlist m
             WHERE (SELECT coalesce(sum(cs.strength * d.rxamt
                             * overlap_days(d.adate,
@@ -3653,7 +3654,7 @@ def test_mincumdose_on_inclusion_is_prorated():
                    JOIN cfg_code_strength cs ON cs.code = d.code
                    WHERE d.patid = m.patid
                      AND d.code IN ('E00001','E00002','E00003')) < 500
-        """).fetchone()[0]
+        """))[0]
         assert short == 0, f"{short} survivor(s) below the pro-rated threshold"
         assert eng.count("ptsmasterlist") > 0, "everything was excluded"
     finally:
@@ -3866,8 +3867,8 @@ def test_risk_score_windows_honour_their_anchors():
         eng = Engine(verbose=False)
         try:
             run(_risk_study(rows), DATA, engine=eng, verbose=False)
-            return eng.con.execute(
-                "SELECT sum(score) FROM risk_scores").fetchone()[0]
+            return fetch_one(eng.con.execute(
+                "SELECT sum(score) FROM risk_scores"))[0]
         finally:
             eng.close()
 
@@ -4285,18 +4286,18 @@ def test_followuptime_levels_reconcile_and_every_episode_is_censored():
         run(s, DATA, engine=eng, verbose=False)
         total = eng.count("cohort_final")
         for level in ("1", "2"):
-            got = eng.con.execute(
+            got = fetch_one(eng.con.execute(
                 "SELECT sum(episodes) FROM followuptime WHERE level = ?",
-                [level]).fetchone()[0]
+                [level]))[0]
             assert got == total, (level, got, total)
 
         # Every episode has a reason its follow-up ended. Checked on
         # episode_flags, where all seven flags live: SAS's follow-up-time
         # table carries only five of them (no cens_dth / cens_qryend).
-        unexplained = eng.con.execute(
+        unexplained = fetch_one(eng.con.execute(
             "SELECT count(*) FROM episode_flags WHERE fup_elig + fup_dth + "
             "fup_qryend + fup_dpend + fup_episend + fup_spec + fup_event = 0"
-        ).fetchone()[0]
+        ))[0]
         assert unexplained == 0, f"{unexplained} episodes with no reason"
     finally:
         eng.close()
@@ -4319,14 +4320,14 @@ def test_followuptime_censor_date_differs_from_censor_cida():
     eng = Engine(verbose=False)
     try:
         run(s, DATA, engine=eng, verbose=False)
-        events = eng.con.execute(
+        events = fetch_one(eng.con.execute(
             "SELECT sum(cens_event) FROM followuptime WHERE level = '1'"
-        ).fetchone()[0]
+        ))[0]
         assert events > 0, "no episode censored by its event"
         # and that matches the episodes that actually have one
-        with_event = eng.con.execute(
+        with_event = fetch_one(eng.con.execute(
             "SELECT count(*) FROM cohort_final WHERE has_event = 1"
-        ).fetchone()[0]
+        ))[0]
         assert events <= with_event, (events, with_event)
     finally:
         eng.close()
@@ -4374,8 +4375,8 @@ def test_censor_cida_has_the_sas_shape():
         assert eng.count("censoring") > 0, (
             "censor_cida is absent for a study that defines no strata"
         )
-        total = eng.con.execute(
-            "SELECT sum(episodes) FROM censoring").fetchone()[0]
+        total = fetch_one(eng.con.execute(
+            "SELECT sum(episodes) FROM censoring"))[0]
         assert total == eng.count("cohort_final")
     finally:
         eng.close()
@@ -4394,22 +4395,22 @@ def test_censoring_flags_are_independent_not_exclusive():
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        episodes, flagged = eng.con.execute("""
+        episodes, flagged = fetch_one(eng.con.execute("""
             SELECT sum(episodes),
                    sum(cens_elig + cens_dth + cens_qryend + cens_dpend)
             FROM censoring
-        """).fetchone()
+        """))
         # every episode has at least one reason ...
         assert flagged >= episodes, (flagged, episodes)
         # ... and the excess is exactly the coincident-date episodes
-        coincident = eng.con.execute("""
+        coincident = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final c
             JOIN cfg_cohort cfg ON cfg.cohortgrp = c.cohortgrp
             WHERE c.enr_end = DATE '2015-06-30'
               AND least(c.enr_end,
                         coalesce(c.deathdt, DATE '9999-12-31'),
                         DATE '2015-06-30') = c.enr_end
-        """).fetchone()[0]
+        """))[0]
         assert flagged - episodes == coincident, (flagged, episodes,
                                                   coincident)
     finally:
@@ -4558,10 +4559,10 @@ def test_denominator_metrics_use_the_sas_names():
             assert "dennummemdays" in cols or table == "t2_cida", cols
 
         # and the two must agree — the merge is by name
-        denom, cida = eng.con.execute("""
+        denom, cida = fetch_one(eng.con.execute("""
             SELECT (SELECT sum(dennumpts) FROM denomcounts WHERE level='1'),
                    (SELECT sum(dennumpts) FROM t2_cida     WHERE level='1')
-        """).fetchone()
+        """))
         assert denom == cida, (denom, cida)
     finally:
         eng.close()
@@ -4595,9 +4596,9 @@ def test_geography_columns_live_on_the_master_list():
 
         # the merge must not drop or duplicate episodes
         assert eng.count("ptsmasterlist") == eng.count("geography")
-        unmatched = eng.con.execute(
+        unmatched = fetch_one(eng.con.execute(
             "SELECT count(*) FROM ptsmasterlist WHERE zip_uncertain IS NULL"
-        ).fetchone()[0]
+        ))[0]
         assert unmatched == 0, f"{unmatched} episodes lost the geography join"
     finally:
         eng.close()
@@ -4711,14 +4712,14 @@ def test_mstr_carries_the_sas_column_names():
             assert required in cols, (required, sorted(cols))
 
         # the SAS-named columns must agree with this package's own
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             SELECT count(*) FROM cohort_final
             WHERE (event = 1) <> (has_event = 1)
                OR feventdt IS DISTINCT FROM eventdt
                OR (event_flag = 'Y') <> (has_event = 1)
                OR followuptime < 0
                OR timetocensor < 0
-        """).fetchone()[0]
+        """))[0]
         assert bad == 0, f"{bad} rows where the SAS names disagree"
     finally:
         eng.close()
@@ -4739,11 +4740,11 @@ def test_followuptime_agrees_between_mstr_and_the_cida_table():
     eng = Engine(verbose=False)
     try:
         run(s, DATA, engine=eng, verbose=False)
-        on_mstr, in_table = eng.con.execute("""
+        on_mstr, in_table = fetch_one(eng.con.execute("""
             SELECT (SELECT sum(followuptime) FROM cohort_final),
                    (SELECT sum(censdays_value * episodes)
                     FROM followuptime WHERE level = '1')
-        """).fetchone()
+        """))
         assert on_mstr == in_table, (on_mstr, in_table)
     finally:
         eng.close()
@@ -4888,8 +4889,8 @@ def test_baseline_is_wide_one_row_per_group():
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        groups = eng.con.execute(
-            "SELECT count(DISTINCT cohortgrp) FROM cohort_final").fetchone()[0]
+        groups = fetch_one(eng.con.execute(
+            "SELECT count(DISTINCT cohortgrp) FROM cohort_final"))[0]
         assert eng.count("baseline") == groups, "not one row per group"
 
         cols = [d[0] for d in eng.con.execute(
@@ -4904,16 +4905,16 @@ def test_baseline_is_wide_one_row_per_group():
 
         # SAS counts demographics once per PATIENT (first episode;
         # ms_createdistbaselinetable.sas:437-449), not per episode
-        bad = eng.con.execute(
+        bad = fetch_one(eng.con.execute(
             'SELECT count(*) FROM baseline WHERE "Sex_F" + "Sex_M" + "Sex_O" '
-            '<> patient').fetchone()[0]
+            '<> patient'))[0]
         assert bad == 0, "sex dummies do not sum to the patient count"
-        assert eng.con.execute(
-            "SELECT count(*) FROM baseline WHERE patient < n_episodes").fetchone()[0] > 0, (
+        assert fetch_one(eng.con.execute(
+            "SELECT count(*) FROM baseline WHERE patient < n_episodes"))[0] > 0, (
             "no cohort has repeat episodes: the per-patient rule is untested")
 
-        total = eng.con.execute(
-            "SELECT sum(n_episodes) FROM baseline").fetchone()[0]
+        total = fetch_one(eng.con.execute(
+            "SELECT sum(n_episodes) FROM baseline"))[0]
         assert total == eng.count("cohort_final")
     finally:
         eng.close()
@@ -4950,10 +4951,10 @@ def test_baseline_is_squared():
         # no NULLs anywhere in the table
         cols = [d[0] for d in eng.con.execute(
             "SELECT * FROM baseline LIMIT 0").description][1:]
-        nulls = eng.con.execute(
+        nulls = fetch_one(eng.con.execute(
             "SELECT " + " + ".join(
                 f'sum(CASE WHEN "{c}" IS NULL THEN 1 ELSE 0 END)'
-                for c in cols) + " FROM baseline").fetchone()[0]
+                for c in cols) + " FROM baseline"))[0]
         assert nulls == 0, f"{nulls} NULL cells; the table is not squared"
     finally:
         eng.close()
@@ -5028,8 +5029,8 @@ def test_px_risk_score_codes_match_procedure_claims():
         try:
             run(_risk_codecat_study(codecat, code), DATA, engine=eng,
                 verbose=False)
-            return eng.con.execute(
-                "SELECT sum(score) FROM risk_scores").fetchone()[0] or 0
+            return fetch_one(eng.con.execute(
+                "SELECT sum(score) FROM risk_scores"))[0] or 0
         finally:
             eng.close()
 
@@ -5054,8 +5055,8 @@ def test_risk_score_care_setting_is_applied():
         try:
             run(_risk_codecat_study("DX", "X00001", csp), DATA,
                 engine=eng, verbose=False)
-            return eng.con.execute(
-                "SELECT sum(score) FROM risk_scores").fetchone()[0] or 0
+            return fetch_one(eng.con.execute(
+                "SELECT sum(score) FROM risk_scores"))[0] or 0
         finally:
             eng.close()
 
@@ -5084,11 +5085,11 @@ def test_eventcount_key_includes_codetype():
         assert "codetype" in cols, sorted(cols)
 
         # under eventcount=1 the FULL key must be unique
-        dupes = eng.con.execute("""
+        dupes = fetch_one(eng.con.execute("""
             SELECT count(*) FROM (
                 SELECT cohortgrp, patid, adate, code, codetype
                 FROM event_claims GROUP BY 1,2,3,4,5 HAVING count(*) > 1)
-        """).fetchone()[0]
+        """))[0]
         assert dupes == 0, f"{dupes} duplicate (patid, date, code, codetype)"
     finally:
         eng.close()
@@ -5120,9 +5121,9 @@ def test_event_and_ioc_codes_read_their_own_domain():
         try:
             run(load_study_dict({**base, "cohortcodes": cc}), DATA,
                 engine=eng, verbose=False)
-            return eng.con.execute(
+            return fetch_one(eng.con.execute(
                 "SELECT count(*) FROM cohort_final WHERE has_event = 1"
-            ).fetchone()[0]
+            ))[0]
         finally:
             eng.close()
 
@@ -5160,8 +5161,8 @@ def test_codesupply_overrides_the_claim_rxsup():
         try:
             run(load_study_dict({**base, "type2file": t2, "cohortcodes": cc}),
                 DATA, engine=eng, verbose=False)
-            return eng.con.execute(
-                "SELECT avg(episode_days) FROM cohort_final").fetchone()[0]
+            return fetch_one(eng.con.execute(
+                "SELECT avg(episode_days) FROM cohort_final"))[0]
         finally:
             eng.close()
 
@@ -5416,9 +5417,9 @@ def test_baseline_carries_the_sas_dummy_groups():
         # each dummy group is a partition: it sums to n_episodes
         years = [c for c in cols if c.startswith("Year_")]
         total = " + ".join(f'"{c}"' for c in years)
-        bad = eng.con.execute(
+        bad = fetch_one(eng.con.execute(
             f"SELECT count(*) FROM baseline WHERE {total} <> n_episodes"
-        ).fetchone()[0]
+        ))[0]
         assert bad == 0, "year dummies do not sum to n_episodes"
     finally:
         eng.close()
@@ -5548,23 +5549,23 @@ def test_numerators_and_denominators_reconcile_at_every_level():
     try:
         run(s, DATA, engine=eng, verbose=False)
         for level in ("1", "2", "3"):
-            cida_den, den = eng.con.execute("""
+            cida_den, den = fetch_one(eng.con.execute("""
                 SELECT (SELECT sum(dennumpts) FROM t2_cida     WHERE level = ?),
                        (SELECT sum(dennumpts) FROM denomcounts WHERE level = ?)
-            """, [level, level]).fetchone()
+            """, [level, level]))
             assert cida_den == den, (level, cida_den, den)
 
-            cida_num, num = eng.con.execute("""
+            cida_num, num = fetch_one(eng.con.execute("""
                 SELECT (SELECT sum(npts) FROM t2_cida   WHERE level = ?),
                        (SELECT sum(npts) FROM numcounts WHERE level = ?)
-            """, [level, level]).fetchone()
+            """, [level, level]))
             assert cida_num == num, (level, cida_num, num)
 
             # every level must actually stratify, or the check above is
             # comparing two copies of the same unstratified answer
-            rows = eng.con.execute(
+            rows = fetch_one(eng.con.execute(
                 "SELECT count(*) FROM denomcounts WHERE level = ?",
-                [level]).fetchone()[0]
+                [level]))[0]
             assert rows > 0, (level, "denomcounts empty")
     finally:
         eng.close()
@@ -6324,88 +6325,53 @@ def test_index_dates_must_fall_inside_the_query_period():
     try:
         study = load_study(STUDY)
         run(study, DATA, engine=eng, verbose=False)
-        outside = eng.con.execute(
+        outside = fetch_one(eng.con.execute(
             "SELECT count(*) FROM cohort_final WHERE indexdt < ? OR indexdt > ?",
-            [study.start_date, study.end_date]).fetchone()[0]
+            [study.start_date, study.end_date]))[0]
         assert outside == 0, (
             f"{outside} episodes have an index date outside the query "
             f"period {study.start_date}..{study.end_date}")
         # and the cohort is not empty, or the check proves nothing
-        assert eng.con.execute(
-            "SELECT count(*) FROM cohort_final").fetchone()[0] > 0
+        assert fetch_one(eng.con.execute(
+            "SELECT count(*) FROM cohort_final"))[0] > 0
     finally:
         eng.close()
 
 
-def test_bulk_registration_matches_row_by_row_exactly():
-    """Large config tables are bulk-loaded through a CSV, which is 25x
-    faster on a real study (91s of registration down to 3.6s). The
-    speed is worthless if the data changes on the way.
-
-    The subtle case is NULL against EMPTY STRING. `csv` writes None as
-    an empty field, so a naive `nullstr=''` turns a genuinely empty
-    value into NULL — one risk-code value silently did exactly that,
-    and the two behave differently in a join. A sentinel keeps them
-    apart.
+def test_registration_round_trips_values_exactly():
+    """Config reaches SQL through Engine.register, which uses DuckDB 2's
+    native appender. Values must come back EXACTLY as given. The cases are
+    the ones earlier paths got wrong or had to guard: an empty string must
+    stay a string, not become NULL (the old CSV path needed a sentinel for
+    it, after a risk-code value silently did exactly that), and text with
+    commas, quotes, newlines or non-ASCII, codes with leading zeros, dates,
+    decimals and booleans must not be altered on the way.
     """
+    import datetime as dt
     from qrp import Engine
-    from qrp import engine as engine_mod
     from qrp.pipeline import register_config
 
-    study = load_study(STUDY)
-    original = engine_mod._BULK_LOAD_ROWS
-    snaps = {}
-    try:
-        for label, threshold in (("bulk", 1), ("rowwise", 10 ** 9)):
-            engine_mod._BULK_LOAD_ROWS = threshold
-            eng = Engine(verbose=False)
-            try:
-                register_config(eng, study)
-                out = {}
-                for tbl in ("cfg_codes", "cfg_cohort", "cfg_demog"):
-                    cols = [d[0] for d in eng.con.execute(
-                        f"SELECT * FROM {tbl} LIMIT 0").description]
-                    # row count, per-column non-null count, and the rows
-                    # themselves
-                    counts = eng.con.execute(
-                        "SELECT count(*), "
-                        + ", ".join(f"count({c})" for c in cols)
-                        + f" FROM {tbl}").fetchone()
-                    rows = eng.con.execute(
-                        f"SELECT * FROM {tbl} ORDER BY ALL").fetchall()
-                    out[tbl] = (counts, rows)
-                snaps[label] = out
-            finally:
-                eng.close()
-    finally:
-        engine_mod._BULK_LOAD_ROWS = original
-
-    for tbl in snaps["bulk"]:
-        assert snaps["bulk"][tbl][0] == snaps["rowwise"][tbl][0], (
-            f"{tbl}: row or non-null counts differ between the two "
-            f"registration paths")
-        assert snaps["bulk"][tbl][1] == snaps["rowwise"][tbl][1], (
-            f"{tbl}: row CONTENT differs between the two paths")
-
-
-def test_empty_string_survives_bulk_registration_as_a_string():
-    """The specific bug the sentinel exists to prevent."""
-    from qrp import Engine
-    from qrp import engine as engine_mod
-
-    original = engine_mod._BULK_LOAD_ROWS
+    rows = [
+        {"s": "", "n": None, "d": dt.date(2024, 2, 29), "x": 0.1, "b": True, "i": 0},
+        {"s": None, "n": "", "d": None, "x": None, "b": None, "i": None},
+        {"s": 'a, "b"\nc', "n": "00012345678", "d": dt.date(1900, 1, 1),
+         "x": 1e-300, "b": False, "i": -7},
+        {"s": "é—✓", "n": "0", "d": dt.date(2099, 12, 31), "x": 123456.789, "b": True,
+         "i": 2_000_000_000},
+    ]
     eng = Engine(verbose=False)
     try:
-        engine_mod._BULK_LOAD_ROWS = 1          # force the CSV path
-        eng.register("t_probe",
-                     [{"a": "", "b": None}, {"a": "x", "b": "y"}],
-                     "a VARCHAR, b VARCHAR")
-        got = eng.con.execute(
-            "SELECT a IS NULL, b IS NULL FROM t_probe ORDER BY a").fetchall()
-        assert got == [(False, True), (False, False)], (
-            "an empty string became NULL, or a NULL became a string", got)
+        eng.register("t_probe", rows,
+                     "s VARCHAR, n VARCHAR, d DATE, x DOUBLE, b BOOLEAN, i INTEGER")
+        got = [dict(zip(("s", "n", "d", "x", "b", "i"), r, strict=True)) for r in
+               eng.con.execute("SELECT s, n, d, x, b, i FROM t_probe").fetchall()]
+        assert got == rows, got
+        # and a real study's config registers, with the row counts intact
+        study = load_study(STUDY)
+        register_config(eng, study)
+        n_codes = fetch_one(eng.con.execute("SELECT count(*) FROM cfg_codes"))[0]
+        assert n_codes > 0
     finally:
-        engine_mod._BULK_LOAD_ROWS = original
         eng.close()
 
 
@@ -6472,10 +6438,10 @@ def test_fut_claims_truncate_an_episode():
         eng = Engine(verbose=False)
         try:
             run(s, DATA, engine=eng, verbose=False)
-            return eng.con.execute(
+            return fetch_one(eng.con.execute(
                 "SELECT sum(date_diff('day', indexdt, episodeenddt)) "
                 "FROM cohort_final WHERE cohortgrp = 'lisinopril'"
-            ).fetchone()[0]
+            ))[0]
         finally:
             eng.close()
 
@@ -6531,9 +6497,9 @@ def test_truncation_claims_are_stockpiled():
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
         # the stockpiled date must never precede the claim's own date,
         # and for a repeat fill in one stockgroup it must exceed it
-        bad = eng.con.execute(
+        bad = fetch_one(eng.con.execute(
             "SELECT count(*) FROM trunc_claims WHERE adate < orig_adate"
-        ).fetchone()[0]
+        ))[0]
         assert bad == 0, "a stockpiled truncation date moved BACKWARDS"
     finally:
         eng.close()
@@ -6758,22 +6724,22 @@ def test_truncation_chain_starts_at_the_enrolment_window():
     try:
         study = load_study(STUDY)
         run(study, DATA, engine=eng, verbose=False)
-        bound = eng.con.execute(
+        bound = fetch_one(eng.con.execute(
             "SELECT min(CAST(? AS DATE) - enr_days) FROM cfg_cohort",
-            [study.start_date]).fetchone()[0]
-        early = eng.con.execute(
+            [study.start_date]))[0]
+        early = fetch_one(eng.con.execute(
             "SELECT count(*) FROM trunc_claims WHERE orig_adate > ?",
-            [bound]).fetchone()[0]
+            [bound]))[0]
         # every retained claim's SUPPLY must reach the bound; claims
         # filed after it trivially do, so the check is that nothing
         # retained expired before it
-        stale = eng.con.execute(
+        stale = fetch_one(eng.con.execute(
             "SELECT count(*) FROM trunc_claims t "
             "WHERE t.orig_adate < ? AND NOT EXISTS ("
             "  SELECT 1 FROM cdm_dispensing d "
             "  WHERE d.patid = t.patid AND d.adate = t.orig_adate "
             "    AND d.adate + CAST(d.rxsup - 1 AS INTEGER) >= ?)",
-            [bound, bound]).fetchone()[0]
+            [bound, bound]))[0]
         assert stale == 0, (
             f"{stale} truncation claims were kept whose supply had "
             f"already run out before {bound}")
@@ -6801,13 +6767,13 @@ def test_non_dispensing_exposure_is_not_stockpiled():
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
         # nothing outside RX may have been shifted by stockpiling
-        shifted = eng.con.execute(
+        shifted = fetch_one(eng.con.execute(
             "SELECT count(*) FROM stockpiled s "
             "WHERE s.adate <> s.orig_adate AND NOT EXISTS ("
             "  SELECT 1 FROM exposure_claims x "
             "  WHERE x.cohortgrp = s.cohortgrp AND x.patid = s.patid "
             "    AND x.adate = s.orig_adate AND x.codecat = 'RX')"
-        ).fetchone()[0]
+        ))[0]
         assert shifted == 0, (
             f"{shifted} non-dispensing exposure rows were stockpiled")
     finally:
@@ -6835,16 +6801,16 @@ def test_exposure_chain_starts_at_the_enrolment_window():
     try:
         study = load_study(STUDY)
         run(study, DATA, engine=eng, verbose=False)
-        bound = eng.con.execute(
+        bound = fetch_one(eng.con.execute(
             "SELECT min(CAST(? AS DATE) - enr_days) FROM cfg_cohort",
-            [study.start_date]).fetchone()[0]
-        stale = eng.con.execute(
+            [study.start_date]))[0]
+        stale = fetch_one(eng.con.execute(
             "SELECT count(*) FROM stockpiled s "
             "WHERE EXISTS (SELECT 1 FROM exposure_claims x "
             "  WHERE x.cohortgrp = s.cohortgrp AND x.patid = s.patid "
             "    AND x.adate = s.orig_adate AND x.codecat = 'RX' "
             "    AND x.adate + CAST(x.rxsup - 1 AS INTEGER) < ?)",
-            [bound]).fetchone()[0]
+            [bound]))[0]
         assert stale == 0, (
             f"{stale} dispensings joined the chain whose supply had run "
             f"out before {bound}")
@@ -6978,8 +6944,8 @@ def test_washout_shave_uses_stockpiled_dates():
         eng = Engine(verbose=False)
         try:
             run(s, DATA, engine=eng, verbose=False)
-            return eng.con.execute(
-                "SELECT sum(dennummemdays) FROM denomcounts").fetchone()[0]
+            return fetch_one(eng.con.execute(
+                "SELECT sum(dennummemdays) FROM denomcounts"))[0]
         finally:
             eng.close()
 
@@ -7017,9 +6983,9 @@ def test_inclusion_codes_are_matched_within_their_own_domain():
             "inclusion codes carry no domain, so they match claims in "
             "every domain a sibling rule happens to use")
         # and no code may be registered without one
-        blank = eng.con.execute(
+        blank = fetch_one(eng.con.execute(
             "SELECT count(*) FROM cfg_inclusion_codes "
-            "WHERE codecat IS NULL OR codecat = ''").fetchone()[0]
+            "WHERE codecat IS NULL OR codecat = ''"))[0]
         assert blank == 0, blank
     finally:
         eng.close()
@@ -7128,12 +7094,12 @@ def test_supply_and_amount_are_clipped_to_the_episode():
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        r = eng.con.execute("""
+        r = fetch_one(eng.con.execute("""
             SELECT
               count(*) FILTER (WHERE episode_totrxsup > episode_rxsup),
               count(*) FILTER (WHERE episode_totrxsup < episode_rxsup),
               count(*) FILTER (WHERE episode_totrxsup <= 0)
-            FROM cohort_final""").fetchone()
+            FROM cohort_final"""))
         assert r[0] == 0, "clipped supply exceeded the uncapped supply"
         assert r[1] > 0, (
             "no episode had its supply clipped, so the window is not "
@@ -7259,7 +7225,7 @@ def test_denominator_washout_chain_restarts_each_enrolment_span():
         run(study, DATA, engine=eng, verbose=False)
         # earliest RX fill per (cohort, stockgroup, patient, span) on the
         # raw side, against the earliest chained date in the same span
-        bad = eng.con.execute("""
+        bad = fetch_one(eng.con.execute("""
             WITH raw AS (
                 SELECT x.cohortgrp, x.stockgroup, x.patid, en.enr_start AS span,
                        min(x.adate) AS first_fill
@@ -7280,8 +7246,8 @@ def test_denominator_washout_chain_restarts_each_enrolment_span():
                 SELECT 1 FROM _denom_chain d
                 WHERE d.cohortgrp = r.cohortgrp AND d.patid = r.patid
                   AND d.adate = r.first_fill)
-        """, [study.start_date]).fetchone()[0]
-        total = eng.con.execute("SELECT count(*) FROM _denom_chain").fetchone()[0]
+        """, [study.start_date]))[0]
+        total = fetch_one(eng.con.execute("SELECT count(*) FROM _denom_chain"))[0]
         assert total > 0, "the denominator washout chain is empty"
         assert bad == 0, (
             f"{bad} span(s) had their first fill pushed — supply was carried "
@@ -7440,7 +7406,7 @@ def test_covariate_dispensings_are_stockpiled():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        moved, earlier = eng.con.execute(f"""
+        moved, earlier = fetch_one(eng.con.execute(f"""
             WITH first_fill AS (
                 SELECT patid, min(adate) AS d FROM cdm_dispensing
                 WHERE code IN ({",".join(f"'{c}'" for c in lis)})
@@ -7458,7 +7424,7 @@ def test_covariate_dispensings_are_stockpiled():
                       WHERE en.patid = x.patid AND en.enr_start = x.adate)),
               count(*) FILTER (WHERE x.adate < f.d)
             FROM _covar_rx_chain x JOIN first_fill f USING (patid)
-            WHERE x.covarnum = 90""").fetchone()
+            WHERE x.covarnum = 90"""))
     finally:
         eng.close()
     assert moved > 0, "no fill was moved: covariate dispensings are not stockpiled"
@@ -7492,7 +7458,7 @@ def test_covariate_chain_admits_only_claims_reaching_the_enrolment_window():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        early, bad = eng.con.execute(f"""
+        early, bad = fetch_one(eng.con.execute(f"""
             WITH opens AS (
                 SELECT DISTINCT enr_cfg_id, CAST(? AS DATE) - enr_days AS d
                 FROM cfg_covariates)
@@ -7506,7 +7472,7 @@ def test_covariate_chain_admits_only_claims_reaching_the_enrolment_window():
               (SELECT count(*) FROM _covar_rx_chain c
                JOIN opens o ON o.enr_cfg_id = c.enr_cfg_id
                WHERE c.covarnum = 90 AND c.cend_max < o.d)
-        """, [study.start_date]).fetchone()
+        """, [study.start_date]))
     finally:
         eng.close()
     assert early > 0, "no dispensing ends before the window: the test proves nothing"
@@ -7594,7 +7560,7 @@ def test_supply_counting_stops_at_the_first_event():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        past, over = eng.con.execute("""
+        past, over = fetch_one(eng.con.execute("""
             WITH ep AS (
                 SELECT f.cohortgrp, f.patid, f.indexdt, f.episode_totrxsup,
                        least(f.episodeenddt, f.feventdt) AS fup_end,
@@ -7614,7 +7580,7 @@ def test_supply_counting_stops_at_the_first_event():
               count(*) FILTER (WHERE e.episode_totrxsup >
                   (date_diff('day', e.indexdt, e.fup_end) + 1) * k.n_sg)
             FROM ep e JOIN k USING (cohortgrp, patid, indexdt)
-        """).fetchone()
+        """))
     finally:
         eng.close()
     assert past > 0, "no episode has supply running past its event: proves nothing"
@@ -7759,17 +7725,17 @@ def test_mfu_reads_sas_format_rows():
         con = eng.con
         cohorts = {r[0] for r in con.execute(
             "SELECT DISTINCT cohortgrp FROM mfu WHERE analysisnum = 1").fetchall()}
-        n2 = con.execute("SELECT count(*) FROM mfu WHERE analysisnum = 2").fetchone()[0]
-        by_pat = con.execute("""
+        n2 = fetch_one(con.execute("SELECT count(*) FROM mfu WHERE analysisnum = 2"))[0]
+        by_pat = fetch_one(con.execute("""
             SELECT count(*) FROM (
               SELECT patcount < lead(patcount) OVER w AS bad
               FROM mfu WHERE analysisnum = 1
-              WINDOW w AS (PARTITION BY cohortgrp ORDER BY rank)) WHERE bad""").fetchone()[0]
-        claims_disagree = con.execute("""
+              WINDOW w AS (PARTITION BY cohortgrp ORDER BY rank)) WHERE bad"""))[0]
+        claims_disagree = fetch_one(con.execute("""
             SELECT count(*) FROM (
               SELECT codecount < lead(codecount) OVER w AS inv
               FROM mfu WHERE analysisnum = 1
-              WINDOW w AS (PARTITION BY cohortgrp ORDER BY rank)) WHERE inv""").fetchone()[0]
+              WINDOW w AS (PARTITION BY cohortgrp ORDER BY rank)) WHERE inv"""))[0]
     finally:
         eng.close()
     assert cohorts == {c.cohortgrp for c in study.cohorts}, (
@@ -7811,9 +7777,9 @@ def test_risk_scores_follow_the_risk_score_file():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        scores, hit = eng.con.execute("""
+        scores, hit = fetch_one(eng.con.execute("""
             SELECT list(DISTINCT riskscore), count(*) FILTER (WHERE score > 0)
-            FROM risk_scores""").fetchone()
+            FROM risk_scores"""))
     finally:
         eng.close()
     assert scores == ["AAA"], f"a score without an intercept must be reported: {scores}"
@@ -7848,7 +7814,7 @@ def test_master_list_utilization_and_score_columns_follow_sas():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        r = eng.con.execute("""
+        r = fetch_one(eng.con.execute("""
             SELECT
               count(*) FILTER (WHERE cohortgrp = 'beta_blocker' AND
                   ("NumAV" IS NOT NULL OR "ExactNumVisit" IS NOT NULL OR "NumVisits" <> '')),
@@ -7860,10 +7826,10 @@ def test_master_list_utilization_and_score_columns_follow_sas():
               count(*) FILTER (WHERE "fupdays_value_cat" IS DISTINCT FROM
                   CASE WHEN followuptime <= 90 THEN '0-90' WHEN followuptime <= 180
                        THEN '91-180' ELSE '181+' END)
-            FROM cohort_final""").fetchone()
-        types = eng.con.execute(
+            FROM cohort_final"""))
+        types = fetch_one(eng.con.execute(
             'SELECT typeof("ExactNumVisit"), typeof("NumVisits") FROM cohort_final LIMIT 1'
-        ).fetchone()
+        ))
     finally:
         eng.close()
     # ExactNumVisit is a count, so an integer: SAS stores every numeric as a
@@ -7971,7 +7937,7 @@ def test_dispensing_whose_supply_reaches_the_window_is_read():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        straddling, missing = eng.con.execute("""
+        straddling, missing = fetch_one(eng.con.execute("""
             WITH defs AS (
                 SELECT DISTINCT cohortgrp, code FROM cfg_codes
                 WHERE role = 'DEF' AND codecat = 'RX'),
@@ -7985,7 +7951,7 @@ def test_dispensing_whose_supply_reaches_the_window_is_read():
                        SELECT 1 FROM exposure_claims x
                        WHERE x.cohortgrp = e.cohortgrp AND x.patid = e.patid
                          AND x.adate = e.adate AND x.code = e.code))
-            FROM early e""", [claims_from, claims_from]).fetchone()
+            FROM early e""", [claims_from, claims_from]))
     finally:
         eng.close()
     assert straddling > 0, "no fill straddles claims_from: the test proves nothing"
@@ -8156,7 +8122,7 @@ def test_truncation_claims_only_for_patients_in_the_cohort():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        outsiders, rows, stray = eng.con.execute(f"""
+        outsiders, rows, stray = fetch_one(eng.con.execute(f"""
             SELECT
               (SELECT count(DISTINCT d.patid) FROM cdm_dispensing d
                 WHERE d.code IN ({codes}) AND NOT EXISTS (
@@ -8166,7 +8132,7 @@ def test_truncation_claims_only_for_patients_in_the_cohort():
               (SELECT count(*) FROM trunc_claims t WHERE NOT EXISTS (
                   SELECT 1 FROM exposure_claims x
                   WHERE x.cohortgrp = t.cohortgrp AND x.patid = t.patid))
-        """).fetchone()
+        """))
     finally:
         eng.close()
     assert outsiders > 0, "no outsider has these dispensings: the test proves nothing"
@@ -8271,7 +8237,7 @@ def test_reported_age_is_sas_yrdif_age():
     try:
         eng.script_stage("macros", "00_macros.sql")
         def age(b, d):
-            return eng.con.execute("SELECT age_yrdif(?::DATE, ?::DATE)", [b, d]).fetchone()[0]
+            return fetch_one(eng.con.execute("SELECT age_yrdif(?::DATE, ?::DATE)", [b, d]))[0]
         # no 29 Feb since the last birthday (2024-03-10): 71 days
         assert abs(age(dt.date(1990, 3, 10), dt.date(2024, 5, 20)) - (34 + 71 / 365)) < 1e-12
         # the age year contains 29 Feb 2020, not yet reached: still /365
@@ -8294,12 +8260,12 @@ def test_master_list_quarter_numevents_and_ttc_follow_sas():
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        q_end, wrong_q, zero_ev, ttc = eng.con.execute("""
+        q_end, wrong_q, zero_ev, ttc = fetch_one(eng.con.execute("""
             SELECT count(*) FILTER (WHERE month(indexdt) IN (3, 6, 9, 12)),
                    count(*) FILTER (WHERE quarter <> quarter(indexdt)),
                    count(*) FILTER (WHERE numevents = 0),
                    count(ttc)
-            FROM cohort_final""").fetchone()
+            FROM cohort_final"""))
     finally:
         eng.close()
     assert q_end > 0, "no quarter-end index dates: the test proves nothing"
@@ -8388,12 +8354,12 @@ def test_dispensing_counts_cover_every_record_in_the_episode():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        multi, raw_below, = eng.con.execute("""
+        multi, raw_below, = fetch_one(eng.con.execute("""
             SELECT count(*) FILTER (WHERE "AdjustedDisp" > 1),
                    count(*) FILTER (WHERE "RawDisp" < "AdjustedDisp")
-            FROM cohort_final""").fetchone()
-        above = eng.con.execute(
-            "SELECT count(*) FROM t2_cida WHERE adjustedcodecount > episodes").fetchone()[0]
+            FROM cohort_final"""))
+        above = fetch_one(eng.con.execute(
+            "SELECT count(*) FROM t2_cida WHERE adjustedcodecount > episodes"))[0]
     finally:
         eng.close()
     assert multi > 0, "no episode with several dispensings: the test proves nothing"
@@ -8419,13 +8385,13 @@ def test_t2_cida_sums_the_episodes_followuptime():
     eng = Engine(verbose=False)
     try:
         run(study, DATA, engine=eng, verbose=False)
-        distinct, mismatched = eng.con.execute("""
+        distinct, mismatched = fetch_one(eng.con.execute("""
             WITH ep AS (SELECT cohortgrp, sum(followuptime) AS fut,
                                sum(person_days) AS pd
                         FROM cohort_final GROUP BY 1)
             SELECT count(*) FILTER (WHERE ep.fut <> ep.pd),
                    count(*) FILTER (WHERE t.followuptime IS DISTINCT FROM ep.fut)
-            FROM ep JOIN t2_cida t ON t."group" = ep.cohortgrp""").fetchone()
+            FROM ep JOIN t2_cida t ON t."group" = ep.cohortgrp"""))
     finally:
         eng.close()
     assert distinct > 0, "person_days equals followuptime here: the test proves nothing"
@@ -8469,18 +8435,18 @@ def test_followuptime_levels_follow_sas_and_are_squared():
     eng = Engine(verbose=False)
     try:
         run(s, DATA, engine=eng, verbose=False)
-        assert eng.con.execute(
-            "SELECT count(*) FROM cohort_final WHERE cohortgrp = 'empty_grp'").fetchone()[0] == 0, (
+        assert fetch_one(eng.con.execute(
+            "SELECT count(*) FROM cohort_final WHERE cohortgrp = 'empty_grp'"))[0] == 0, (
             "the empty cohort has episodes: the test cannot see the shell rows")
-        cohorts = eng.con.execute("SELECT count(*) FROM cfg_cohort").fetchone()[0]
+        cohorts = fetch_one(eng.con.execute("SELECT count(*) FROM cfg_cohort"))[0]
         assert cohorts == 3, cohorts
         total = eng.count("cohort_final")
-        cat_rows, day1_rows, eps700, eps701 = eng.con.execute("""
+        cat_rows, day1_rows, eps700, eps701 = fetch_one(eng.con.execute("""
             SELECT count(*) FILTER (WHERE level = '701'),
                    count(DISTINCT "group") FILTER (WHERE level = '700' AND censdays_value = 1),
                    sum(episodes) FILTER (WHERE level = '700'),
                    sum(episodes) FILTER (WHERE level = '701')
-            FROM followuptime""").fetchone()
+            FROM followuptime"""))
     finally:
         eng.close()
     assert cat_rows == cohorts * 3, (cat_rows, cohorts)
@@ -8497,27 +8463,27 @@ def test_distindex_output_rules_follow_sas(baseline):
         otherwise one blank hoi row.
     """
     con = baseline.con
-    bad_mix = con.execute("""
+    bad_mix = fetch_one(con.execute("""
         SELECT count(*) FROM (
             SELECT "group", distindextype,
                    count(*) FILTER (WHERE distindexlist = '') AS blank,
                    count(*) AS n
             FROM distindex GROUP BY 1, 2)
-        WHERE blank > 0 AND n > 1""").fetchone()[0]
+        WHERE blank > 0 AND n > 1"""))[0]
     assert bad_mix == 0, "a blank list beside real lists: placeholders must stand alone"
-    counted_blank = con.execute(
+    counted_blank = fetch_one(con.execute(
         "SELECT count(*) FROM distindex WHERE distindexlist = '' AND episodes IS NOT NULL"
-    ).fetchone()[0]
+    ))[0]
     assert counted_blank == 0, "a placeholder row carries a count"
-    with_ev, placeholders, hoi_map_wrong = con.execute("""
+    with_ev, placeholders, hoi_map_wrong = fetch_one(con.execute("""
         WITH ev AS (SELECT DISTINCT cohortgrp FROM cohort_final WHERE feventdt IS NOT NULL)
         SELECT (SELECT count(*) FROM ev),
                (SELECT count(*) FROM distindex WHERE distindextype = 'hoi' AND distindexlist = ''),
                (SELECT count(*) FROM distindexmap m WHERE m.distindextype = 'hoi'
                   AND ((m."group" IN (SELECT cohortgrp FROM ev)) <> (m.distindexid IS NOT NULL)))
-    """).fetchone()
+    """))
     assert with_ev > 0, "no cohort with an event: the hoi rules are untested"
-    groups = con.execute("SELECT count(DISTINCT cohortgrp) FROM cohort_final").fetchone()[0]
+    groups = fetch_one(con.execute("SELECT count(DISTINCT cohortgrp) FROM cohort_final"))[0]
     assert placeholders == groups - with_ev, (placeholders, groups, with_ev)
     assert hoi_map_wrong == 0, "hoi map rows disagree with which cohorts have events"
 
@@ -8596,7 +8562,7 @@ def test_fills_are_shaved_to_enrollment_before_stockpiling():
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        outside, stray = eng.con.execute("""
+        outside, stray = fetch_one(eng.con.execute("""
             WITH inside AS (
                 SELECT x.cohortgrp, x.patid, x.adate FROM exposure_claims x
                 JOIN cfg_cohort c ON c.cohortgrp = x.cohortgrp
@@ -8611,7 +8577,7 @@ def test_fills_are_shaved_to_enrollment_before_stockpiling():
               (SELECT count(*) FROM stockpiled s
                  WHERE NOT EXISTS (SELECT 1 FROM inside i WHERE i.cohortgrp = s.cohortgrp
                                      AND i.patid = s.patid AND i.adate = s.orig_adate))
-        """).fetchone()
+        """))
     finally:
         eng.close()
     assert outside > 0, "no fill outside enrollment: the test proves nothing"
@@ -8632,7 +8598,7 @@ def test_stockpiled_records_are_reshaved_to_enrollment():
     eng = Engine(verbose=False)
     try:
         run(load_study(STUDY), DATA, engine=eng, verbose=False)
-        outside, past_end = eng.con.execute("""
+        outside, past_end = fetch_one(eng.con.execute("""
             SELECT count(*) FILTER (WHERE e.patid IS NULL),
                    count(*) FILTER (WHERE e.patid IS NOT NULL AND s.expiredt > e.enr_end)
             FROM stockpiled s
@@ -8643,8 +8609,136 @@ def test_stockpiled_records_are_reshaved_to_enrollment():
             WHERE s.stockgroup IS NOT NULL
               AND EXISTS (SELECT 1 FROM exposure_claims x WHERE x.cohortgrp = s.cohortgrp
                             AND x.patid = s.patid AND x.adate = s.orig_adate AND x.codecat = 'RX')
-        """).fetchone()
+        """))
     finally:
         eng.close()
     assert outside == 0, f"{outside} stockpiled dispensings start outside enrollment"
     assert past_end == 0, f"{past_end} stockpiled dispensings run past their span's end"
+
+
+def test_stockpiling_file_matches_sas_reference_algorithm():
+    """STOCKPILINGFILE (SAMEDAY, SUPRANGE, AMTRANGE, PERCENTDAYS) against a
+    line-by-line transliteration of SAS's ms_stockpiling.sas
+    (tests/_stockpile_reference.py). Randomised patients exercise same-day
+    fills, overlaps of every size and supplies inside and outside the
+    ranges; every stockpiled record must match the reference exactly. A
+    group without a row keeps SAS's defaults.
+    """
+    import datetime as dt
+    import random
+    import sys as _sys
+    from qrp import Engine
+    from qrp.config import parse_stock_range
+    from qrp.sqlsplit import split_statements
+    _sys.path.insert(0, str(Path(__file__).parent))
+    from _stockpile_reference import stockpile
+
+    rules = {  # (group, stockgroup) -> (sameday, suprange, amtrange, percentdays)
+        ("g1", "s1"): ("ax", "1-60", "0<-HIGH", 0.25),
+        ("g1", "s2"): ("nm", "0<-HIGH", "10-<200", None),
+        ("g2", "s1"): ("aa", "LOW-HIGH", "0<-HIGH", 0.5),
+    }
+    rng = random.Random(7)
+    claims = []
+    for g, sg in list(rules) + [("g2", "s9")]:          # g2/s9: no row, defaults
+        for patid in range(1, 41):
+            d = dt.date(2021, 1, 1) + dt.timedelta(days=rng.randrange(60))
+            for _ in range(rng.randrange(1, 9)):
+                for _ in range(1 + (rng.random() < 0.2)):  # sometimes two the same day
+                    sup = rng.choice([7, 14, 30, 30, 30, 60, 90])
+                    claims.append({"cohortgrp": g, "stockgroup": sg, "patid": patid,
+                                   "adate": d, "code": "x", "rxsup": sup,
+                                   "rxamt": float(sup * rng.choice([0.5, 1, 2])),
+                                   "codecat": "RX"})
+                d += dt.timedelta(days=rng.randrange(5, 70))
+    sql = (Path(qrp.__file__).parent / "sql" / "30_exposure.sql").read_text()
+    stmt = next(st.sql for st in split_statements(sql) if st.target == "stockpiled")
+    stmt = stmt.replace("{start_date}", "2000-01-01")
+    eng = Engine(verbose=False)
+    try:
+        eng.register("exposure_claims", claims,
+                     "cohortgrp VARCHAR, stockgroup VARCHAR, patid BIGINT, adate DATE, "
+                     "code VARCHAR, rxsup INTEGER, rxamt DOUBLE, codecat VARCHAR")
+        eng.register("cfg_cohort", [{"cohortgrp": g, "enr_cfg_id": "e", "enr_days": 0}
+                                    for g in ("g1", "g2")],
+                     "cohortgrp VARCHAR, enr_cfg_id VARCHAR, enr_days INTEGER")
+        eng.register("enrollment_spans", [{"enr_cfg_id": "e", "patid": p,
+                                           "enr_start": dt.date(2000, 1, 1),
+                                           "enr_end": dt.date(2030, 12, 31)} for p in range(1, 41)],
+                     "enr_cfg_id VARCHAR, patid BIGINT, enr_start DATE, enr_end DATE")
+        ops = {"a": "sum", "n": "min", "x": "max", "m": "mean"}
+        eng.register("cfg_stockpiling", [
+            {"cohortgrp": g, "stockgroup": sg, "sup_op": ops[sd[0]], "amt_op": ops[sd[1]],
+             "percentdays": pd} for (g, sg), (sd, _, _, pd) in rules.items()],
+            "cohortgrp VARCHAR, stockgroup VARCHAR, sup_op VARCHAR, amt_op VARCHAR, "
+            "percentdays DOUBLE")
+        eng.register("cfg_stockpiling_ranges", [
+            {"cohortgrp": g, "stockgroup": sg, "kind": k, "lo": lo, "lo_open": lo_o,
+             "hi": hi, "hi_open": hi_o}
+            for (g, sg), (_, sr, ar, _) in rules.items()
+            for k, spec in (("sup", sr), ("amt", ar))
+            for lo, lo_o, hi, hi_o in parse_stock_range(spec)],
+            "cohortgrp VARCHAR, stockgroup VARCHAR, kind VARCHAR, lo DOUBLE, "
+            "lo_open BOOLEAN, hi DOUBLE, hi_open BOOLEAN")
+        eng.con.execute(stmt)
+        got = sorted((g, sg, p, a, x, s, round(m, 6)) for g, sg, p, a, x, s, m in
+                     eng.con.execute("SELECT cohortgrp, stockgroup, patid, adate, expiredt, "
+                                     "rxsup, rxamt FROM stockpiled").fetchall())
+    finally:
+        eng.close()
+    want = []
+    seen = {"new_sequence": 0, "truncated": 0, "excluded": 0, "same_day": 0, "pushed": 0}
+    for (g, sg) in list(rules) + [("g2", "s9")]:
+        sd, sr, ar, pd = rules.get((g, sg), ("aa", None, None, None))
+        for p in range(1, 41):
+            fills = [(c["adate"], c["rxsup"], c["rxamt"]) for c in claims
+                     if (c["cohortgrp"], c["stockgroup"], c["patid"]) == (g, sg, p)]
+            recs, excluded = stockpile(fills, sd, sr, ar, pd)
+            want += [(g, sg, p, r["date"], r["exp"], r["sup"], round(r["amt"], 6))
+                     for r in recs if r["sup"] > 0]
+            seen["new_sequence"] += sum(r["flag"] for r in recs)
+            seen["truncated"] += sum(bool(r.get("cut")) for r in recs)
+            seen["excluded"] += len(excluded)
+            seen["same_day"] += sum(r["n"] > 1 for r in recs)
+            seen["pushed"] += sum(r["date"] != r["orig"] for r in recs)
+    # the data must exercise every rule, or a pass proves little
+    assert all(seen.values()), seen
+    want.sort()
+    assert len(got) == len(want), (len(got), len(want))
+    bad = [(w, h) for w, h in zip(want, got, strict=True) if w != h]
+    assert not bad, f"{len(bad)} records differ from SAS's algorithm, e.g. {bad[:2]}"
+
+
+def test_stockpiling_file_reaches_the_run_and_requires_a_stockgroup():
+    """A STOCKPILINGFILE row in a study JSON flows through configuration
+    into the run: a SUPRANGE excluding fills of 30 days or more removes
+    that cohort's long fills, and a cohort without a row is untouched. As
+    in SAS, the stockgroup is required and must be one the cohort's codes
+    use. (Before, the JSON path ignored the file silently.)
+    """
+    from qrp import Engine
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    codes = [{**r, "stockgroup": "lis"} if r.get("group") == "lisinopril" else r
+             for r in base["cohortcodes"]]
+    def counts(stockpiling):
+        study = load_study_dict({**base, "cohortcodes": codes, "stockpilingfile": stockpiling})
+        eng = Engine(verbose=False)
+        try:
+            run(study, DATA, engine=eng, verbose=False)
+            return dict(eng.con.execute(
+                "SELECT cohortgrp, count(*) FROM stockpiled GROUP BY 1").fetchall())
+        finally:
+            eng.close()
+    plain = counts([])
+    ruled = counts([{"group": "lisinopril", "stockgroup": "lis", "suprange": "1-29"}])
+    assert ruled["lisinopril"] < plain["lisinopril"], (plain, ruled)
+    assert ruled["beta_blocker"] == plain["beta_blocker"], (plain, ruled)
+
+    with pytest.raises(ValueError, match="stockgroup is required"):
+        load_study_dict({**base, "cohortcodes": codes,
+                         "stockpilingfile": [{"group": "lisinopril", "stockgroup": ""}]})
+    with pytest.raises(ValueError, match="not used by cohort"):
+        load_study_dict({**base, "cohortcodes": codes,
+                         "stockpilingfile": [{"group": "lisinopril", "stockgroup": "other"}]})

@@ -43,6 +43,7 @@ from .outputs import (  # noqa: F401
 )
 from .events import EmptyResult, LogMessage, Level, RunFinished, RunStarted
 from .scdm import check_table_map, SCDM, columns_of, identify_by_columns, reader, resolve_table
+from .engine import fetch_one
 
 # Stages that produce a table the caller may want on disk.
 
@@ -86,9 +87,9 @@ def _check_exposure(eng: Engine, study: StudyConfig, indata) -> None:
 
     # Distinguish "these codes are absent" from "there are no claims at
     # all", because the fix is different.
-    total_claims = first_value(eng.con.execute(
+    total_claims = first_value(fetch_one(eng.con.execute(
         "SELECT count(*) FROM cdm_dispensing"
-    ).fetchone())
+    )))
     sample = eng.con.execute(
         "SELECT code FROM cfg_codes WHERE role = 'DEF' LIMIT 3"
     ).fetchall()
@@ -582,25 +583,31 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     # config give three copies of every filter row, and the join
     # multiplies rather than deduplicates. That version spilled to disk
     # and ran out of space.
+    # Each cohort's denominator config id, computed ONCE. The comprehensions
+    # below called _denom_cfg_id per cohort and again per demographic value
+    # and age stratum, each call scanning every inclusion rule of the study
+    # (wp307: ~1,480 calls x 2,280 rules for 40 distinct ids).
+    denom_id = {c.cohortgrp: _denom_cfg_id(c, study) for c in cohorts}
+    denom_cohorts = set(study.denominator_cohorts())
     eng.register(
         "cfg_denom_map",
         # Only cohorts SAS would compute a denominator for: OUTPUTDENOM
         # is not "N", and no inclusion rule uses minrxdays > 1.
-        [{"denom_cfg_id": _denom_cfg_id(c, study), "cohortgrp": c.cohortgrp,
+        [{"denom_cfg_id": denom_id[c.cohortgrp], "cohortgrp": c.cohortgrp,
           # "M" = members only: DenNumMemDays is blanked
           # (ms_cidadenom.sas:1346). Carried per COHORT because two
           # cohorts can share a denominator config and still differ on
           # whether they report member-days.
           "output_denom": c.output_denom}
          for c in cohorts
-         if c.cohortgrp in set(study.denominator_cohorts())],
+         if c.cohortgrp in denom_cohorts],
         "denom_cfg_id VARCHAR, cohortgrp VARCHAR, output_denom VARCHAR",
     )
     eng.register(
         "cfg_denom_cohort",
         list({
-            _denom_cfg_id(c, study): {
-                "denom_cfg_id": _denom_cfg_id(c, study),
+            denom_id[c.cohortgrp]: {
+                "denom_cfg_id": denom_id[c.cohortgrp],
                 "enr_cfg_id": _enr_cfg_id(c),
                 "enr_days": c.enr_days,
                 "min_days_supp": c.min_days_supp,
@@ -618,8 +625,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_denom_demog",
         list({
-            (_denom_cfg_id(c, study), dim, v): {
-                "denom_cfg_id": _denom_cfg_id(c, study), "dimension": dim,
+            (denom_id[c.cohortgrp], dim, v): {
+                "denom_cfg_id": denom_id[c.cohortgrp], "dimension": dim,
                 "value": v}
             for c in cohorts
             for dim, vals in (("sex", c.sex), ("race", c.race),
@@ -631,8 +638,8 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
     eng.register(
         "cfg_denom_strata",
         list({
-            (_denom_cfg_id(c, study), lv.ordinal): {
-                "denom_cfg_id": _denom_cfg_id(c, study), "ordinal": lv.ordinal,
+            (denom_id[c.cohortgrp], lv.ordinal): {
+                "denom_cfg_id": denom_id[c.cohortgrp], "ordinal": lv.ordinal,
                 "label": lv.label, "lo": lv.lo, "hi": lv.hi,
                 "unit": lv.unit}
             for c in cohorts
@@ -826,6 +833,28 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
         "cfg_code_strength",
         [{"code": c, "strength": v} for c, v in study.code_strength],
         "code VARCHAR, strength DOUBLE",
+    )
+
+    # STOCKPILINGFILE: per-group settings, and the SUPRANGE / AMTRANGE
+    # intervals (cfg_stockpiling_ranges). A group with no row keeps SAS's
+    # defaults, applied in 30_exposure.sql.
+    eng.register(
+        "cfg_stockpiling",
+        [{"cohortgrp": r.cohortgrp, "stockgroup": r.stockgroup,
+          "sup_op": r.sup_op, "amt_op": r.amt_op, "percentdays": r.percentdays}
+         for r in study.stockpiling],
+        "cohortgrp VARCHAR, stockgroup VARCHAR, sup_op VARCHAR, amt_op VARCHAR, "
+        "percentdays DOUBLE",
+    )
+    eng.register(
+        "cfg_stockpiling_ranges",
+        [{"cohortgrp": r.cohortgrp, "stockgroup": r.stockgroup, "kind": kind,
+          "lo": lo, "lo_open": lo_open, "hi": hi, "hi_open": hi_open}
+         for r in study.stockpiling
+         for kind, spec in (("sup", r.suprange), ("amt", r.amtrange))
+         for lo, lo_open, hi, hi_open in spec],
+        "cohortgrp VARCHAR, stockgroup VARCHAR, kind VARCHAR, lo DOUBLE, "
+        "lo_open BOOLEAN, hi DOUBLE, hi_open BOOLEAN",
     )
 
     eng.register(
@@ -1103,9 +1132,9 @@ def run(
     # legitimately hold only whole amounts.
     if disp and not disp.startswith("("):
         try:
-            _row = eng.con.execute(
+            _row = fetch_one(eng.con.execute(
                 f"SELECT column_type FROM (DESCRIBE SELECT rxamt FROM {disp})"
-            ).fetchone()
+            ))
             rxamt_type = str(_row[0]).upper() if _row else ""
         except Exception:                                   # noqa: BLE001
             rxamt_type = ""
@@ -1308,10 +1337,10 @@ def run(
             CREATE OR REPLACE TABLE _cohort_patids AS
             SELECT DISTINCT patid FROM ptsmasterlist
         """)
-        row = eng.con.execute("""
+        row = fetch_one(eng.con.execute("""
             SELECT (SELECT count(*) FROM _cohort_patids)::DOUBLE
                  / nullif((SELECT count(DISTINCT patid) FROM demographics), 0)
-        """).fetchone()
+        """))
         # fetchone() is Optional; treat "cannot tell" as "do not copy",
         # since the copy is the expensive choice.
         share = (row[0] if row and row[0] is not None else 1.0)

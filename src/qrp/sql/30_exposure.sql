@@ -144,12 +144,11 @@ WHERE x.adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}';
 -- read for nothing — the same "materialise on fan-out only" rule this
 -- package applies everywhere else, violated here.
 CREATE OR REPLACE TABLE stockpiled AS
-WITH sameday AS (
+WITH RECURSIVE shaved AS (
     SELECT
-        x.cohortgrp,
-        x.stockgroup,
-        x.patid,
-        x.adate,
+        x.cohortgrp, x.stockgroup, x.patid, x.adate,
+        -- carried through, so the re-shave needs no second cfg_cohort join
+        cc.enr_cfg_id,
         -- SHAVED to enrollment first, as SAS does before stockpiling
         -- (ms_cidanum.sas:1408, ms_shaveoutside KeepPartBf=N shaverx=Y): a
         -- fill must START inside one of the cohort's enrollment spans
@@ -157,39 +156,56 @@ WITH sameday AS (
         -- keeps only the days up to it, its amount prorated. Chaining the
         -- raw fills let a fill in an enrollment gap, or days beyond a
         -- span, push later fills to dates SAS never has.
-        sum(least(x.rxsup, date_diff('day', x.adate, e.enr_end) + 1))::INTEGER AS rxsup,
-        sum(x.rxamt * least(x.rxsup, date_diff('day', x.adate, e.enr_end) + 1)
-            / x.rxsup)                                                      AS rxamt,
-        count(*)::INTEGER     AS numdispensing
-    -- DISPENSINGS ONLY. SAS stockpiles `_ITDrugs`
-    -- (ms_cidanum.sas:1545); procedure- and diagnosis-sourced exposure
-    -- never passes through it. Chaining them pushed each successive
-    -- administration a day later and stretched the episode end past
-    -- SAS's — visible on a filgrastim patient whose three same-day
-    -- J-code administrations became a six-day run.
+        least(x.rxsup, date_diff('day', x.adate, e.enr_end) + 1)   AS sup,
+        x.rxamt * least(x.rxsup, date_diff('day', x.adate, e.enr_end) + 1)
+            / x.rxsup                                                 AS amt,
+        -- STOCKPILINGFILE settings for the group; none: SAS's defaults
+        coalesce(r.sup_op, 'sum')                                     AS sup_op,
+        coalesce(r.amt_op, 'sum')                                     AS amt_op,
+        r.percentdays,
+        r.cohortgrp IS NOT NULL                                       AS has_rule
     FROM exposure_claims x
     JOIN cfg_cohort cc ON cc.cohortgrp = x.cohortgrp
     JOIN enrollment_spans e
       ON e.enr_cfg_id = cc.enr_cfg_id AND e.patid = x.patid
      AND x.adate BETWEEN e.enr_start AND e.enr_end
+    LEFT JOIN cfg_stockpiling r
+      ON r.cohortgrp = x.cohortgrp AND r.stockgroup = x.stockgroup
     WHERE x.codecat = 'RX'
-      -- A dispensing joins the stockpile chain only if its SUPPLY
-      -- still runs at the start of the required prior-enrolment
-      -- window — the same rule the truncation chain follows.
-      --
-      -- Chaining from the beginning of the extract pushed every
-      -- expiry forward, which closed gaps that SAS leaves open. One
-      -- patient's claims were 35 days apart on their own dates, past
-      -- the 30-day `episodegap`, so SAS starts a new episode there;
-      -- accumulated push made the gap 5 days here and the episodes
-      -- merged, losing the later index date entirely.
-      --
-      -- This closed the last of the membership gap: episodes go from
-      -- 31,440 to 31,464, exactly SAS's count, with no episode in
-      -- either output missing from the other.
       AND x.adate + CAST(x.rxsup - 1 AS INTEGER)
           >= DATE '{start_date}' - cc.enr_days
-    GROUP BY 1, 2, 3, 4
+),
+-- SUPRANGE / AMTRANGE (ms_stockpiling.sas): a dispensing whose shaved
+-- supply or amount falls outside every range of its group is excluded.
+-- A group without a row has SAS's default 0<-HIGH, which every dispensing
+-- meets (supply and amount are already positive).
+in_range AS (
+    SELECT * FROM shaved s
+    WHERE NOT s.has_rule
+       OR (EXISTS (SELECT 1 FROM cfg_stockpiling_ranges q
+                   WHERE q.cohortgrp = s.cohortgrp AND q.stockgroup = s.stockgroup
+                     AND q.kind = 'sup'
+                     AND CASE WHEN q.lo_open THEN s.sup > q.lo ELSE s.sup >= q.lo END
+                     AND CASE WHEN q.hi_open THEN s.sup < q.hi ELSE s.sup <= q.hi END)
+           AND EXISTS (SELECT 1 FROM cfg_stockpiling_ranges q
+                   WHERE q.cohortgrp = s.cohortgrp AND q.stockgroup = s.stockgroup
+                     AND q.kind = 'amt'
+                     AND CASE WHEN q.lo_open THEN s.amt > q.lo ELSE s.amt >= q.lo END
+                     AND CASE WHEN q.hi_open THEN s.amt < q.hi ELSE s.amt <= q.hi END))
+),
+-- SAMEDAY: same-day dispensings combined, supply and amount each by the
+-- group's operator (sum | min | max | mean). A mean supply is rounded to
+-- whole days (SAS would carry the fraction).
+sameday AS (
+    SELECT
+        cohortgrp, stockgroup, patid, adate, sup_op, amt_op, percentdays, enr_cfg_id,
+        (CASE sup_op WHEN 'min'  THEN min(sup) WHEN 'max' THEN max(sup)
+                     WHEN 'mean' THEN round(avg(sup)) ELSE sum(sup) END)::INTEGER AS rxsup,
+        CASE amt_op WHEN 'min'  THEN min(amt) WHEN 'max' THEN max(amt)
+                    WHEN 'mean' THEN avg(amt) ELSE sum(amt) END        AS rxamt,
+        count(*)::INTEGER                                              AS numdispensing
+    FROM in_range
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 ),
 running AS (
     SELECT
@@ -200,11 +216,15 @@ running AS (
         rxsup,
         rxamt,
         numdispensing,
+        enr_cfg_id,
         -- C(i): cumulative supply through this dispensing
         sum(rxsup) OVER w AS cum_sup,
         -- a(j) - C(j-1), expressed in day numbers so it stays integer
         day_num(adate) - (sum(rxsup) OVER w - rxsup) AS anchor
     FROM sameday
+    -- the closed form below: always push. Groups with PERCENTDAYS go
+    -- through the sequential chain instead (pd_chain).
+    WHERE percentdays IS NULL
     -- ORDER BY adate alone is a TOTAL order here: the sameday CTE has
     -- already collapsed to one row per (cohortgrp, patid, adate), so no
     -- tie is possible. Stated explicitly because the guarantee comes
@@ -224,6 +244,82 @@ solved AS (
             ROWS UNBOUNDED PRECEDING
         ) AS running_anchor
     FROM running
+),
+-- PERCENTDAYS (ms_stockpiling.sas:394-480), one dispensing at a time:
+-- the overlap with the previous record's (adjusted) supply, as a share of
+-- the previous days supplied, decides: at most PERCENTDAYS -> pushed to
+-- the day after; more -> kept on its own date, starting a new sequence.
+-- Inherently sequential, so only groups that set it come this way.
+pd_numbered AS (
+    SELECT *, row_number() OVER (PARTITION BY cohortgrp, stockgroup, patid
+                                 ORDER BY adate) AS rn
+    FROM sameday
+    WHERE percentdays IS NOT NULL
+),
+pd_chain AS (
+    SELECT cohortgrp, stockgroup, patid, rn, percentdays, enr_cfg_id,
+           adate AS orig_adate, adate,
+           adate + CAST(rxsup - 1 AS INTEGER) AS expiredt,
+           rxsup, rxamt, numdispensing, 1 AS seq, 0 AS flag
+    FROM pd_numbered WHERE rn = 1
+    UNION ALL
+    SELECT n.cohortgrp, n.stockgroup, n.patid, n.rn, n.percentdays, n.enr_cfg_id,
+           n.adate,
+           CASE WHEN date_diff('day', n.adate, c.expiredt) + 1 > 0
+                 AND (date_diff('day', n.adate, c.expiredt) + 1)::DOUBLE / c.rxsup
+                     <= n.percentdays
+                THEN c.expiredt + 1 ELSE n.adate END,
+           CASE WHEN date_diff('day', n.adate, c.expiredt) + 1 > 0
+                 AND (date_diff('day', n.adate, c.expiredt) + 1)::DOUBLE / c.rxsup
+                     <= n.percentdays
+                THEN c.expiredt + n.rxsup
+                ELSE n.adate + CAST(n.rxsup - 1 AS INTEGER) END,
+           n.rxsup, n.rxamt, n.numdispensing,
+           CASE WHEN date_diff('day', n.adate, c.expiredt) + 1 > 0
+                 AND (date_diff('day', n.adate, c.expiredt) + 1)::DOUBLE / c.rxsup
+                     <= n.percentdays
+                THEN c.seq ELSE c.seq + 1 END,
+           CASE WHEN date_diff('day', n.adate, c.expiredt) + 1 > 0
+                 AND (date_diff('day', n.adate, c.expiredt) + 1)::DOUBLE / c.rxsup
+                     > n.percentdays
+                THEN 1 ELSE 0 END
+    FROM pd_chain c
+    JOIN pd_numbered n
+      ON n.cohortgrp = c.cohortgrp AND n.stockgroup = c.stockgroup
+     AND n.patid = c.patid AND n.rn = c.rn + 1
+),
+-- A sequence started because PERCENTDAYS was exceeded truncates the
+-- previous one: each of its records running into the new sequence ends the
+-- day before it starts, days supplied reduced and amount prorated; a record
+-- left with no days is dropped (ms_stockpiling.sas:451-480).
+pd_next AS (
+    SELECT cohortgrp, stockgroup, patid, seq - 1 AS seq, min(adate) AS next_start
+    FROM pd_chain
+    GROUP BY 1, 2, 3, 4
+    HAVING max(flag) = 1
+),
+pd_stock AS (
+    SELECT c.cohortgrp, c.stockgroup, c.patid, c.adate,
+           CASE WHEN c.expiredt >= x.next_start THEN x.next_start - 1
+                ELSE c.expiredt END                                   AS expiredt,
+           c.orig_adate,
+           CASE WHEN c.expiredt >= x.next_start
+                THEN date_diff('day', c.adate, x.next_start - 1) + 1
+                ELSE c.rxsup END                                      AS rxsup,
+           CASE WHEN c.expiredt >= x.next_start
+                THEN c.rxamt * (date_diff('day', c.adate, x.next_start - 1) + 1) / c.rxsup
+                ELSE c.rxamt END                                      AS rxamt,
+           c.numdispensing, c.enr_cfg_id
+    FROM pd_chain c
+    LEFT JOIN pd_next x
+      ON x.cohortgrp = c.cohortgrp AND x.stockgroup = c.stockgroup
+     AND x.patid = c.patid AND x.seq = c.seq
+    -- kept unless truncation leaves it no days. Written so that a record
+    -- with NO following sequence (x.next_start NULL) is kept: NOT (NULL AND
+    -- NULL) is NULL, which WHERE would have treated as false.
+    WHERE x.next_start IS NULL
+       OR c.expiredt < x.next_start
+       OR date_diff('day', c.adate, x.next_start - 1) + 1 > 0
 )
 -- RE-SHAVED to enrollment after stockpiling, as SAS does
 -- (ms_cidanum.sas:1641-1650, "Need to reshave because Stockpiling may have
@@ -251,12 +347,16 @@ SELECT
     adate       AS orig_adate,
     rxsup,
     rxamt,
-    numdispensing
+    numdispensing,
+    enr_cfg_id
 FROM solved
+UNION ALL
+SELECT cohortgrp, stockgroup, patid, adate, expiredt, orig_adate,
+       rxsup, rxamt, numdispensing, enr_cfg_id
+FROM pd_stock
 ) r
-JOIN cfg_cohort cc ON cc.cohortgrp = r.cohortgrp
 JOIN enrollment_spans e
-  ON e.enr_cfg_id = cc.enr_cfg_id AND e.patid = r.patid
+  ON e.enr_cfg_id = r.enr_cfg_id AND e.patid = r.patid
  AND r.adate BETWEEN e.enr_start AND e.enr_end
 
 UNION ALL
@@ -348,14 +448,20 @@ FROM (
     -- outcome defined by a dispensing or a procedure is legitimate.
     -- Reading cdm_diagnosis only meant such an outcome NEVER fired —
     -- the same defect the exposure extraction had. Reported in review.
+    -- Each branch is pre-filtered to event codes (a semi-join DuckDB applies
+    -- at the scan), so the join below sees candidates only, not every claim
+    -- after enveloping (wp307: event_claims 1.84s -> 0.35s). The join keeps
+    -- every condition; the pre-filter cannot change the result.
     FROM (
         SELECT patid, adate, code, codetype, enctype,
                COALESCE(pdx, '') AS pdx, 'DX' AS codecat
         FROM cdm_diagnosis
+        WHERE code IN (SELECT code FROM cfg_codes WHERE role = 'EVENT')
         UNION ALL
         SELECT patid, adate, code, codetype, enctype, '' AS pdx,
                'PX' AS codecat
         FROM cdm_procedure
+        WHERE code IN (SELECT code FROM cfg_codes WHERE role = 'EVENT')
         UNION ALL
         -- the dispensing vocabulary is real and must not be discarded:
         -- hardcoding NULL here made every configured RX vocabulary
@@ -363,6 +469,7 @@ FROM (
         SELECT patid, adate, code, codetype, '**' AS enctype,
                '' AS pdx, 'RX' AS codecat
         FROM cdm_dispensing
+        WHERE code IN (SELECT code FROM cfg_codes WHERE role = 'EVENT')
     ) x
     JOIN cfg_codes k
       ON k.code    = x.code
@@ -467,12 +574,18 @@ UNION ALL
 
 -- Non-drug truncation claims keep their own dates.
 SELECT DISTINCT k.cohortgrp, t.patid, t.adate, t.adate AS orig_adate
+-- Each branch pre-filtered to truncation codes (a semi-join applied at the
+-- scan), so the join below sees candidates, not every enveloped claim
+-- (wp307: trunc_claims 2.38s -> 1.59s). The join keeps every
+-- condition; the pre-filter cannot change the result.
 FROM (
     SELECT patid, adate, code, 'DX' AS codecat, codetype FROM cdm_diagnosis
      WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+       AND code IN (SELECT code FROM cfg_codes WHERE role = 'TRUNK')
     UNION ALL
     SELECT patid, adate, code, 'PX', codetype FROM cdm_procedure
      WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+       AND code IN (SELECT code FROM cfg_codes WHERE role = 'TRUNK')
 ) t
 JOIN cfg_codes k
   ON k.role = 'TRUNK' AND k.code = t.code AND k.codecat = t.codecat

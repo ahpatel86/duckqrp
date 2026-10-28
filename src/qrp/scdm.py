@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 import duckdb
+from .engine import fetch_one
 
 
 @dataclass(frozen=True)
@@ -459,9 +460,9 @@ def probe(indata: str | Path, sample_rows: bool = True,
         n = 0
         if sample_rows:
             try:
-                n = first_value(con.execute(
+                n = first_value(fetch_one(con.execute(
                     f"SELECT count(*) FROM {reader(glob)}('{glob}')"
-                ).fetchone())
+                )))
             except Exception:
                 n = -1
 

@@ -131,6 +131,6 @@ class ParityDumper:
             eng.con.execute(
                 f"COPY (SELECT {select} FROM {table} {where} {order}) "
                 f"TO '{path}' ({opts})"
-            )
+            ).fetchall()   # consumed: DuckDB 2 requires it
             out.append(path)
         return out

@@ -18,6 +18,7 @@ import random
 import pytest
 
 from qrp.engine import Engine
+from qrp.engine import fetch_one
 
 
 # ---------------------------------------------------------------------
@@ -200,26 +201,26 @@ def test_age_years_is_birthday_aware(eng):
     This is the documented source of the age-bucket tolerance warnings.
     """
     q = "SELECT age_years(DATE '1960-06-15', CAST(? AS DATE))"
-    assert eng.con.execute(q, ["2020-06-14"]).fetchone()[0] == 59
-    assert eng.con.execute(q, ["2020-06-15"]).fetchone()[0] == 60
-    assert eng.con.execute(q, ["2020-06-16"]).fetchone()[0] == 60
+    assert fetch_one(eng.con.execute(q, ["2020-06-14"]))[0] == 59
+    assert fetch_one(eng.con.execute(q, ["2020-06-15"]))[0] == 60
+    assert fetch_one(eng.con.execute(q, ["2020-06-16"]))[0] == 60
     # leap-day birthday
     q2 = "SELECT age_years(DATE '2000-02-29', CAST(? AS DATE))"
-    assert eng.con.execute(q2, ["2021-02-28"]).fetchone()[0] == 20
-    assert eng.con.execute(q2, ["2021-03-01"]).fetchone()[0] == 21
+    assert fetch_one(eng.con.execute(q2, ["2021-02-28"]))[0] == 20
+    assert fetch_one(eng.con.execute(q2, ["2021-03-01"]))[0] == 21
 
 
 def test_periods_overlap_is_inclusive(eng):
-    f = lambda a, b, c, d: eng.con.execute(
+    f = lambda a, b, c, d: fetch_one(eng.con.execute(
         f"SELECT periods_overlap(DATE '{a}', DATE '{b}', DATE '{c}', DATE '{d}')"
-    ).fetchone()[0]
+    ))[0]
     assert f("2020-01-01", "2020-01-10", "2020-01-10", "2020-01-20")  # touch
     assert not f("2020-01-01", "2020-01-09", "2020-01-10", "2020-01-20")
     assert f("2020-01-05", "2020-01-06", "2020-01-01", "2020-01-31")  # contained
 
 
 def test_span_days_is_inclusive(eng):
-    v = eng.con.execute(
+    v = fetch_one(eng.con.execute(
         "SELECT span_days(DATE '2020-01-01', DATE '2020-01-01')"
-    ).fetchone()[0]
+    ))[0]
     assert v == 1

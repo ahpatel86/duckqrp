@@ -681,6 +681,50 @@ class StratumLevel:
         )
 
 
+# ---------------------------------------------------------------------
+# STOCKPILINGFILE (SAS: ms_stockpiling.sas, read in
+# ms_processinputfiles.sas). One row per cohort and stockgroup.
+# ---------------------------------------------------------------------
+_SAMEDAY_OPS = {"a": "sum", "n": "min", "x": "max", "m": "mean"}
+_STOCK_RANGE_PART = _re.compile(r"(\d+(?:\.\d+)?)(<?)-(<?)(\d+(?:\.\d+)?|HIGH)")
+
+
+def parse_stock_range(spec: str | None) -> tuple[tuple[float, bool, float, bool], ...]:
+    """SAS's range syntax for SUPRANGE / AMTRANGE (ms_stockpiling.sas,
+    PARSE_RANGE): space-separated pieces `lo-hi` (inclusive), `lo<-hi`
+    (exclusive low), `lo-<hi` (exclusive high), `HIGH` as the top; `LOW`
+    is read as `0<`. A value outside every piece is excluded. Returns
+    (lo, lo_exclusive, hi, hi_exclusive) per piece."""
+    text = (str(spec).strip() if spec not in (None, "") else "0<-HIGH").upper()
+    text = text.replace("LOW", "0<")
+    parts = []
+    for piece in text.split():
+        m = _STOCK_RANGE_PART.fullmatch(piece)
+        if not m:
+            raise ValueError(
+                f"stockpiling range {spec!r}: cannot read {piece!r} "
+                f"(expected e.g. 1-90, 0<-HIGH, 30-<90)")
+        hi = float("inf") if m[4] == "HIGH" else float(m[4])
+        parts.append((float(m[1]), m[2] == "<", hi, m[3] == "<"))
+    return tuple(parts)
+
+
+@dataclass(frozen=True)
+class StockpilingRule:
+    """One STOCKPILINGFILE row: how a cohort's stockgroup is stockpiled.
+    Absent a row, SAS's defaults apply (sum/sum, 0<-HIGH, always push)."""
+    cohortgrp: str
+    stockgroup: str
+    sup_op: str = "sum"            # same-day supply: sum | min | max | mean
+    amt_op: str = "sum"            # same-day amount
+    suprange: tuple = ((0.0, True, float("inf"), False),)
+    amtrange: tuple = ((0.0, True, float("inf"), False),)
+    # push a refill forward only if overlap / previous days supplied is at
+    # most this fraction; above it, start a new sequence and truncate the
+    # previous one. None: always push (SAS's default).
+    percentdays: float | None = None
+
+
 @dataclass(frozen=True)
 class StudyConfig:
     """Study-level parameters plus every cohort."""
@@ -710,6 +754,7 @@ class StudyConfig:
     lab_codes: tuple[tuple, ...] = ()
     # (cohortgrp, analysisnum, codecat, countmethod, topxx, from, to)
     mfu: tuple[tuple, ...] = ()
+    stockpiling: tuple[StockpilingRule, ...] = ()
     # SAS's RUN_ENVELOPE (ms_envelope.sas): 0 envelopes claims within an
     # inpatient stay, admit day included; 2 switches it off; any other
     # value envelopes from the day AFTER admission.
@@ -1502,10 +1547,28 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
 
     def rows(name: str) -> list[dict[str, Any]]:
         if name not in _rows_cache:
-            _rows_cache[name] = [
-                {str(k).lower(): v for k, v in r.items()}
-                for r in (raw.get(name) or raw.get(name.upper()) or [])
-            ]
+            # The rows of one table share their column names, so lower-case
+            # each distinct key tuple ONCE and build the rows with
+            # dict(zip(...)), in C. Lower-casing every key of every row cost
+            # 5.4M str.lower calls on wp307. A row whose keys differ (in
+            # content or order) gets its own lowered tuple, so mixed rows
+            # are still right.
+            out: list[dict[str, Any]] = []
+            last_keys: tuple = ()
+            lowered: tuple = ()
+            already = False
+            for r in (raw.get(name) or raw.get(name.upper()) or []):
+                keys = tuple(r)
+                if keys != last_keys:
+                    last_keys = keys
+                    lowered = tuple(str(k).lower() for k in keys)
+                    already = lowered == keys
+                # Keys already lower-case (as qrp's own converter writes
+                # them): the row itself, not a copy. Nothing here mutates a
+                # row, so sharing it with `raw` is safe; copying 616k rows
+                # of wp307 to change nothing was most of rows()'s cost.
+                out.append(r if already else dict(zip(lowered, r.values(), strict=True)))
+            _rows_cache[name] = out
         return _rows_cache[name]
 
     # Scalars arrive either pre-resolved from qrp.inputfile, or as a
@@ -1801,6 +1864,8 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         if r.get("code") and r.get("strength") not in (None, "")
     )
 
+    stockpiling = _parse_stockpiling(rows("stockpilingfile"), cohorts, covariates)
+
     study = StudyConfig(
         study_type=_int(params.get("type"), 2),
         run_envelope=_int(params.get("run_envelope"), 0),
@@ -1813,6 +1878,7 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
         drug_classes=drug_classes,
         lab_codes=lab_codes,
         mfu=mfu,
+        stockpiling=stockpiling,
         code_strength=code_strength,
         start_date=_period[0],
         end_date=_period[1],
@@ -1827,11 +1893,73 @@ def load_study_dict(raw: dict[str, Any]) -> StudyConfig:
     return study
 
 
+
+def _parse_stockpiling(rows_: list, cohorts: Sequence, covariates: Sequence
+                       ) -> tuple[StockpilingRule, ...]:
+    """STOCKPILINGFILE rows -> rules, validated against the cohorts.
+
+    As in SAS, a row is keyed by cohort AND stockgroup, and the stockgroup
+    is required: it must be one the cohort's exposure codes use. Settings
+    for a stockgroup used only by covariates are read but not yet applied,
+    which is warned about rather than ignored.
+    """
+    import warnings as _w
+    by_group = {c.cohortgrp: c for c in cohorts}
+    covar_groups = {sg for cv in covariates for _, sg in getattr(cv, "code_stockgroups", ())}
+    seen: set = set()
+    out = []
+    for r in rows_:
+        g = str(r.get("group") or "").strip()
+        sg = str(r.get("stockgroup") or "").strip()
+        if g not in by_group:
+            raise ValueError(f"stockpilingfile: group {g!r} is not a cohort in the cohort file")
+        if not sg:
+            raise ValueError(f"stockpilingfile: stockgroup is required (group {g!r}), as in SAS")
+        known = {s for _, s in by_group[g].exposure_stockgroups}
+        if sg not in known:
+            if sg in covar_groups:
+                _w.warn(f"stockpilingfile: stockgroup {sg!r} (group {g!r}) is used only by "
+                        f"covariates; covariate stockpiling settings are not applied yet",
+                        stacklevel=3)
+                continue
+            raise ValueError(
+                f"stockpilingfile: stockgroup {sg!r} is not used by cohort {g!r}'s codes "
+                f"(its stockgroups: {sorted(known)})")
+        if (g, sg) in seen:
+            raise ValueError(f"stockpilingfile: duplicate row for group {g!r}, stockgroup {sg!r}")
+        seen.add((g, sg))
+        sameday = (str(r.get("sameday") or "aa").strip().lower() + "aa")[:2]
+        ops = []
+        for letter in sameday:
+            if letter not in _SAMEDAY_OPS:
+                _w.warn(f"stockpilingfile: sameday {r.get('sameday')!r} (group {g!r}, "
+                        f"stockgroup {sg!r}): {letter!r} is not a, n, x or m; using a "
+                        f"(sum), as SAS does", stacklevel=3)
+                letter = "a"
+            ops.append(_SAMEDAY_OPS[letter])
+        pd_raw = r.get("percentdays")
+        pdays = None if pd_raw in (None, "", ".") else float(pd_raw)
+        if pdays is not None:
+            if pdays < 0:
+                raise ValueError(f"stockpilingfile: percentdays {pd_raw!r} is negative")
+            if pdays > 1:
+                _w.warn(f"stockpilingfile: percentdays {pd_raw!r} (group {g!r}) is a FRACTION "
+                        f"in SAS (0.25 = 25%); {pdays} lets every overlap be pushed",
+                        stacklevel=3)
+        out.append(StockpilingRule(
+            cohortgrp=g, stockgroup=sg, sup_op=ops[0], amt_op=ops[1],
+            suprange=parse_stock_range(r.get("suprange")),
+            amtrange=parse_stock_range(r.get("amtrange")),
+            percentdays=pdays))
+    return tuple(out)
+
+
 __all__ = [
     "AgeStrata",
     "AgeStratum",
     "CohortConfig",
     "Covariate",
+    "StockpilingRule",
     "StudyConfig",
     "load_study",
     "load_study_dict",

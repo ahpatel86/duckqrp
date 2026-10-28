@@ -19,6 +19,7 @@ import argparse
 from pathlib import Path
 
 import duckdb
+from qrp.engine import fetch_one
 
 # Exposure and outcome code sets the demo study refers to.
 EXPOSURE_CODES = [f"E{i:05d}" for i in range(1, 41)]
@@ -216,9 +217,9 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
     ) TO '{out / "lab_result" / "data.parquet"}' (FORMAT PARQUET)""")
 
     counts = {
-        t: con.execute(
+        t: fetch_one(con.execute(
             f"SELECT count(*) FROM read_parquet('{out / t}/**/*.parquet')"
-        ).fetchone()[0]
+        ))[0]
         for t in ("demographic", "enrollment", "dispensing", "diagnosis",
                   "death", "procedure", "lab_result")
     }

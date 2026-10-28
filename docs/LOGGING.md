@@ -28,7 +28,7 @@ because a log that omits the settings is half useless six weeks later:
 QRP Type 2 run — mpl1r
 environment
   qrp          dev
-  duckdb       1.5.5
+  duckdb       2.0.0
   python       3.12.3
   platform     Linux-6.18.44-...
 inputs

@@ -279,6 +279,8 @@ WITH raw AS (
     -- covers every enrolled member, and shaving it with a
     -- numerator-filtered claim source leaves excluded time in the
     -- denominator for everyone outside the cohort.
+    -- Each branch pre-filtered to inclusion codes (a semi-join applied at
+    -- the scan): the join below then sees candidates, not every claim.
     FROM (
         -- Windowed like every other claim source. SAS shaves from
         -- `_IT<inclusioncodes>`, the EXTRACTED claim set, so a code
@@ -287,12 +289,15 @@ WITH raw AS (
         -- does not have.
         SELECT patid, adate, code, 'DX' AS codecat FROM cdm_diagnosis
          WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+           AND code IN (SELECT code FROM cfg_inclusion_codes)
         UNION ALL
         SELECT patid, adate, code, 'PX' FROM cdm_procedure
          WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+           AND code IN (SELECT code FROM cfg_inclusion_codes)
         UNION ALL
         SELECT patid, adate, code, 'RX' FROM cdm_dispensing
          WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
+           AND code IN (SELECT code FROM cfg_inclusion_codes)
     ) s2
     JOIN cfg_inclusion_codes k
       ON k.code = s2.code AND k.codecat = s2.codecat
@@ -435,14 +440,23 @@ SELECT denom_cfg_id, scope, patid, eligepisode, enr_start, enr_end,
 FROM gaps
 WHERE seg_end >= seg_start
 UNION ALL
--- windows with no ineligible period inside them pass through untouched
+-- windows with no ineligible period inside them pass through untouched.
+-- They are exactly the windows NOT in `overlapping`, so this is an anti-join
+-- on the window's identity, not a correlated NOT EXISTS with a range
+-- condition: that made DuckDB decorrelate over every window (wp307: 1.36M
+-- of them, ~1s) when only 14k overlap anything.
 SELECT w.denom_cfg_id, w.scope, w.patid, w.eligepisode, w.enr_start, w.enr_end,
        w.denom_start, w.denom_end, w.memberdays
 FROM _denom_windows_x w
-WHERE NOT EXISTS (
-    SELECT 1 FROM _denom_unelig_x u
-    WHERE u.denom_cfg_id = w.denom_cfg_id AND u.scope = w.scope AND u.patid = w.patid
-      AND u.unelig_start <= w.denom_end AND u.unelig_end >= w.denom_start);
+ANTI JOIN (SELECT DISTINCT denom_cfg_id, scope, patid, eligepisode,
+                           denom_start, denom_end
+           FROM overlapping) o
+       ON o.denom_cfg_id IS NOT DISTINCT FROM w.denom_cfg_id
+      AND o.scope        IS NOT DISTINCT FROM w.scope
+      AND o.patid        IS NOT DISTINCT FROM w.patid
+      AND o.eligepisode  IS NOT DISTINCT FROM w.eligepisode
+      AND o.denom_start  IS NOT DISTINCT FROM w.denom_start
+      AND o.denom_end    IS NOT DISTINCT FROM w.denom_end;
 
 DROP TABLE _denom_windows;
 DROP VIEW _denom_windows_x;
@@ -451,7 +465,11 @@ DROP VIEW _denom_unelig_a;
 DROP VIEW _denom_ev_pat;
 ALTER TABLE _denom_windows_shaved RENAME TO _denom_windows;
 
-CREATE OR REPLACE TEMP TABLE _denom_demog AS
+-- A view, like _denom_strat which reads it: the chain from windows to
+-- denomcounts streams, with no 1.36M-row intermediate written (wp307:
+-- ~0.5s and the memory). Its source, _denom_windows, is therefore
+-- dropped after denomcounts, not here.
+CREATE OR REPLACE TEMP VIEW _denom_demog AS
 SELECT
     el.denom_cfg_id,
     el.scope,
@@ -476,11 +494,12 @@ JOIN cfg_denom_demog dh ON dh.denom_cfg_id = el.denom_cfg_id
                  AND dh.dimension = 'hispanic' AND dh.value = dm.hispanic
 WHERE mx.patid IS NULL AND ms.patid IS NULL;
 
-DROP TABLE _denom_windows;
 
 -- Pass 2b: age band. Age is taken at the START of the eligible window,
 -- the earliest date an index could occur in it.
-CREATE OR REPLACE TEMP TABLE _denom_strat AS
+-- A view: its one reader (_denom_agg) aggregates it straight to a few
+-- rows, so materialising 1.36M rows first (wp307: 0.47s) bought nothing.
+CREATE OR REPLACE TEMP VIEW _denom_strat AS
 SELECT
     d.denom_cfg_id,
     d.scope,
@@ -500,24 +519,52 @@ JOIN cfg_denom_strata a
   ON a.denom_cfg_id = d.denom_cfg_id
  AND age_in_unit(d.birth_date, d.denom_start, a.unit) BETWEEN a.lo AND a.hi;
 
-DROP TABLE _denom_demog;
 
-CREATE OR REPLACE TABLE denomcounts AS
+-- Two phases, for speed; the counts are identical.
+--   1. _denom_agg: each DISTINCT count once per denominator config, SCOPE,
+--      level and stratum. The shared scope '*' is the same for every
+--      cohort on a config, and an event scope ('a:<cohort>' / 'b:<cohort>')
+--      belongs to one cohort, so nothing needs the cohort fan-out here.
+--   2. denomcounts: map to cohorts and combine '*' + after - before by
+--      plain addition — exactly the FILTERed distinct counts of the
+--      one-step form, which spent 3.9s of wp307's run on 40 rows
+--      re-counting the shared rows once per cohort.
+-- a view: one reader. The planner cannot move the join below the
+-- aggregation, so the counting still happens before the cohort fan-out.
+CREATE OR REPLACE TEMP VIEW _denom_agg AS
 SELECT
-    lv.level_id                                        AS level,
-    -- Fan out: one row per COHORT, from the config that produced it.
-    m.cohortgrp                                        AS "group",
+    lv.level_id,
+    s.denom_cfg_id,
+    s.scope,
     CASE WHEN lv.has_agegroup THEN s.agegroup    END   AS agegroup,
     CASE WHEN lv.has_agegroup THEN s.agegroupnum END   AS agegroupnum,
     CASE WHEN lv.has_sex      THEN s.sex         END   AS sex,
     CASE WHEN lv.has_race     THEN s.race        END   AS race,
     CASE WHEN lv.has_hispanic THEN s.hispanic    END   AS hispanic,
+    CASE WHEN lv.has_year     THEN s.index_year  END   AS index_year,
+    count(DISTINCT s.patid)                            AS n_pts,
+    sum(s.memberdays)                                  AS memberdays
+FROM _denom_strat s
+CROSS JOIN (SELECT * FROM cfg_strata
+            WHERE tableid = 't2cida') lv
+GROUP BY ALL;
+
+CREATE OR REPLACE TABLE denomcounts AS
+SELECT
+    a.level_id                                         AS level,
+    -- Fan out: one row per COHORT, from the config that produced it.
+    m.cohortgrp                                        AS "group",
+    a.agegroup,
+    a.agegroupnum,
+    a.sex,
+    a.race,
+    a.hispanic,
     -- SAS column names (ms_cidadenom.sas:1386). `year`, not
     -- `index_year`; `DenNumPts`/`DenNumMemDays`, not
     -- `eligible_members`/`memberdays`. These are the metrics a
     -- downstream merge references by name, so they are a contract, not
     -- a description.
-    CASE WHEN lv.has_year     THEN s.index_year  END   AS "year",
+    a.index_year                                       AS "year",
     -- Geography and finer time strata appear in SAS's shell and are
     -- stratified on only when a level asks for them. This package does
     -- not offer them as CIDA strata, so they are emitted NULL — the
@@ -531,37 +578,32 @@ SELECT
     NULL::SMALLINT                                     AS "month",
     NULL::SMALLINT                                     AS quarter,
     -- '*' + after - before; see SCOPES above
-    count(DISTINCT s.patid) FILTER (WHERE s.scope = '*')
-      + count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'a:%')
-      - count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'b:%')
+    (coalesce(sum(a.n_pts) FILTER (WHERE a.scope = '*'), 0)
+      + coalesce(sum(a.n_pts) FILTER (WHERE a.scope LIKE 'a:%'), 0)
+      - coalesce(sum(a.n_pts) FILTER (WHERE a.scope LIKE 'b:%'), 0))::BIGINT
                                                        AS dennumpts,
     -- OUTPUTDENOM='M' reports members only: SAS sets DenNumMemDays to
     -- MISSING for those cohorts, and 0 for the rest
     -- (ms_cidadenom.sas:1346-1347). NULL, not 0 — "we did not count
     -- this" and "we counted zero days" are different statements.
     CASE WHEN m.output_denom = 'M' THEN NULL
-         ELSE coalesce(sum(s.memberdays) FILTER (WHERE s.scope = '*'), 0)
-            + coalesce(sum(s.memberdays) FILTER (WHERE s.scope LIKE 'a:%'), 0)
-            - coalesce(sum(s.memberdays) FILTER (WHERE s.scope LIKE 'b:%'), 0)
+         ELSE coalesce(sum(a.memberdays) FILTER (WHERE a.scope = '*'), 0)
+            + coalesce(sum(a.memberdays) FILTER (WHERE a.scope LIKE 'a:%'), 0)
+            - coalesce(sum(a.memberdays) FILTER (WHERE a.scope LIKE 'b:%'), 0)
          END                                           AS dennummemdays
-FROM _denom_strat s
+FROM _denom_agg a
 -- one row per cohort sharing this config
-JOIN cfg_denom_map m ON m.denom_cfg_id = s.denom_cfg_id
+JOIN cfg_denom_map m ON m.denom_cfg_id = a.denom_cfg_id
  -- each cohort sees the shared scope and only its OWN event scopes
- AND (s.scope = '*' OR substr(s.scope, 3) = m.cohortgrp)
-CROSS JOIN (SELECT * FROM cfg_strata
-            WHERE tableid = 't2cida') lv
+ AND (a.scope = '*' OR substr(a.scope, 3) = m.cohortgrp)
 GROUP BY
-    lv.level_id, m.cohortgrp, m.output_denom,
-    CASE WHEN lv.has_agegroup THEN s.agegroup    END,
-    CASE WHEN lv.has_agegroup THEN s.agegroupnum END,
-    CASE WHEN lv.has_sex      THEN s.sex         END,
-    CASE WHEN lv.has_race     THEN s.race        END,
-    CASE WHEN lv.has_hispanic THEN s.hispanic    END,
-    CASE WHEN lv.has_year     THEN s.index_year  END
+    a.level_id, m.cohortgrp, m.output_denom,
+    a.agegroup, a.agegroupnum, a.sex, a.race, a.hispanic, a.index_year
 -- a stratum emptied by the event shave is not emitted, as before
-HAVING count(DISTINCT s.patid) FILTER (WHERE s.scope = '*')
-     + count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'a:%')
-     - count(DISTINCT s.patid) FILTER (WHERE s.scope LIKE 'b:%') > 0;
-
-DROP TABLE _denom_strat;
+HAVING coalesce(sum(a.n_pts) FILTER (WHERE a.scope = '*'), 0)
+     + coalesce(sum(a.n_pts) FILTER (WHERE a.scope LIKE 'a:%'), 0)
+     - coalesce(sum(a.n_pts) FILTER (WHERE a.scope LIKE 'b:%'), 0) > 0;
+DROP VIEW _denom_strat;
+-- after the views that read them, not before: the chain is lazy
+DROP VIEW _denom_demog;
+DROP TABLE _denom_windows;

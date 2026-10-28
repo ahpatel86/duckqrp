@@ -29,8 +29,6 @@ DuckDB specifics worth knowing
 
 from __future__ import annotations
 
-import contextlib
-import os
 
 import threading
 import time
@@ -94,14 +92,20 @@ def sql_str(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-# Row count above which config tables are bulk-loaded via CSV rather
-# than inserted row by row.
-_BULK_LOAD_ROWS = 5_000
 
-# Marks a Python None in the bulk-load CSV, so it stays distinct from a
-# genuine empty string. Chosen to be something no config value holds.
-_NULL_TOKEN = "\\N@qrp"
+def fetch_one(result: Any) -> tuple | None:
+    """The first row of a query's result, or None — what .fetchone() gave
+    on DuckDB 1.x — with the result read to its end.
 
+    DuckDB 2 streams results: a result read only partly owns the connection
+    until it is finished, and fetchone() on even a one-row result leaves it
+    so ("fetch until a fetch returns no rows"; see the DB API's Open Results
+    in DuckDB's docs). fetchall() is the plain DB-API way to read a result
+    to its end, on every version; con.complete() is the 2.0-only
+    equivalent. Every query passed here returns one row or a handful.
+    """
+    rows = result.fetchall()
+    return rows[0] if rows else None
 
 
 def first_value(row: tuple | None, what: str = "query") -> Any:
@@ -215,8 +219,8 @@ class Engine:
         the job actually took on a shared machine.
         """
         try:
-            row = self.con.execute(
-                "SELECT current_setting('memory_limit')").fetchone()
+            row = fetch_one(self.con.execute(
+                "SELECT current_setting('memory_limit')"))
             return str(row[0]).strip() if row else "unknown"
         except Exception:
             return "unknown"
@@ -225,8 +229,8 @@ class Engine:
     def effective_threads(self) -> int:
         """Threads DuckDB will actually use (defaults to core count)."""
         try:
-            row = self.con.execute(
-                "SELECT current_setting('threads')").fetchone()
+            row = fetch_one(self.con.execute(
+                "SELECT current_setting('threads')"))
             return int(row[0]) if row else 0
         except Exception:
             return 0
@@ -234,9 +238,9 @@ class Engine:
     def _parse_limit(self) -> int:
         """Resolve the effective memory limit to bytes."""
         try:
-            raw = str(first_value(self.con.execute(
+            raw = str(first_value(fetch_one(self.con.execute(
                 "SELECT current_setting('memory_limit')"
-            ).fetchone(), "current_setting('memory_limit')")).strip()
+            )), "current_setting('memory_limit')")).strip()
         except Exception:
             return 0
         units = {"KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4,
@@ -262,9 +266,9 @@ class Engine:
         if self._monitor is None:
             return 0
         try:
-            row = self._monitor.execute(
+            row = fetch_one(self._monitor.execute(
                 "SELECT coalesce(sum(temporary_storage_bytes), 0) "
-                "FROM duckdb_memory()").fetchone()
+                "FROM duckdb_memory()"))
             return int(row[0]) if row else 0
         except Exception:
             return 0
@@ -274,11 +278,11 @@ class Engine:
         used = spilled = 0
         if self._monitor is not None:
             try:
-                row = self._monitor.execute(
+                row = fetch_one(self._monitor.execute(
                     "SELECT coalesce(sum(memory_usage_bytes), 0), "
                     "       coalesce(sum(temporary_storage_bytes), 0) "
                     "FROM duckdb_memory()"
-                ).fetchone()
+                ))
                 if row is not None:          # otherwise both stay 0
                     used, spilled = row
             except Exception:
@@ -374,7 +378,7 @@ class Engine:
 
     def count(self, table: str) -> int:
         return int(first_value(
-            self.con.execute(f"SELECT count(*) FROM {table}").fetchone(), f"count of {table}"))
+            fetch_one(self.con.execute(f"SELECT count(*) FROM {table}")), f"count of {table}"))
 
     def shape(self, name: str) -> tuple[int, int]:
         """(rows, columns) for a table or view.
@@ -386,7 +390,7 @@ class Engine:
         statement.
         """
         try:
-            row = self.con.execute(
+            row = fetch_one(self.con.execute(
                 "SELECT t.estimated_size, t.column_count, 0 AS is_view "
                 "FROM duckdb_tables() t WHERE t.table_name = ? "
                 "UNION ALL "
@@ -394,7 +398,7 @@ class Engine:
                 "FROM duckdb_views() v WHERE v.view_name = ? "
                 "LIMIT 1",
                 [name, name],
-            ).fetchone()
+            ))
         except Exception:
             return -1, -1
         if row is None:
@@ -415,54 +419,22 @@ class Engine:
         self.con.execute(f"CREATE OR REPLACE TABLE {name} ({schema})")
         if not rows:
             return
-        parts = [c.strip() for c in schema.split(",") if c.strip()]
-        cols = [c.split()[0] for c in parts]
-        types = [" ".join(c.split()[1:]) or "VARCHAR" for c in parts]
-
-        # Per-row INSERTs are fine for a handful of rows and hopeless for
-        # a real study: a 40-cohort file registers ~300,000 config rows,
-        # and executemany spent 91 SECONDS on them — 79% of the whole
-        # run, against 17 seconds of actual SQL.
+        cols = [c.split()[0] for c in (p.strip() for p in schema.split(",")) if c]
+        # DuckDB 2's native appender: rows go straight into the table, with
+        # no SQL per row and no round trip through text, so an empty string
+        # stays an empty string and a NULL stays NULL.
         #
-        # DuckDB's bulk CSV reader does the same work in a fraction of
-        # the time (0.16s against 13.8s on a 200,000-row benchmark), so
-        # anything large goes through a temp file. Small tables keep the
-        # direct path, which avoids the file overhead and any question
-        # about how a value round-trips through text.
-        if len(rows) < _BULK_LOAD_ROWS:
-            placeholders = ", ".join("?" for _ in cols)
-            self.con.executemany(
-                f"INSERT INTO {name} VALUES ({placeholders})",
-                [[r.get(c) for c in cols] for r in rows],
-            )
-            return
-
-        import csv
-        import tempfile
-
-        spec = ", ".join(f"'{c}': '{t}'" for c, t in zip(cols, types, strict=False))
-        fd, path = tempfile.mkstemp(suffix=".csv", prefix="qrp_cfg_")
-        try:
-            with os.fdopen(fd, "w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(cols)
-                w.writerows(
-                    [_NULL_TOKEN if r.get(c) is None else r.get(c)
-                     for c in cols]
-                    for r in rows)
-            # A sentinel, NOT nullstr=''. csv writes None as an empty
-            # field, so with nullstr='' a genuinely EMPTY STRING would
-            # also arrive as NULL — one risk-code value silently did
-            # exactly that, and an empty string and a NULL behave
-            # differently in a join.
-            self.con.execute(
-                f"INSERT INTO {name} SELECT * FROM read_csv("
-                f"{sql_str(path)}, header=true, columns={{{spec}}}, "
-                f"nullstr={sql_str(_NULL_TOKEN)})"
-            )
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+        # History: per-row INSERTs once spent 91 seconds registering a
+        # 40-cohort study's ~300,000 config rows (79% of the run), so large
+        # tables went through a temporary CSV, which needed a NULL sentinel
+        # to keep empty strings from becoming NULL. The appender replaced
+        # both: 0.002s against 0.158s for 500 rows, 0.447s against 0.778s
+        # for 300,000, tables identical. A value it cannot convert raises.
+        app = self.con.appender(name)
+        # map(r.get, ...) looks the values up in C; a missing key is still None
+        app.append_rows([tuple(map(r.get, cols)) for r in rows])
+        app.flush()
+        del app
 
     # ---------------- stage boundary --------------------------------
 
@@ -551,7 +523,9 @@ class Engine:
             if path.exists():
                 _shutil.rmtree(path)
             opts += f", PARTITION_BY ({partition_by}), OVERWRITE_OR_IGNORE"
-        self.con.execute(f"COPY {table} TO {sql_str(path)} ({opts})")
+        # consume the result (a row count): DuckDB 2 refuses the next
+        # statement until it is read
+        self.con.execute(f"COPY {table} TO {sql_str(path)} ({opts})").fetchall()
 
     def write_csv(self, table: str, path: str | Path) -> None:
         """Export a table as CSV, for opening in Excel.
@@ -563,7 +537,7 @@ class Engine:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.con.execute(f"COPY {table} TO {sql_str(path)} (FORMAT CSV, HEADER)")
+        self.con.execute(f"COPY {table} TO {sql_str(path)} (FORMAT CSV, HEADER)").fetchall()
 
     def summary(self) -> str:
         total = sum(s.seconds for s in self.log)

@@ -14,13 +14,13 @@ recollection.
 | Runtime code download | **Disabled.** See below — this was ON by default. |
 | Network listener | **Only** if you run `qrp serve` (opt-in extra). |
 | `eval` / `exec` / `pickle` | **None.** |
-| Known CVEs in declared deps | **None** (`pip-audit`, `duckdb>=1.1`). |
+| Known CVEs in declared deps | **None** (`pip-audit`, `duckdb>=2.0,<3`). |
 | Bandit HIGH severity | **Zero.** |
 
 The core runtime dependency list is one line:
 
 ```toml
-dependencies = ["duckdb>=1.1"]
+dependencies = ["duckdb>=2.0,<3"]
 ```
 
 `textual` and `textual-serve` are optional extras. `pytest`/`pandas` are
@@ -127,7 +127,7 @@ For a site that requires provenance:
 * Wheels are published by DuckDB Labs and are reproducible from the
   tagged source at `github.com/duckdb/duckdb`.
 * Pin an exact version and hash in your lockfile
-  (`pip install duckdb==1.5.5 --require-hashes`).
+  (`pip install --require-hashes -r requirements.lock`).
 * Mirror the wheel into an internal artifact repository if outbound PyPI
   is not permitted.
 

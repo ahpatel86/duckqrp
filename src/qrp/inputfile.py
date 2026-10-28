@@ -80,7 +80,6 @@ REQUIRED_TABLES = ("qrp_parameters", "cohortfile", "type2file", "cohortcodes")
 # Tables recognised but not yet implemented — listed so a study using
 # them gets a warning instead of a silently narrower result.
 UNIMPLEMENTED_TABLES = (
-    "stockpilingfile",
     "riskscorefile",
     "utilfile",
     "mfufile",
