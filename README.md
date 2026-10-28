@@ -15,6 +15,9 @@ to. It is **not published on PyPI**, so `pip install qrp-duckdb` and
 No internet at your site? See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
 (offline bundle, single executable, or Docker).
 
+Requires **Python 3.11 or newer**; `pip install` brings in DuckDB 2.0,
+which is what sets that floor.
+
 ```bash
 unzip duckqrp-clean.zip && cd pyqrp-duck
 
@@ -43,7 +46,7 @@ qrp show --out results/            # list result tables
 qrp show --out results/ attrition  # read one
 
 # Developers (after the [dev] install):
-pytest                             # the full suite, ~330 tests
+pytest                             # the full suite, ~340 tests
 python tools/gen_synthetic.py --out /tmp/qrp_data/100k --patients 100000
 python tools/bench.py --scales 100k 500k 2m
 ```
@@ -53,7 +56,8 @@ python tools/bench.py --scales 100k 500k 2m
 ## What this is and isn't
 
 **Is:** the Type 2 spine, end to end and running — normalize, enrollment
-spans, exposure extraction, stockpiling, dose restrictions, washout/index
+spans, exposure extraction, stockpiling (including `STOCKPILINGFILE`),
+dose restrictions, washout/index
 dates, POV1, episode construction, censoring, patient master list,
 follow-up washout, event attribution, baseline covariate detection,
 attrition and stratified denominators.
@@ -64,11 +68,20 @@ code distribution, geography, lab extraction, combo covariates
 
 **Isn't:** the Type 1/3/4/5/6 branches, propensity scores, secondary
 episodes, `INDEXDT_EXP` anchors (comparator designs), and the LAB01
-lookup's full attribute mapping. Each of these **warns at load** rather
+lookup's full attribute mapping, and `STOCKPILINGFILE` settings for
+stockgroups used only by covariates. Each of these **warns at load** rather
 than failing silently, because ignoring a rule makes a cohort *broader*
 than SAS's — the dangerous direction.
 
 ## Measured
+
+> **These tables were measured on an earlier version** (DuckDB 1.x,
+> before the efficiency review) and have not been re-run since. Two
+> changes have made runs faster: **DuckDB 2.0** — on the wp307 study,
+> 34.9 s → 25.8 s for the whole run, measured back to back with
+> identical results — and an **efficiency review** that removed about
+> 10.8 s of stage time from a wp307 run, every change kept only with
+> identical outputs. Read the figures below as an upper bound.
 
 On **1 CPU core / 3 GB RAM**.
 
@@ -197,6 +210,16 @@ A cumulative sum and a running max — two ordered window functions over
 one sort, fully vectorised, no UDF and no recursion. Proven by induction,
 and tested against the sequential reference on 200 random patients
 (`tests/test_rewrites.py`).
+
+Two additions since. Groups that set `percentdays` in a
+`STOCKPILINGFILE` follow SAS's sequential rule instead — whether a refill
+is pushed depends on where the previous one ended up, which has no closed
+form — through a recursive chain that only those groups pay for. It is
+tested record for record against a line-by-line transliteration of
+`ms_stockpiling.sas`. And, as SAS does (`ms_cidanum.sas`), dispensings
+are shaved to enrollment both before stockpiling and again after it,
+since stockpiling can push a fill outside enrollment; that is what made
+attrition match SAS exactly.
 
 ### 4. Washout is a running max, not a range self-join
 
@@ -329,6 +352,11 @@ python -m qrp run --study s.json --indata scdm/ --out results/ \
 
 Measured on the 2m-patient study (316 MB input, 10 stages):
 
+(Measured on the same earlier version as the tables above, and not
+re-measured under DuckDB 2.0. The denominators now stream rather than
+store their largest intermediate tables, but whether peak memory has
+moved overall is unmeasured: treat these as indicative.)
+
 | Configuration | Time | Peak RSS |
 |---|---|---|
 | `:memory:`, no limit | 117 s | 3807 MB |
@@ -395,14 +423,15 @@ src/qrp/
   show.py         read result tables without pandas
   tui.py          Textual terminal UI
   engine.py       DuckDB connection + stage boundary + timing
-  pipeline.py     config -> tables, then 7 stages
+  pipeline.py     config -> tables, then 23 stages
   parity.py       dump in the existing harness's directory layout
   cli.py          argparse entry point
   sql/
     00_macros.sql      shared vocabulary
     10_normalize.sql   the schema contract
     20_enrollment.sql  episoderec2 + enrollment spans
-    30_exposure.sql    extraction + closed-form stockpiling
+    30_exposure.sql    extraction, enrollment shaves, stockpiling
+                       (closed form; PERCENTDAYS chain)
     40_index.sql       findgap washout
     42_dose.sql        cumulative dose + CFDD (RANGE-framed windows)
     45_pov1.sql        demographics, age strata, enrollment
@@ -410,7 +439,7 @@ src/qrp/
     50_episodes.sql    claim episodes + master list + censoring
     55_dose_censor.sql maxcumdose episode censoring
     60_followup.sql    follow-up washout + events (ASOF)
-    70_outputs.sql     attrition + denominators (GROUPING SETS)
+    70_outputs.sql     attrition (SAS's 27-level funnel) + denominators
     52_inclusion.sql   INCLUSIONCODES: cond/subcond, dose, anchors
     72_codedistribution.sql  code distribution / distindex
     74_utilization.sql encounter + drug utilization
@@ -431,7 +460,7 @@ tests/
   test_ui.py           event stream, cancellation, headless TUI
 ```
 
-Roughly 14,500 lines total (6,650 Python, 2,730 SQL, 5,090 tests),
+Roughly 23,100 lines total (8,190 Python, 4,890 SQL, 10,030 tests),
 against
 ~40,000 in the PySpark package —
 though that ratio is unfair in both directions, since the port covers
@@ -490,15 +519,19 @@ upstream rather than from the clause, so the SQL says so in a comment.
 
 ## Honest caveats
 
-- **Not verified against SAS OUTPUT.** `docs/SAS_PARITY.md` records a
-  clause-by-clause audit against the SAS macro library — deliberately
-  the macros, not the PySpark port, so a defect in the port would not be
-  inherited silently. It found eight divergences, all fixed. But reading
-  has limits: two further divergences were found only when a reviewer
-  pointed at a column I had dismissed, and four more only when lab
-  data and a real input file arrived. **One comparison against SAS
-  output for a real study would test every stage at once**, including
-  the ones read confidently and got wrong.
+- **Verified against SAS output for one study, not for every feature.**
+  On wp307 (40 cohorts, a 0.1% extract), every output table matches
+  SAS's: the master list (92 columns, 31,464 episodes), `t2_cida`,
+  `denomcounts`, baseline, follow-up time, both index-distribution tables
+  and all 27 attrition levels. MFU's per-code counts match; only its
+  order among tied codes differs, which SAS leaves undetermined. Before
+  that comparison, `docs/SAS_PARITY.md`'s clause-by-clause audit of the
+  SAS macros found eight divergences; comparing real output found many
+  more, every one now fixed. **What wp307 does not exercise is still
+  unverified against SAS output**: dose limits, a `STOCKPILINGFILE`,
+  prior-look periods, member-level age, chart and demographic
+  restrictions, and every Type other than 2. A second study is the next
+  real test.
 - **Covariate detection WAS the scaling risk, and it was real.** An
   earlier edition of this file predicted it; on a production study it
   grew 15.5× for 4× the data. Fixed (see the benchmark section), and a
