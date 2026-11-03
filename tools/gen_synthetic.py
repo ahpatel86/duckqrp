@@ -77,8 +77,7 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
                 'Y' AS medcov,
                 CASE WHEN random() < 0.93 THEN 'Y' ELSE 'N' END AS drugcov,
                 'Y' AS chart,
-                -- PlanType P = PPO, PayerType MC = Medicare: each in its
-                -- own SCDM domain (the pair was swapped before).
+                -- SCDM PlanType P means PPO. SCDM PayerType MC means Medicare.
                 'P'  AS plantype,
                 'MC' AS payertype
             FROM _pat p
@@ -116,10 +115,9 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
         COPY (
             SELECT
                 patid, adate, dx, dx_codetype, encounterid, providerid,
-                -- SCDM populates Pdx only for IP and IS encounters and
-                -- blanks it for AV/ED/OA; deriving it from the aliased
-                -- enctype (not an independent draw) keeps the pair
-                -- consistent on every row.
+                -- SCDM allows Pdx only for IP and IS encounters.
+                -- DuckDB cannot reuse a side-effecting alias in one SELECT list.
+                -- This outer select derives Pdx from Enctype.
                 CASE WHEN enctype IN ('IP', 'IS')
                      THEN CASE WHEN random() < 0.3 THEN 'P' ELSE 'S' END
                      ELSE '' END AS pdx,
@@ -152,8 +150,8 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
         COPY (
             SELECT patid,
                    DATE '2011-01-01' + CAST(random() * 1800 AS INTEGER) AS deathdt,
-                   -- Source N = National Death Registry; 'D' is not in
-                   -- the SCDM Source domain (L, N, S, T, O, M).
+                   -- SCDM Source allows L, N, S, T, O, and M.
+                   -- N means National Death Registry.
                    'N' AS dtimpute, 'N' AS source, 'E' AS confidence
             FROM _pat WHERE random() < 0.04
         ) TO '{out / "death" / "data.parquet"}'
