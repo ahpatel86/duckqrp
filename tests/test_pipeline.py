@@ -1727,6 +1727,212 @@ def test_dose_comparisons_round_like_sas():
     assert "round(l.cfdd)" in sql
 
 
+# ---------------------------------------------------------------------
+# DB-5 witness: the maxcumdose censor must precede the length re-check.
+#
+# SAS truncates EpisodeEndDt at the maxcumdose censor date BEFORE the
+# master-list flags are computed
+# (ms_createptsmasterlist.sas:124), so MinEnrolMet3 (:156) and
+# MinEpiDurMet (:165) see the POST-truncation end, and the subsetting IF
+# at :185 drops every episode failing any of them, followed by the
+# defensive `if IndexDt > EpisodeEndDt then delete` (:188). This port
+# filtered on the PRE-truncation end and let the dose censor truncate
+# afterwards without re-checking anything, so episodes the censor pushed
+# below minepisdur were kept here but deleted by SAS — and episodes
+# failing the observable-days requirement on the pre-truncation end were
+# deleted here but kept by SAS, because on the post-truncation end the
+# requirement is easier to satisfy.
+#
+# These tests assert the SAS-expected outcome on a deterministic study.
+# ---------------------------------------------------------------------
+
+
+def _db5_witness_study(**t2_overrides):
+    """The demo study with the lisinopril group tuned for the witness."""
+    from qrp.config import load_study_dict
+
+    base = json.loads((STUDY.parent / "demo_full.json").read_text())
+    for t in base["type2file"]:
+        if t["group"] == "lisinopril":
+            t.update(t2_overrides)
+    return load_study_dict({
+        "qrp_parameters_scalars": {
+            "type": 2, "runid": "db5w",
+            "startdate": "2011-01-01", "enddate": "2015-06-30",
+        },
+        "cohortfile": base["cohortfile"],
+        "type2file": base["type2file"],
+        "cohortcodes": base["cohortcodes"],
+        "codestrength": base["codestrength"],
+    })
+
+
+_DB5_DC_REPL = """
+-- The dose-censor date computed over ALL candidate episodes, not just
+-- master-list survivors: the accumulation mirrors 55_dose_censor.sql
+-- (SAS ms_createpov4.sas:178-201), but sources episode_criteria so the
+-- witness can evaluate the SAS flags on the truncated end for episodes
+-- the current code dropped upstream.
+CREATE OR REPLACE TEMP TABLE _db5_dc AS
+WITH in_window AS (
+    SELECT e.cohortgrp, e.patid, e.indexdt,
+           d.adate, d.expiredt, d.cumdose, c.max_cum_dose
+    FROM episode_criteria e
+    JOIN cfg_cohort c
+      ON c.cohortgrp = e.cohortgrp
+     AND c.max_cum_dose IS NOT NULL
+     AND c.cum_dose_per IS NOT NULL
+    JOIN claim_dose d
+      ON d.cohortgrp = e.cohortgrp
+     AND d.patid     = e.patid
+     AND d.adate BETWEEN e.indexdt - c.cum_dose_per AND e.episodeenddt
+),
+running AS (
+    SELECT *,
+           sum(cumdose) OVER (
+               PARTITION BY cohortgrp, patid, indexdt
+               ORDER BY adate, expiredt
+               ROWS UNBOUNDED PRECEDING
+           ) AS total
+    FROM in_window
+)
+SELECT cohortgrp, patid, indexdt, min(expiredt) AS censordate_maxdose
+FROM running
+WHERE round(total) > max_cum_dose
+GROUP BY 1, 2, 3
+"""
+
+
+def test_db5_witness_dose_censor_recheck_min_episode_duration():
+    """WITNESS (DB-5, case 1: minepisdur).
+
+    maxcumdose=800 with cumdoseper=90 censors most episodes a few weeks
+    after the index. With minepisdur=90 the stage-50 flags pass on the
+    UNCENSORED end, but SAS recomputes MinEpiDurMet on the POST-truncation
+    end (ms_createptsmasterlist.sas:124 before :165) and the subsetting IF
+    at :185 deletes every episode it fails. Truncating after the filter
+    kept 1,157 such episodes in this witness.
+
+    SAS-expected outcome: NO master-list episode ends below minepisdur.
+    """
+    from qrp import Engine
+
+    s = _db5_witness_study(maxcumdose=800.0, t2cumdoseper=90, maxcfdd=None,
+                           minepisdur=90, reqdaysaftepi=0)
+    assert s.any_dose_censoring
+
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        below = fetch_one(eng.con.execute("""
+            SELECT count(*) FROM ptsmasterlist m
+            JOIN cfg_cohort c ON c.cohortgrp = m.cohortgrp
+            WHERE m.cohortgrp = 'lisinopril'
+              AND span_days(m.indexdt, m.episodeenddt) < c.min_epis_dur
+        """))[0]
+        assert below == 0, (
+            f"{below} master-list episode(s) end below minepisdur after "
+            f"dose-censor truncation: SAS recomputes MinEpiDurMet on the "
+            f"truncated end (ms_createptsmasterlist.sas:124 before :165, "
+            f"subsetting IF :185) and deletes them"
+        )
+    finally:
+        eng.close()
+
+
+def test_db5_witness_dose_censor_recheck_observable_days():
+    """WITNESS (DB-5, case 2: required observable days after the episode).
+
+    With reqdaysaftepi=180 the MinEnrolMet3 component of the post-index
+    data-availability flag fails on the long pre-truncation end for
+    episodes whose dose censor lands the end well before the data runs
+    out. SAS evaluates MinEnrolMet3 on the POST-truncation end
+    (ms_createptsmasterlist.sas:124 before :156), where the requirement
+    is satisfied, and KEEPS those episodes; filtering before truncating
+    deleted them here. 208 such episodes exist in this witness.
+
+    SAS-expected outcome: every episode whose ONLY stage-50 failure is
+    the observable-days component, and which passes it on the truncated
+    end, is present in the master list.
+    """
+    from qrp import Engine
+
+    s = _db5_witness_study(maxcumdose=800.0, t2cumdoseper=90, maxcfdd=None,
+                           minepisdur=1, reqdaysaftepi=180)
+    assert s.any_dose_censoring
+
+    eng = Engine(verbose=False)
+    try:
+        run(s, DATA, engine=eng, verbose=False)
+        eng.con.execute(_DB5_DC_REPL)
+        sas_kept = eng.con.execute("""
+            WITH cand AS (
+                SELECT e.*, c.min_epis_dur, c.req_days_aft_epi,
+                       x.censordate_maxdose,
+                       least(e.episodeenddt,
+                             x.censordate_maxdose) AS t_end
+                FROM episode_criteria e
+                JOIN cfg_cohort c ON c.cohortgrp = e.cohortgrp
+                JOIN _db5_dc x
+                  ON x.cohortgrp = e.cohortgrp AND x.patid = e.patid
+                 AND x.indexdt  = e.indexdt
+            )
+            SELECT cohortgrp, patid, indexdt FROM cand
+            WHERE min_enr_days_met
+              AND min_day_sup_met
+              AND min_epi_dur_met
+              AND post_blackout_met
+              -- FUEnrolMet component (index-anchored, ms_createptsmasterlist
+              -- .sas:171-174): unaffected by the truncation
+              AND (min_epis_dur <= 0
+                   OR (enr_start <= indexdt
+                       AND indexdt + (min_epis_dur - 1) <= enr_end))
+              -- MinEnrolMet3 (:156): fails on the pre-truncation end,
+              -- passes on the post-truncation end
+              AND NOT (dataavail_dt >= episodeenddt + greatest(0, req_days_aft_epi))
+              AND dataavail_dt >= t_end + greatest(0, req_days_aft_epi)
+              -- :188
+              AND indexdt <= t_end
+        """).fetchall()
+        present = fetch_one(eng.con.execute("""
+            WITH cand AS (
+                SELECT e.*, c.min_epis_dur, c.req_days_aft_epi,
+                       x.censordate_maxdose,
+                       least(e.episodeenddt,
+                             x.censordate_maxdose) AS t_end
+                FROM episode_criteria e
+                JOIN cfg_cohort c ON c.cohortgrp = e.cohortgrp
+                JOIN _db5_dc x
+                  ON x.cohortgrp = e.cohortgrp AND x.patid = e.patid
+                 AND x.indexdt  = e.indexdt
+            )
+            SELECT count(*) FROM cand
+            JOIN ptsmasterlist m
+              ON m.cohortgrp = cand.cohortgrp AND m.patid = cand.patid
+             AND m.indexdt  = cand.indexdt
+            WHERE cand.min_enr_days_met
+              AND cand.min_day_sup_met
+              AND cand.min_epi_dur_met
+              AND cand.post_blackout_met
+              AND (cand.min_epis_dur <= 0
+                   OR (cand.enr_start <= cand.indexdt
+                       AND cand.indexdt + (cand.min_epis_dur - 1) <= cand.enr_end))
+              AND NOT (cand.dataavail_dt
+                       >= cand.episodeenddt + greatest(0, cand.req_days_aft_epi))
+              AND cand.dataavail_dt >= cand.t_end + greatest(0, cand.req_days_aft_epi)
+              AND cand.indexdt <= cand.t_end
+        """))[0]
+        assert present == len(sas_kept), (
+            f"{len(sas_kept) - present} of {len(sas_kept)} episodes whose "
+            f"observable-days flag only passes on the dose-truncated end "
+            f"are missing from the master list: SAS evaluates MinEnrolMet3 "
+            f"on the truncated end (ms_createptsmasterlist.sas:124 before "
+            f":156) and keeps them"
+        )
+    finally:
+        eng.close()
+
+
 def _fupwash_study(**t2_overrides):
     from qrp.config import load_study_dict
 
