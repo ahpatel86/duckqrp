@@ -28,13 +28,6 @@
 -- enrollment spans already carry death censoring where the study asks
 -- for it.
 --
--- For studies with INCLUSIONCODES (SAS sets excl_incl=Y), eligible time
--- is further restricted below: each INCLUSION subcondition's windows
--- clip the enrollment (ms_cidadenom.sas:212-261), %ms_dose_denom's
--- qualifying dose spans clip it again (:265-280), exclusion windows are
--- removed further down, and exclusion dose spans remove time too
--- (:366-376). Studies without inclusion codes keep the exact
--- enrollment-minus-exclusions path. See docs/SAS_PARITY.md.
 -- =====================================================================
 
 -- Split into three passes rather than one nine-way join. Written as a
@@ -116,37 +109,8 @@ FROM windows w
 -- the start.
 WHERE w.denom_end >= w.denom_start;
 
--- ------------------------------------------------------------------
--- INCLUSION-restricted eligible time (excl_incl = Y).
---
--- SAS does not count all enrolled time for INC-condition studies. Per
--- INCLUSION subcondition it derives one window per claim,
---
---   EligStart = ADate - coalesce(CondTo, 99999)
---   EligEnd   = Expiredt - coalesce(CondFrom, -99999)   (dateonly = 'N')
---             = ADate     - coalesce(CondFrom, -99999)   (dateonly = 'Y')
---   if EligStart <= EligEnd;                  (ms_cidadenom.sas:212-219)
---
--- requires the windows of CODEDAYS DISTINCT dispensing dates to overlap
--- (:220-247), and clips the enrollment into the result with
--- %ms_shaveoutside(KeepPartBf=Y) (:253-261). Within a condition the
--- subconditions INTERSECT (successive clips of the same enrollment
--- copy); across conditions the merged STACK_INC windows UNION
--- (:400-449). Exclusion windows are removed afterwards. MINRXDAYS never
--- clips the denominator: it gates the NUMERATOR's index dates
--- (ms_createpov3.sas:374-393), and a study with minrxdays > 1 gets NO
--- denominator from SAS at all — "Outputdenom set to N ... because
--- minrxdays is used in inclusion/exclusion criteria"
--- (ms_setnumloopmacrovars.sas:898-900), enforced in the Python config
--- (StudyConfig.denominator_cohorts). Without this restriction,
--- member-days are overstated for every INC-condition study.
--- ------------------------------------------------------------------
 CREATE OR REPLACE TEMP TABLE _denom_incl_claims AS
 WITH rep AS (
-    -- One representative cohort per denominator config. The config id
-    -- hashes the INCLUSION rules, so cohorts sharing a config carry
-    -- identical rule rows; reading one cohort's keeps a claim from
-    -- matching once per sharing cohort and duplicating dose sums.
     SELECT denom_cfg_id, min(cohortgrp) AS cohortgrp
     FROM cfg_denom_map
     GROUP BY denom_cfg_id
@@ -171,11 +135,6 @@ SELECT
     CASE WHEN r.dateonly THEN s2.adate - r.condfrom
          ELSE s2.expiredt - r.condfrom END              AS elig_end
 FROM (
-    -- Windowed like every other claim source. SAS shaves from
-    -- `_IT<inclusioncodes>`, the EXTRACTED claim set, so a code outside
-    -- the extraction window never restricts anyone. A DX/PX Expiredt is
-    -- `ADate + CodeSupply - 1` with CodeSupply defaulting to 1; only
-    -- dispensings carry supply.
     SELECT patid, adate, code, 'DX' AS codecat,
            adate AS expiredt, NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt
     FROM cdm_diagnosis
@@ -201,23 +160,9 @@ JOIN rep
 JOIN cfg_inclusion r
   ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
  AND r.cond = k.cond AND r.subcond = k.subcond AND r.codecat = k.codecat
--- only plain index-anchored windows; an episode-end anchor has no
--- meaning without an episode (same skip the EXC shave applies)
 WHERE coalesce(r.condfromanchor, '') <> 'EPISODEENDDT'
   AND coalesce(r.condtoanchor, '')   <> 'EPISODEENDDT';
 
--- %ms_dose_denom: per-subcondition dose thresholds restrict TIME, not
--- members. SAS enumerates one row per member-day inside each claim's
--- window ∩ enrollment (ms_dose_denom.sas:77-92), prorates every
--- overlapping dispensing into the day's [date+CondFrom, date+CondTo]
--- lookback (:154-170), keeps days meeting round(cumdose,1) >= subcumdose
--- and the afdd bounds (:173-182), collapses the qualifying days into
--- eligcumdosestart/end spans (:185-204), and ms_cidadenom shaves those
--- into the denominator — INSIDE for inclusions (:272-280), OUT for
--- exclusions (:366-376). The macro is invoked only when at least one
--- threshold is set: `%if %sysevalf(&subcumdose. > 0) |
--- %sysevalf(&subminafdd. > 0) | %sysevalf(&submaxafdd. > 0)`
--- (ms_cidadenom.sas:265-270).
 CREATE OR REPLACE TEMP TABLE _denom_dose_spans AS
 WITH gated AS (
     SELECT DISTINCT
@@ -227,15 +172,10 @@ WITH gated AS (
     JOIN cfg_denom_map m ON m.cohortgrp = r.cohortgrp
     WHERE (coalesce(r.mincumdose, 0) > 0 OR coalesce(r.minafdd, 0) > 0
            OR coalesce(r.maxafdd, 0) > 0)
-      -- same anchor skip as the window shaves
       AND coalesce(r.condfromanchor, '') <> 'EPISODEENDDT'
       AND coalesce(r.condtoanchor, '')   <> 'EPISODEENDDT'
 ),
 clipped AS (
-    -- SAS enumerates days inside [eligstartdt, eligenddt] ∩ enrollment
-    -- (ms_dose_denom.sas:77-92). Enumerating against the member's own
-    -- denominator windows and intersecting with them again at the shave
-    -- yields the same spans at a fraction of the rows.
     SELECT c.denom_cfg_id, c.criteria, c.cond, c.subcond, c.patid,
            g.condfrom, g.condto, g.mincumdose, g.minafdd, g.maxafdd,
            greatest(c.elig_start, w.denom_start)        AS gs,
@@ -256,13 +196,6 @@ days AS (
     FROM clipped
     WHERE gs <= ge
 ),
--- Every dispensing overlapping the day's lookback window is credited,
--- prorated by the share of its supply inside it:
---   cumdose = cumdose * (rxsup - ToDeductBf - ToDeductAf) / rxsup
--- (ms_dose_denom.sas:158-170), where the two deductions are the parts
--- of the supply before [date+CondFrom] and after [date+CondTo] — i.e.
--- the overlap in days. aFDD divides the summed cfdd by the number of
--- dispensings (:173-182); SAS does not prorate it.
 rx AS (
     SELECT d.denom_cfg_id, d.criteria, d.cond, d.subcond, d.patid, d.day,
            overlap_days(c.adate, c.expiredt,
@@ -291,13 +224,6 @@ summed AS (
     GROUP BY 1, 2, 3, 4, 5, 6
 ),
 qualified AS (
-    -- `where=(round(cumdose,1)>=&subcumdose. and
-    --   round((cfdd/numdispensing),1) >= &subminafdd. and
-    --   round((cfdd/numdispensing),1) <= &submaxafdd.)`
-    -- (ms_dose_denom.sas:173-182). An unset bound is a no-op, so NULL
-    -- thresholds fall back to 0 (or no bound); a day with no credited
-    -- dispensing has NULL cfdd and fails any set bound, as SAS's
-    -- missing-value comparisons do.
     SELECT denom_cfg_id, criteria, cond, subcond, patid, day
     FROM summed
     WHERE round(cumdose, 1) >= coalesce(mincumdose, 0)
@@ -305,9 +231,6 @@ qualified AS (
       AND (maxafdd IS NULL
            OR round(cfdd / numdispensing, 1) <= maxafdd)
 ),
--- Contiguous qualifying days collapse to eligcumdosestart/end spans
--- (ms_dose_denom.sas:185-204): a new block starts wherever a day is not
--- the successor of the previous one.
 marked AS (
     SELECT *,
            CASE WHEN day <= max(day) OVER (
@@ -328,15 +251,8 @@ SELECT denom_cfg_id, criteria, cond, subcond, patid,
 FROM blocks
 GROUP BY 1, 2, 3, 4, 5, blk;
 
--- Clip the enrolled windows into the INCLUSION-restricted time, the
--- mirror of `_denom_windows_shaved`'s subtraction: there ineligible
--- periods are cut out, here everything OUTSIDE the allowed spans is.
 CREATE OR REPLACE TEMP TABLE _denom_windows_incl AS
 WITH daywin AS (
-    -- One window per (member, DISTINCT dispensing date): SAS assigns an
-    -- id that increments only when ADate changes
-    -- (ms_cidadenom.sas:220-247), so same-day dispensings are one window
-    -- reaching as far as their combined supply does.
     SELECT denom_cfg_id, cond, subcond, patid,
            min(elig_start)                                  AS ws,
            CASE WHEN bool_or(dateonly) THEN min(elig_end)
@@ -346,14 +262,6 @@ WITH daywin AS (
     WHERE criteria = 'INC' AND elig_start <= elig_end
     GROUP BY denom_cfg_id, cond, subcond, patid, adate
 ),
--- The common overlap of CODEDAYS windows from DISTINCT dates is the set
--- of days covered by at least CODEDAYS of them: a day inside some
--- combination's common overlap is inside codedays windows, and any
--- codedays covering a day have that day in their overlap. A sweep over
--- starts (+1) and end+1 (-1) finds those days for any codedays where
--- SAS needs one self-join per codedays way (:220-247). At a date tie
--- the -1 events sort first, so a window ending on a day and one
--- starting on it cancel before the count is read for that day.
 cd_events AS (
     SELECT denom_cfg_id, cond, subcond, patid, codedays, ws AS d, 1 AS delta
     FROM daywin
@@ -395,10 +303,6 @@ cd_cov AS (
     GROUP BY denom_cfg_id, cond, subcond, patid, span_no
 ),
 keys AS (
-    -- how many subconditions each INC condition has, and how many of
-    -- them carry dose thresholds: a day counts toward the condition
-    -- only when EVERY subcondition covers the member then, and when
-    -- dose-gated subconditions exist, every one of those covers it too
     SELECT m.denom_cfg_id, r.cond,
            count(DISTINCT r.subcond) AS win_need,
            count(DISTINCT CASE WHEN coalesce(r.mincumdose, 0) > 0
@@ -456,8 +360,6 @@ inc_cond AS (
     GROUP BY denom_cfg_id, cond, patid, span_no
 ),
 dose_union AS (
-    -- the dose-gated subconditions of each condition intersect the same
-    -- way; conditions with no dose-gated subcondition constrain nothing
     SELECT s.denom_cfg_id, s.cond, s.patid, k.dose_need AS need,
            s.span_start, s.span_end
     FROM _denom_dose_spans s
@@ -503,18 +405,10 @@ dose_cond AS (
     GROUP BY denom_cfg_id, cond, patid, span_no
 ),
 cond_keys AS (
-    -- Per subcondition the eligibility is codedays-window ∩ dose-span
-    -- (ms_cidadenom.sas:253-261 then :265-280), and intersecting across
-    -- subconditions distributes over the pairwise intersections — so
-    -- the condition's sweep needs every window-covering subcondition
-    -- AND every dose-covering one.
     SELECT denom_cfg_id, cond,
            1 + CASE WHEN dose_need > 0 THEN 1 ELSE 0 END AS need
     FROM keys
 ),
--- Intersect the condition's window time with its dose time: two span
--- sets that are each already disjoint, counted by the same sweep —
--- covered exactly when both cover.
 cond_events AS (
     SELECT e.denom_cfg_id, e.cond, e.patid, k.need,
            e.d, e.delta
@@ -560,10 +454,6 @@ cond_cov AS (
     FROM cond_open
     GROUP BY denom_cfg_id, cond, patid, span_no
 ),
--- ACROSS conditions the windows UNION: "_Denom&Group._STACK_INC includes
--- all time periods where the potential index dates will meet at least
--- one of the cond inclusions" (ms_cidadenom.sas:406). Same merge as
--- `_denom_unelig`.
 raw AS (
     SELECT denom_cfg_id, patid, span_start, span_end FROM cond_cov
 ),
@@ -587,11 +477,6 @@ allow AS (
     FROM blocks
     GROUP BY denom_cfg_id, patid, blk
 )
--- DuckDB's greatest/least ignore NULLs, so with no matching allowed
--- span the window keeps its own bounds — and the WHERE drops it once
--- the denominator config HAS inclusion rules. A config with none must
--- pass through exactly: SAS scopes excl_incl per group (built from
--- that group's rules only) and never clips a group without them.
 SELECT w.denom_cfg_id, w.patid, w.eligepisode, w.enr_start, w.enr_end,
        greatest(w.denom_start, a.span_start) AS denom_start,
        least(w.denom_end, a.span_end)        AS denom_end,
@@ -815,11 +700,6 @@ WITH raw AS (
 
     UNION ALL
 
-    -- Periods disqualified by an EXCLUSION subcondition's DOSE
-    -- thresholds: %ms_dose_denom's qualifying spans are shaved OUT of
-    -- the denominator on the exclusion side (ms_cidadenom.sas:366-376),
-    -- the mirror of the inclusion shave at :272-280 — there meeting the
-    -- dose profile keeps time, here meeting it removes it.
     SELECT denom_cfg_id, patid, span_start AS unelig_start,
            span_end AS unelig_end
     FROM _denom_dose_spans

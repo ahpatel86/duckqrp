@@ -277,7 +277,7 @@ def test_minrxdays_suppresses_the_denominator_like_sas(tmp_path):
     <group> because minrxdays is used in inclusion/exclusion criteria"
     (ms_setnumloopmacrovars.sas:898-900): a pro-rated supply requirement
     makes the eligible-member count incoherent. minrxdays = 1 is the
-    default and computes normally; nothing in the denominator's window
+    default and computes normally. Nothing in the denominator's window
     arithmetic reads minrxdays (it gates the NUMERATOR's index dates,
     ms_createpov3.sas:374-393).
     """
@@ -304,7 +304,7 @@ def test_subconditions_intersect_within_a_condition(tmp_path):
 
     Subcond 1 (code A, [-30, -10]): A on 06-01 -> [06-11, 07-01].
     Subcond 2 (code B, [-20, -5]):  B on 06-20 -> [06-25, 07-10].
-    Intersection [06-25, 07-01] = 7 member-days; a member meeting only
+    Intersection [06-25, 07-01] = 7 member-days. A member meeting only
     subcond 1 keeps none.
     """
     _scdm(
@@ -349,9 +349,9 @@ def test_episode_end_anchor_does_not_raise_a_conditions_need(tmp_path):
     """win_need counts only the subconditions that produce denominator
     windows. The claim stage skips EPISODEENDDT-anchored rules (an
     episode end does not exist in the denominator's enrolled time), so
-    `keys` must skip them too: counting one made a condition mixing a
+    `keys` must skip them too: counting one makes a condition mixing a
     plain subcond and an anchored subcond require 2 covering windows
-    while at most 1 could ever exist, zeroing the cohort out. SAS
+    while at most 1 can exist, zeroing the cohort out. SAS
     builds the inclusion table from the group's rules and intersects
     the windows it actually derived (ms_cidadenom.sas:220-261).
 
@@ -494,7 +494,7 @@ def test_exclusion_shaves_after_inclusion(tmp_path):
 #   od(d) = min(06-10, d-10) - max(06-01, d-30) + 1,
 # credited cumdose = 100 * od / 10 = 10 * od.  round(cumdose,1) >= 50
 # needs od >= 5, which holds exactly for d in [06-15, 07-06] (22 days,
-# one contiguous span); >= 40 needs od >= 4 -> [06-14, 07-07] (24 days).
+# one contiguous span). The >= 40 bound needs od >= 4 -> [06-14, 07-07] (24 days).
 
 
 def _dose_rule(thresholds: dict) -> dict:
@@ -582,7 +582,7 @@ def test_dateonly_dose_entry_uses_the_dispensing_date(tmp_path):
 
 
 def test_dateonly_amount_prorates_the_supply_span(tmp_path):
-    """The dateonly split stops at the ENTRY test; the credited AMOUNT
+    """The dateonly split stops at the ENTRY test. The credited AMOUNT
     of an entered claim is still its supply overlap with the day's
     lookback, with no dateonly case in the proration step
     (ms_dose_denom.sas:154-171).
@@ -625,7 +625,7 @@ def test_dateonly_amount_prorates_the_supply_span(tmp_path):
 def test_dose_afdd_bounds_qualify_without_mincumdose(tmp_path):
     """afdd = round(sum(cfdd) / numdispensing, 1) = 10 on every
     candidate day, so [8, 12] keeps all 30 enumerated days
-    (ms_dose_denom.sas:173-182); 5 or 15 excludes every day and the
+    (ms_dose_denom.sas:173-182). 5 or 15 excludes every day and the
     member keeps no eligible time.
     """
     _scdm(tmp_path, [(1, "2021-06-01", "D", 10, 100.0)])
@@ -683,7 +683,7 @@ def test_inclusion_scoping_is_per_cohort_group_in_mixed_studies(tmp_path):
     group has rules (:1020-1021), and the stack shave runs only
     `%IF %SYSFUNC(exist(_Denom&Group._STACK_INC))=1`
     (ms_cidadenom.sas:399). Scoping the pass-through guard on the
-    study as a whole dropped every window of the INC-less cohort.
+    study as a whole drops every window of the INC-less cohort.
 
     Cohort c1 carries an INC rule: dispensing 2021-06-01, supply 10
     (Expiredt 06-10), window [-30, -10] -> eligible [06-11, 07-01],
@@ -726,7 +726,7 @@ def test_all_episodeenddt_anchored_condition_passes_through(tmp_path):
     episode-end anchor, which has no meaning without an episode) and
     no keys rows. The pass-through guard must therefore treat such a
     config as INC-less — the same skip semantics every other stage of
-    this file applies to that anchor. Counting it as INC-having left
+    this file applies to that anchor. Counting it as INC-having leaves
     the cohort with no allowed spans and an empty denominator.
 
     Single condition whose single subcond carries
@@ -756,7 +756,7 @@ def test_all_episodeenddt_anchored_condition_passes_through(tmp_path):
 
 
 def test_denominator_config_key_separates_inclusion_rules():
-    """The denominator is clipped by the INCLUSION rules, so cohorts
+    """The INCLUSION rules clip the denominator, so cohorts
     with different ones must not share a denominator pass — sharing
     would apply one cohort's inclusions to the other's denominator.
     """

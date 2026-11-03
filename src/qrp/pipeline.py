@@ -446,11 +446,10 @@ def _enr_cfg_id(c) -> str:
 
 
 def _rules_key(c, study: StudyConfig, criteria: str) -> str:
-    """Every rule of one criteria that shapes this cohort's denominator.
+    """Every rule of one criteria value that shapes this cohort's denominator.
 
-    The INCLUSION half shapes it too (ms_cidadenom.sas:212-261 clips the
-    enrollment into each subcondition's windows, and %ms_dose_denom
-    restricts it further), so both halves belong in the key.
+    The key carries every field the clip reads. A missing field
+    silently merges two cohorts whose clips differ.
     """
     parts = []
     for r in study.inclusions:
@@ -528,11 +527,9 @@ def _denom_cfg_id(c, study: StudyConfig) -> str:
         # them let one cohort's exclusions be applied to another's
         # denominator through the shared config id.
         hashlib.sha1(_exclusion_key(c, study).encode()).hexdigest()[:12],
-        # The INCLUSION rules belong here for the same reason: SAS clips
-        # the enrolled window into each subcondition's codedays windows
-        # (ms_cidadenom.sas:253-261) and into %ms_dose_denom's qualifying
-        # spans (:272-280), so two cohorts with different inclusions have
-        # different eligible time.
+        # The INCLUSION rules belong here too: they clip the enrolled
+        # window (ms_cidadenom.sas:253-261, :272-280), so two cohorts
+        # with different inclusions have different eligible time.
         hashlib.sha1(_inclusion_key(c, study).encode()).hexdigest()[:12],
         # The OUTCOME is deliberately NOT part of this key. It changes
         # the denominator only for the few members with an event, and
