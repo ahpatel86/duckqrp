@@ -251,9 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         runlog = RunLog(a.log_dir, run_id="qrp",
                         write_jsonl=not a.no_jsonl).capture()
 
-    # The engine handle exists the moment Engine() succeeds; failures can
-    # happen before it is ever bound (a bad study), so the finally below
-    # needs the name bound regardless.
+    # Initialize the handle before construction so finally can close it after later failures.
     eng: Engine | None = None
     t0 = time.perf_counter()
     try:
@@ -297,12 +295,8 @@ def main(argv: list[str] | None = None) -> int:
         if runlog is not None:
             runlog.stage_summary(eng)
     except KeyboardInterrupt:
-        # Ruling DB-3(b): a Ctrl-C is a cancelled run, not a crash — it
-        # gets the terminal record the UI path already has. cancelled is
-        # its own state: ok stays True, error stays empty, no ERROR
-        # LogMessage; and the manifest-last rule stands, so a cancelled
-        # run still writes no manifest. Exit 130 is the 128+SIGINT shell
-        # convention.
+        # Record cancellation as its own state. Keep ok True and error empty, and do not emit an ERROR LogMessage.
+        # Keep the manifest-last rule: cancellation writes no manifest. Return 130 for 128+SIGINT, the shell convention for SIGINT.
         if eng is not None:
             eng.emit(RunFinished(cancelled=True,
                                  seconds=time.perf_counter() - t0))
@@ -324,11 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nFailed:\n  {message}", file=sys.stderr)
         return 1
     finally:
-        # Release the engine on the failure and cancellation paths too:
-        # close() used to live only at the end of the try, so a SIGINT
-        # or a failed stage returned with the DuckDB connection still
-        # open. The success path closed it anyway, so nothing moves for
-        # a completed run.
+        # Close the engine here so failures and cancellation also release its DuckDB connection.
         if eng is not None:
             eng.close()
         if runlog is not None:

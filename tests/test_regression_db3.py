@@ -1,28 +1,3 @@
-"""Regression (ruling DB-3b): SIGINT during `qrp run` leaves a terminal record.
-
-Before the fix, KeyboardInterrupt was a BaseException that `except
-Exception` could not catch: the process died with a raw traceback, the
-JSONL stream ended with no terminal record, and no FAILED line reached
-the .log — a cancelled run was indistinguishable from a truncated one.
-
-The adopted option (b) catches KeyboardInterrupt in cli.main around the
-run block, covering from BEFORE Engine construction through output
-writes, and reuses the in-app cancellation convention end to end:
-
-* RunFinished(cancelled=True) into the JSONL — cancelled is its own
-  state: ok is NOT flipped to False, no ERROR LogMessage, error stays
-  empty;
-* a CANCELLED outcome line in the .log where a failure's FAILED goes;
-* one plain-language diagnostic line on stderr;
-* exit 130 (128+SIGINT shell convention);
-* manifest-last untouched: a cancelled run still writes NO manifest.
-
-Standalone: drives cli.main in-process on the repo's demo study, with
-KeyboardInterrupt injected at two points — inside pipeline.run (mid-run,
-with output files already partly on disk so the manifest assertion is
-meaningful) and during Engine construction (the window before the
-engine exists).
-"""
 
 from __future__ import annotations
 
@@ -40,7 +15,6 @@ DATA = Path("/tmp/qrp_data/100k")
 
 
 def _event_stream(log_dir: Path) -> list[dict]:
-    """Parse the single JSONL stream one run wrote into log_dir."""
     files = list(log_dir.glob("*.jsonl"))
     assert len(files) == 1, f"expected exactly one JSONL stream, got {files}"
     return [json.loads(line) for line in files[0].read_text().splitlines()]
@@ -75,8 +49,6 @@ def _stderr_lines(capsys) -> list[str]:
 
 def test_sigint_mid_run_writes_the_cancelled_terminal_record(
         monkeypatch, tmp_path, capsys) -> None:
-    """A Ctrl-C mid-run exits 130 and ends BOTH files with the cancelled
-    terminal record — not a traceback, not a truncated stream."""
     out = tmp_path / "out"
     log_dir = tmp_path / "logs"
 
@@ -122,8 +94,6 @@ def test_sigint_mid_run_writes_the_cancelled_terminal_record(
 
 def test_sigint_before_engine_construction_still_records(
         monkeypatch, tmp_path, capsys) -> None:
-    """The catch wraps from BEFORE Engine construction: a Ctrl-C during
-    construction must still produce the terminal record, not a traceback."""
     out = tmp_path / "out"
     log_dir = tmp_path / "logs"
 
@@ -152,8 +122,6 @@ def test_sigint_before_engine_construction_still_records(
 
 def test_sigint_without_log_dir_still_exits_130(
         monkeypatch, tmp_path, capsys) -> None:
-    """No --log-dir means no files to record into, but the exit contract
-    and the stderr diagnostic still hold — and nothing is written."""
     out = tmp_path / "out"
 
     def interrupted_run(*args, **kwargs):
@@ -176,8 +144,6 @@ def test_sigint_without_log_dir_still_exits_130(
 @pytest.mark.skipif(not DATA.exists(),
                     reason="run tools/gen_synthetic.py first")
 def test_success_path_is_unchanged(tmp_path):
-    """The pin: the fix must not bend the happy path — exit 0, manifest
-    present, stream still ends RunFinished(ok=True, cancelled=False)."""
     out = tmp_path / "out"
     log_dir = tmp_path / "logs"
 
