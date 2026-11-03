@@ -1015,6 +1015,9 @@ def test_no_single_consumer_temp_tables():
               # swaps it over _denom_windows. A deliberate swap, not a
               # CTE that should have been inlined.
               "_denom_windows_shaved",
+              # Same swap, one step earlier: the INCLUSION-restricted
+              # windows replace _denom_windows before the scope fan-out.
+              "_denom_windows_incl",
               "_denom_unelig",
               # Outcome-event periods. Inlined as a CTE they push the
               # _denom_unelig statement to nine joins, past the six-join

@@ -583,6 +583,10 @@ class InclusionRule:
     #   INDEXDT_EXP   indexdt_exp — when exposure began in a pregnancy exposure window (Type 4)
     condfromanchor: str = "INDEXDT"
     condtoanchor: str = "INDEXDT"
+    # DATEONLY='Y' measures the window end from the claim date alone,
+    # ignoring the supply end (ms_cidadenom.sas:213-218,
+    # `EligEnd=ADate-coalesce(CondFrom,-99999)` for dateonly='Y').
+    dateonly: bool = False
     codedays: int = 1
     # RX only: total DAYS OF SUPPLY in the window must reach this, not
     # the number of claims (ms_createpov3.sas:26 — "total days in window
@@ -1360,6 +1364,7 @@ def _parse_inclusions(
                             or "INDEXDT"),
             condtoanchor=(str(r.get("condtoanchor") or "").strip().upper()
                           or "INDEXDT"),
+            dateonly=_bool_yn(r.get("dateonly")),
             codedays=max(1, _int(r.get("codedays"), 1) or 1),
             minrxdays=max(1, _int(r.get("minrxdays"), 1) or 1),
             mincumdose=_float(r.get("mincumdose")),
