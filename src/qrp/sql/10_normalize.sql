@@ -67,10 +67,6 @@ GROUP BY 1 HAVING count(*) > 1;
 CREATE OR REPLACE TABLE demographics_missing AS
 SELECT DISTINCT CAST(patid AS BIGINT) AS patid
 FROM {read_demographic}
--- SAS tests both columns with the missing() function
--- (ms_create_enrollment_spans.sas:187-192: where missing(BIRTH_DATE) or
--- missing(Sex)). On a character variable missing() is true for the
--- blank string, not only for NULL, so IS NULL alone does not match SAS.
 WHERE is_missing(birth_date) OR is_missing(sex);
 
 -- The dispensed-code column is `rx` in SCDM. An earlier version of this
