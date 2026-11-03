@@ -146,7 +146,8 @@ SELECT
     CAST(adate AS DATE)    AS adate,
     CAST(dx AS VARCHAR)    AS code,
     CAST(dx_codetype AS VARCHAR) AS codetype,
-    upper(COALESCE(CAST(pdx AS VARCHAR), 'X')) AS pdx,
+    CASE WHEN is_missing(pdx) THEN ''
+         ELSE upper(CAST(pdx AS VARCHAR)) END AS pdx,
     upper(COALESCE(CAST(enctype AS VARCHAR), 'XX')) AS enctype
 FROM {read_diagnosis}
 WHERE adate IS NOT NULL;
