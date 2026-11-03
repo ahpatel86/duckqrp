@@ -1836,6 +1836,14 @@ def test_db5_witness_dose_censor_recheck_min_episode_duration():
             f"truncated end (ms_createptsmasterlist.sas:124 before :165, "
             f"subsetting IF :185) and deletes them"
         )
+        # :188 on the truncated end: `if IndexDt > EpisodeEndDt then
+        # delete` runs after the subsetting IF against the POST-truncation
+        # value, so no survivor may invert.
+        inverted = fetch_one(eng.con.execute("""
+            SELECT count(*) FROM ptsmasterlist
+            WHERE cohortgrp = 'lisinopril' AND indexdt > episodeenddt
+        """))[0]
+        assert inverted == 0
     finally:
         eng.close()
 
@@ -1931,6 +1939,34 @@ def test_db5_witness_dose_censor_recheck_observable_days():
         )
     finally:
         eng.close()
+
+
+def test_db5_dose_censor_sas_ordering_pins():
+    """Structural pins for the DB-5 ordering rules.
+
+    The behavioral witness above pins :124-before-:156/:165. These pin
+    the two remaining orderings from the ruling:
+
+    - :188 — the `IndexDt > EpisodeEndDt` delete must run against the
+      POST-truncation end, i.e. it must appear in the master-list
+      rebuild's WHERE, after the UPDATE applied the censor date.
+    - :168 — the maximum-episode-duration truncation runs AFTER the
+      flags and is not fed back into them: the dose stage must not
+      re-apply the cap or re-evaluate flags after it. In this port the
+      cap lives upstream in 50_episodes.sql's censor chain, so the dose
+      stage must contain no max_epis_dur reference at all.
+    """
+    sql = (Path(__file__).resolve().parents[1]
+           / "src" / "qrp" / "sql" / "55_dose_censor.sql").read_text()
+
+    # the censor date is applied to the flag inputs before the filter
+    assert "UPDATE episode_criteria" in sql
+    # :188 — the delete guards the truncated end in the rebuild
+    assert "AND indexdt <= episodeenddt" in sql
+    # :168 — no max-episode-duration re-truncation or re-check here
+    assert "max_epis_dur" not in sql
+    # the rebuild filters on the re-evaluated flags, not the stage-50 ones
+    assert "WHERE min_enr_days_met AND min_enr_aft_met AND min_day_sup_met" in sql
 
 
 def _fupwash_study(**t2_overrides):
