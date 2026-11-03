@@ -1848,6 +1848,77 @@ def test_db5_witness_dose_censor_recheck_min_episode_duration():
         eng.close()
 
 
+_DB5_CASE2_REPL = """
+-- The SAS-expected master-list population for the observable-days
+-- witness, derived from the stage-50 episode end RECONSTRUCTED from
+-- columns the dose stage never rewrites (origepisenddt, trunkdt,
+-- dataavail_dt, enr_start/enr_end). Reading the post-update
+-- episodeenddt instead made the two observable-days predicates exact
+-- complements, so the expected set collapsed to 0 rows on green code
+-- and the assert degenerated to 0 == 0. dataavail_dt is itself
+-- least(enr_end, censor_date, death-if-censor_death) (50_episodes.sql),
+-- so it folds in exactly the non-FUT censor terms of the stage-50
+-- chain; the remaining term is the max-episode-duration cap.
+CREATE OR REPLACE TEMP TABLE _db5_case2 AS
+WITH cand AS (
+    SELECT e.cohortgrp, e.patid, e.indexdt,
+           e.origepisenddt, e.trunkdt, e.dataavail_dt,
+           e.enr_start, e.enr_end,
+           e.min_enr_days_met, e.min_day_sup_met,
+           c.min_epis_dur, c.max_epis_dur, c.blackout_per,
+           c.req_days_aft_ind, c.req_days_aft_epi,
+           x.censordate_maxdose,
+           -- the stage-50 end BEFORE the dose truncation
+           least(coalesce(e.trunkdt, e.origepisenddt),
+                 e.origepisenddt,
+                 e.dataavail_dt,
+                 CASE WHEN c.max_epis_dur > 0
+                      THEN e.indexdt + (c.max_epis_dur - 1)
+                      ELSE DATE '9999-12-31' END) AS pre_end
+    FROM episode_criteria e
+    JOIN cfg_cohort c ON c.cohortgrp = e.cohortgrp
+    JOIN _db5_dc x
+      ON x.cohortgrp = e.cohortgrp AND x.patid = e.patid
+     AND x.indexdt  = e.indexdt
+),
+ends AS (
+    SELECT *,
+           -- the dose-truncated end, computed HERE from the
+           -- reconstruction, not read from the updated column
+           least(pre_end, censordate_maxdose) AS t_end
+    FROM cand
+)
+SELECT cohortgrp, patid, indexdt FROM ends
+WHERE min_enr_days_met
+  AND min_day_sup_met
+  -- MinEpiDurMet (:165) on both ends: the observable-days component
+  -- must be the episode's ONLY stage-50 failure
+  AND span_days(indexdt, pre_end) >= min_epis_dur
+  AND span_days(indexdt, t_end) >= min_epis_dur
+  -- PostBlackoutper on both ends
+  AND (blackout_per <= 0
+       OR date_diff('day', indexdt, pre_end) - blackout_per >= 0)
+  AND (blackout_per <= 0
+       OR date_diff('day', indexdt, t_end) - blackout_per >= 0)
+  -- FUEnrolMet enrollment component (index-anchored,
+  -- ms_createptsmasterlist.sas:171-174): unaffected by the truncation
+  AND (min_epis_dur <= 0
+       OR (enr_start <= indexdt
+           AND indexdt + (min_epis_dur - 1) <= enr_end))
+  -- MinEnrolMet3 (:156): the index-anchored component passes, the
+  -- reqdaysaftepi component FAILS on the pre-truncation end ...
+  AND dataavail_dt >= indexdt + greatest(0, req_days_aft_ind)
+  AND NOT (dataavail_dt >= pre_end + greatest(0, req_days_aft_epi))
+  -- ... and PASSES on the dose-truncated end — SAS truncates (:124)
+  -- before evaluating (:156) and the subsetting IF (:185) keeps such
+  -- episodes; the pre-DB-5 code filtered on the pre-truncation end
+  -- and dropped them
+  AND dataavail_dt >= t_end + greatest(0, req_days_aft_epi)
+  -- `if IndexDt > EpisodeEndDt then delete` (:188) on the truncated end
+  AND indexdt <= t_end
+"""
+
+
 def test_db5_witness_dose_censor_recheck_observable_days():
     """WITNESS (DB-5, case 2: required observable days after the episode).
 
@@ -1862,6 +1933,12 @@ def test_db5_witness_dose_censor_recheck_observable_days():
     SAS-expected outcome: every episode whose ONLY stage-50 failure is
     the observable-days component, and which passes it on the truncated
     end, is present in the master list.
+
+    The expectation is built from the PRE-truncation end, reconstructed
+    from columns the dose stage never rewrites, and stays non-empty
+    after stage 55 truncates episode_criteria in place — reading the
+    post-update end made the two observable-days predicates exact
+    complements and this witness a vacuous 0 == 0 pass.
     """
     from qrp import Engine
 
@@ -1873,65 +1950,25 @@ def test_db5_witness_dose_censor_recheck_observable_days():
     try:
         run(s, DATA, engine=eng, verbose=False)
         eng.con.execute(_DB5_DC_REPL)
-        sas_kept = eng.con.execute("""
-            WITH cand AS (
-                SELECT e.*, c.min_epis_dur, c.req_days_aft_epi,
-                       x.censordate_maxdose,
-                       least(e.episodeenddt,
-                             x.censordate_maxdose) AS t_end
-                FROM episode_criteria e
-                JOIN cfg_cohort c ON c.cohortgrp = e.cohortgrp
-                JOIN _db5_dc x
-                  ON x.cohortgrp = e.cohortgrp AND x.patid = e.patid
-                 AND x.indexdt  = e.indexdt
-            )
-            SELECT cohortgrp, patid, indexdt FROM cand
-            WHERE min_enr_days_met
-              AND min_day_sup_met
-              AND min_epi_dur_met
-              AND post_blackout_met
-              -- FUEnrolMet component (index-anchored, ms_createptsmasterlist
-              -- .sas:171-174): unaffected by the truncation
-              AND (min_epis_dur <= 0
-                   OR (enr_start <= indexdt
-                       AND indexdt + (min_epis_dur - 1) <= enr_end))
-              -- MinEnrolMet3 (:156): fails on the pre-truncation end,
-              -- passes on the post-truncation end
-              AND NOT (dataavail_dt >= episodeenddt + greatest(0, req_days_aft_epi))
-              AND dataavail_dt >= t_end + greatest(0, req_days_aft_epi)
-              -- :188
-              AND indexdt <= t_end
-        """).fetchall()
+        eng.con.execute(_DB5_CASE2_REPL)
+        sas_kept = fetch_one(eng.con.execute(
+            "SELECT count(*) FROM _db5_case2"))[0]
         present = fetch_one(eng.con.execute("""
-            WITH cand AS (
-                SELECT e.*, c.min_epis_dur, c.req_days_aft_epi,
-                       x.censordate_maxdose,
-                       least(e.episodeenddt,
-                             x.censordate_maxdose) AS t_end
-                FROM episode_criteria e
-                JOIN cfg_cohort c ON c.cohortgrp = e.cohortgrp
-                JOIN _db5_dc x
-                  ON x.cohortgrp = e.cohortgrp AND x.patid = e.patid
-                 AND x.indexdt  = e.indexdt
-            )
-            SELECT count(*) FROM cand
+            SELECT count(*) FROM _db5_case2 c
             JOIN ptsmasterlist m
-              ON m.cohortgrp = cand.cohortgrp AND m.patid = cand.patid
-             AND m.indexdt  = cand.indexdt
-            WHERE cand.min_enr_days_met
-              AND cand.min_day_sup_met
-              AND cand.min_epi_dur_met
-              AND cand.post_blackout_met
-              AND (cand.min_epis_dur <= 0
-                   OR (cand.enr_start <= cand.indexdt
-                       AND cand.indexdt + (cand.min_epis_dur - 1) <= cand.enr_end))
-              AND NOT (cand.dataavail_dt
-                       >= cand.episodeenddt + greatest(0, cand.req_days_aft_epi))
-              AND cand.dataavail_dt >= cand.t_end + greatest(0, cand.req_days_aft_epi)
-              AND cand.indexdt <= cand.t_end
+              ON m.cohortgrp = c.cohortgrp AND m.patid = c.patid
+             AND m.indexdt  = c.indexdt
         """))[0]
-        assert present == len(sas_kept), (
-            f"{len(sas_kept) - present} of {len(sas_kept)} episodes whose "
+        # calibration pin: if the expected population ever shrinks toward
+        # empty, the presence assert below degenerates toward 0 == 0 and
+        # the witness proves nothing again
+        assert sas_kept == 208, (
+            f"witness population is {sas_kept}, not the calibrated 208 "
+            f"episodes whose only stage-50 failure is the observable-days "
+            f"component; an empty expected set cannot witness anything"
+        )
+        assert present == sas_kept, (
+            f"{sas_kept - present} of {sas_kept} episodes whose "
             f"observable-days flag only passes on the dose-truncated end "
             f"are missing from the master list: SAS evaluates MinEnrolMet3 "
             f"on the truncated end (ms_createptsmasterlist.sas:124 before "
