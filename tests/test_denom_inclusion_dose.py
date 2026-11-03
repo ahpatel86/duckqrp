@@ -345,6 +345,59 @@ def test_subconditions_intersect_within_a_condition(tmp_path):
     assert rows == [("c1", 1, 7)]
 
 
+def test_episode_end_anchor_does_not_raise_a_conditions_need(tmp_path):
+    """win_need counts only the subconditions that produce denominator
+    windows. The claim stage skips EPISODEENDDT-anchored rules (an
+    episode end does not exist in the denominator's enrolled time), so
+    `keys` must skip them too: counting one made a condition mixing a
+    plain subcond and an anchored subcond require 2 covering windows
+    while at most 1 could ever exist, zeroing the cohort out. SAS
+    builds the inclusion table from the group's rules and intersects
+    the windows it actually derived (ms_cidadenom.sas:220-261).
+
+    Subcond 1 (code A 2021-06-01, window [-30, -24]) alone covers
+    [06-25, 07-01] = 7 member-days. Subcond 2 (code B 2021-06-20,
+    window [-20, -5], condtoanchor EPISODEENDDT) produces no window
+    and must not raise the requirement.
+    """
+    _scdm(
+        tmp_path,
+        [
+            (1, "2021-06-01", "A", 1, 1.0),
+            (1, "2021-06-20", "B", 1, 1.0),
+        ],
+    )
+    rows = _denom(
+        tmp_path,
+        _study(
+            [
+                {
+                    "group": "c1",
+                    "indexcriteria": "INC",
+                    "codecat": "RX",
+                    "code": "A",
+                    "condlevel": "1",
+                    "subcondlevel": "1",
+                    "condfrom": -30,
+                    "condto": -24,
+                },
+                {
+                    "group": "c1",
+                    "indexcriteria": "INC",
+                    "codecat": "RX",
+                    "code": "B",
+                    "condlevel": "1",
+                    "subcondlevel": "2",
+                    "condfrom": -20,
+                    "condto": -5,
+                    "condtoanchor": "EPISODEENDDT",
+                },
+            ]
+        ),
+    )
+    assert rows == [("c1", 1, 7)]
+
+
 def test_conditions_union_across(tmp_path):
     """Meeting ANY condition's inclusions makes time eligible: the
     merged STACK_INC windows union (ms_cidadenom.sas:406).
@@ -474,6 +527,57 @@ def test_dose_proration_moves_the_qualifying_edges(tmp_path):
     assert rows == [("c1", 1, 24)]
 
 
+def test_dateonly_dose_crediting_ignores_the_supply_tail(tmp_path):
+    """A dateonly claim's crediting period is its dispensing date
+    alone — never the supply tail:
+    `(claim.dateonly='N' ... period2=claim.ADate claim.Expiredt) |
+     (claim.dateonly='Y' ... period2=claim.ADate)`
+    (ms_dose_denom.sas:148-151).
+
+    Rule code D, window [-30, -10], dateonly, mincumdose 15,
+    strength 1:
+      claim 1: D 2021-06-01, supply 10, rxamt 100
+      claim 2: D 2021-06-11, supply 1,  rxamt 10
+
+    Each enumerated day d looks back over [d-30, d-10]. Claim 1
+    credits only when 06-01 falls in that lookback (d in
+    [06-11, 07-01]), worth 100 * 1/10 = 10; claim 2 only when 06-11
+    does (d in [06-21, 07-11]), worth 10 * 1/1 = 10. Only the 11 days
+    seeing BOTH dispensings ([06-21, 07-01]) reach cumdose 20 >= 15.
+    Crediting claim 1's supply tail 06-02..06-10 (overlap up to 10
+    days -> cumdose 100) instead would qualify every day in
+    [06-12, 07-10] and score 29 member-days.
+    """
+    _scdm(
+        tmp_path,
+        [
+            (1, "2021-06-01", "D", 10, 100.0),
+            (1, "2021-06-11", "D", 1, 10.0),
+        ],
+    )
+    rows = _denom(
+        tmp_path,
+        _study(
+            [
+                {
+                    "group": "c1",
+                    "indexcriteria": "INC",
+                    "codecat": "RX",
+                    "code": "D",
+                    "condlevel": "1",
+                    "subcondlevel": "1",
+                    "condfrom": -30,
+                    "condto": -10,
+                    "dateonly": "Y",
+                    "mincumdose": 15,
+                },
+            ],
+            strength=[("D", 1.0)],
+        ),
+    )
+    assert rows == [("c1", 1, 11)]
+
+
 def test_dose_afdd_bounds_qualify_without_mincumdose(tmp_path):
     """afdd = round(sum(cfdd) / numdispensing, 1) = 10 on every
     candidate day, so [8, 12] keeps all 30 enumerated days
@@ -525,6 +629,51 @@ def test_no_inclusion_codes_keep_the_full_window(tmp_path):
     _scdm(tmp_path, [(1, "2021-06-01", "DEF1", 10, 10.0)])
     rows = _denom(tmp_path, _study([]))
     assert rows == [("c1", 1, YEAR_DAYS)]
+
+
+def test_inclusion_scoping_is_per_cohort_group_in_mixed_studies(tmp_path):
+    """A cohort group without INC rules is never inclusion-clipped,
+    even when OTHER groups in the study have them: SAS builds
+    _IT&inclusioncodes. per group (`where lowcase(group)="&milgrp."`,
+    ms_createmicohorts.sas:1009-1015), sets excl_incl=Y only when THAT
+    group has rules (:1020-1021), and the stack shave runs only
+    `%IF %SYSFUNC(exist(_Denom&Group._STACK_INC))=1`
+    (ms_cidadenom.sas:399). Scoping the pass-through guard on the
+    study as a whole dropped every window of the INC-less cohort.
+
+    Cohort c1 carries an INC rule: dispensing 2021-06-01, supply 10
+    (Expiredt 06-10), window [-30, -10] -> eligible [06-11, 07-01],
+    30 member-days. Cohort c2 carries none and keeps the full
+    365-day enrollment window.
+    """
+    _scdm(
+        tmp_path,
+        [
+            (1, "2021-06-01", "INC1", 10, 10.0),
+            (1, "2021-06-01", "DEF1", 10, 10.0),
+        ],
+    )
+    study = _study(
+        [
+            {
+                "group": "c1",
+                "indexcriteria": "INC",
+                "codecat": "RX",
+                "code": "INC1",
+                "condlevel": "1",
+                "subcondlevel": "1",
+                "condfrom": -30,
+                "condto": -10,
+            },
+        ]
+    )
+    study["cohortfile"].append(dict(study["cohortfile"][0], cohortgrp="c2"))
+    study["type2file"].append(dict(study["type2file"][0], group="c2"))
+    study["cohortcodes"].append(
+        {"group": "c2", "indexcriteria": "DEF", "code": "DEF1", "codecat": "RX"}
+    )
+    rows = _denom(tmp_path, study)
+    assert sorted(rows) == [("c1", 1, 30), ("c2", 1, YEAR_DAYS)]
 
 
 def test_denominator_config_key_separates_inclusion_rules():

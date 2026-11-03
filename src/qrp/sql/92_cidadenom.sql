@@ -265,7 +265,8 @@ days AS (
 -- dispensings (:173-182); SAS does not prorate it.
 rx AS (
     SELECT d.denom_cfg_id, d.criteria, d.cond, d.subcond, d.patid, d.day,
-           overlap_days(c.adate, c.expiredt,
+           overlap_days(c.adate,
+                        CASE WHEN c.dateonly THEN c.adate ELSE c.expiredt END,
                         d.day + c.condfrom, d.day + c.condto) AS od,
            c.rxsup, c.rxamt, s.strength,
            d.condfrom, d.condto, d.mincumdose, d.minafdd, d.maxafdd
@@ -273,7 +274,8 @@ rx AS (
     JOIN _denom_incl_claims c
       ON c.denom_cfg_id = d.denom_cfg_id AND c.criteria = d.criteria
      AND c.cond = d.cond AND c.subcond = d.subcond AND c.patid = d.patid
-     AND periods_overlap(c.adate, c.expiredt,
+     AND periods_overlap(c.adate,
+                         CASE WHEN c.dateonly THEN c.adate ELSE c.expiredt END,
                          d.day + c.condfrom, d.day + c.condto)
     JOIN cfg_code_strength s ON s.code = c.code
     WHERE c.codecat = 'RX' AND c.rxsup > 0
@@ -407,6 +409,8 @@ keys AS (
     FROM cfg_inclusion r
     JOIN cfg_denom_map m ON m.cohortgrp = r.cohortgrp
     WHERE r.criteria = 'INC'
+      AND coalesce(r.condfromanchor, '') <> 'EPISODEENDDT'
+      AND coalesce(r.condtoanchor, '')   <> 'EPISODEENDDT'
     GROUP BY 1, 2
 ),
 inc_union AS (
@@ -586,8 +590,9 @@ allow AS (
 )
 -- DuckDB's greatest/least ignore NULLs, so with no matching allowed
 -- span the window keeps its own bounds — and the WHERE drops it once
--- the study HAS inclusion rules. A study with none must pass through
--- exactly: SAS sets excl_incl=N and never clips.
+-- the denominator config HAS inclusion rules. A config with none must
+-- pass through exactly: SAS scopes excl_incl per group (built from
+-- that group's rules only) and never clips a group without them.
 SELECT w.denom_cfg_id, w.patid, w.eligepisode, w.enr_start, w.enr_end,
        greatest(w.denom_start, a.span_start) AS denom_start,
        least(w.denom_end, a.span_end)        AS denom_end,
@@ -598,7 +603,11 @@ LEFT JOIN allow a
   ON a.denom_cfg_id = w.denom_cfg_id AND a.patid = w.patid
  AND a.span_start <= w.denom_end AND a.span_end >= w.denom_start
 WHERE a.span_start IS NOT NULL
-   OR NOT EXISTS (SELECT 1 FROM cfg_inclusion WHERE criteria = 'INC');
+   OR NOT EXISTS (
+        SELECT 1
+        FROM cfg_inclusion i
+        JOIN cfg_denom_map m ON m.cohortgrp = i.cohortgrp
+        WHERE i.criteria = 'INC' AND m.denom_cfg_id = w.denom_cfg_id);
 
 DROP TABLE _denom_windows;
 ALTER TABLE _denom_windows_incl RENAME TO _denom_windows;
