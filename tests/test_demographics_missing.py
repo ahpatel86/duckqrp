@@ -2,21 +2,22 @@
 Blank-string demographics must be missing, and attrition level 1 must
 count what pov1 counts.
 
-SAS tests non-missing birth date/sex with the missing() function
-(ms_create_enrollment_spans.sas:187-192), which on a character variable
-is true for the blank string too — SAS has no NULL. Those members are
-dropped from _keep BEFORE the level-1 count (ms_attrition_enrollment.sas:
-89-95) and never reach POV1 (a blank sex fails the demographic in-list,
-ms_create_enrollment_spans.sas:141).
+SAS tests birth date and sex with the missing() function
+(ms_create_enrollment_spans.sas:187-192), and on a character variable
+missing() is true for the blank string too, because SAS has no NULL.
+SAS drops those members from _keep before the level-1 count
+(ms_attrition_enrollment.sas:89-95). A blank sex never reaches POV1
+because it fails the demographic in-list
+(ms_create_enrollment_spans.sas:141).
 
-The port checked `sex IS NULL` only, and counted level 1 from the
-collapsed `sex` column, whose CASE never yields NULL: a member whose sex
-was the empty string was counted at level 1 and then vanished before
-POV1 — a funnel that loses people between two levels that should agree.
+The port tested `sex IS NULL` only, and the collapsed `sex` column never
+yields NULL, so the level-1 count included a blank-string sex member
+that POV1 excluded. These tests pin level 1 and POV1 to the same member
+set.
 
-Hand fixtures, not the synthetic extract: the defect is invisible unless
-the extract actually contains a blank-string sex, which real SCDM data
-can and the generator never produced.
+Hand fixtures, not the synthetic extract: the defect shows only when the
+extract contains a blank-string sex, which real SCDM data can contain
+and the generator never produced.
 """
 
 from __future__ import annotations
@@ -161,9 +162,6 @@ def legal(tmp_path):
 
 def test_blank_sex_is_missing(mixed):
     """A blank-string sex is SAS-missing: demographics_missing flags it.
-
-    The table previously tested `sex IS NULL` alone, so the member
-    slipped through and was counted at level 1.
     """
     flagged = {r[0] for r in mixed.con.execute(
         "SELECT patid FROM demographics_missing").fetchall()}
@@ -171,19 +169,14 @@ def test_blank_sex_is_missing(mixed):
 
 
 def test_blank_sex_member_not_counted_at_level1(mixed):
-    """SAS drops the missing-demographics members before the level-1
-    count (ms_attrition.sas:184-185 counts _keep, already filtered by
-    ms_attrition_enrollment.sas:89-95), so level 1 is the legal member
-    alone."""
+    """SAS counts level 1 from _keep (ms_attrition.sas:184-185).
+    ms_attrition_enrollment.sas:89-95 drops the missing-demographics
+    members first, so level 1 is the legal member alone."""
     assert _level1(mixed) == 1
 
 
 def test_level1_matches_pov1(mixed):
     """The level-1 population and POV1 admit exactly the same member.
-
-    Before the fix, attrition level 1 counted the blank-sex member while
-    POV1's sex condition excluded it — a member silently lost between
-    the two levels.
     """
     att = {r[0] for r in mixed.con.execute(
         "SELECT patid FROM _att_dem").fetchall()}
@@ -202,8 +195,7 @@ def test_null_birth_member_excluded(mixed):
 
 def test_legal_extract_unchanged(legal):
     """Zero behavior change for conformant extracts: every sex is
-    F/M/U/A, so level 1 counts all members and POV1 keeps them all —
-    identical before and after the predicate change."""
+    F/M/U/A, so level 1 counts all members and POV1 keeps them all."""
     assert _level1(legal) == 3
     assert {r[0] for r in legal.con.execute(
         "SELECT patid FROM pov1").fetchall()} == {5, 6, 7}

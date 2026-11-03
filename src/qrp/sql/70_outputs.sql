@@ -32,10 +32,8 @@ WHERE d.birth_date IS NOT NULL
 -- SAS drops the missing-demographics members from _keep BEFORE the
 -- level-1 count (ms_attrition_enrollment.sas:89-95: `if a and b and not
 -- c and not d`), so level 1 must exclude the same members POV1
--- excludes. The collapsed `sex` CASE never yields NULL — anything
--- outside F/M becomes 'O' — so `sex IS NOT NULL` excluded nobody and a
--- blank-string sex member was counted at level 1 yet could never reach
--- POV1.
+-- excludes. The collapsed `sex` CASE never yields NULL. Anything
+-- outside F/M becomes 'O', so `sex IS NOT NULL` is not a missing test.
   AND NOT EXISTS (SELECT 1 FROM demographics_missing ms
                   WHERE ms.patid = d.patid);
 
