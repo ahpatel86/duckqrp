@@ -27,8 +27,10 @@
 
 -- Members with a birth date and sex (SAS's level-1 population).
 CREATE OR REPLACE TEMP TABLE _att_dem AS
-SELECT DISTINCT patid FROM demographics
-WHERE birth_date IS NOT NULL AND sex IS NOT NULL;
+SELECT DISTINCT patid FROM demographics d
+WHERE d.birth_date IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM demographics_missing ms
+                  WHERE ms.patid = d.patid);
 
 -- Qualifying enrollment spans overlapping the query period, per
 -- ENROLLMENT CONFIGURATION (not per cohort: cohorts sharing one would copy

@@ -67,7 +67,7 @@ GROUP BY 1 HAVING count(*) > 1;
 CREATE OR REPLACE TABLE demographics_missing AS
 SELECT DISTINCT CAST(patid AS BIGINT) AS patid
 FROM {read_demographic}
-WHERE birth_date IS NULL OR sex IS NULL;
+WHERE is_missing(birth_date) OR is_missing(sex);
 
 -- The dispensed-code column is `rx` in SCDM. An earlier version of this
 -- file read `ndc`, which is the code VOCABULARY, not the column name —
