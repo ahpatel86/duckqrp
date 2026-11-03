@@ -445,18 +445,41 @@ def _enr_cfg_id(c) -> str:
     return f"{c.coverage}|{c.enrol_gap}|{int(c.chart_required)}"
 
 
-def _exclusion_key(c, study: StudyConfig) -> str:
-    """Every exclusion rule that shapes this cohort's denominator."""
+def _rules_key(c, study: StudyConfig, criteria: str) -> str:
+    """Every rule of one criteria that shapes this cohort's denominator.
+
+    The INCLUSION half shapes it too (ms_cidadenom.sas:212-261 clips the
+    enrollment into each subcondition's windows, and %ms_dose_denom
+    restricts it further), so both halves belong in the key.
+    """
     parts = []
     for r in study.inclusions:
-        if r.cohortgrp != c.cohortgrp or r.criteria != "EXC":
+        if r.cohortgrp != c.cohortgrp or r.criteria != criteria:
             continue
         parts.append("|".join(str(x) for x in (
             r.cond, r.subcond, r.codecat, ",".join(sorted(r.codes)),
             r.condfrom, r.condto,
             getattr(r, "condfromanchor", ""),
-            getattr(r, "condtoanchor", ""))))
+            getattr(r, "condtoanchor", ""),
+            getattr(r, "dateonly", False),
+            r.codedays,
+            coalesce_dose(r.mincumdose), coalesce_dose(r.minafdd),
+            coalesce_dose(r.maxafdd))))
     return ";".join(sorted(parts))
+
+
+def coalesce_dose(v: float | None) -> str:
+    return "" if v is None else f"{v:g}"
+
+
+def _exclusion_key(c, study: StudyConfig) -> str:
+    """Every exclusion rule that shapes this cohort's denominator."""
+    return _rules_key(c, study, "EXC")
+
+
+def _inclusion_key(c, study: StudyConfig) -> str:
+    """Every inclusion rule that clips this cohort's denominator."""
+    return _rules_key(c, study, "INC")
 
 
 def _denom_cfg_id(c, study: StudyConfig) -> str:
@@ -505,6 +528,12 @@ def _denom_cfg_id(c, study: StudyConfig) -> str:
         # them let one cohort's exclusions be applied to another's
         # denominator through the shared config id.
         hashlib.sha1(_exclusion_key(c, study).encode()).hexdigest()[:12],
+        # The INCLUSION rules belong here for the same reason: SAS clips
+        # the enrolled window into each subcondition's codedays windows
+        # (ms_cidadenom.sas:253-261) and into %ms_dose_denom's qualifying
+        # spans (:272-280), so two cohorts with different inclusions have
+        # different eligible time.
+        hashlib.sha1(_inclusion_key(c, study).encode()).hexdigest()[:12],
         # The OUTCOME is deliberately NOT part of this key. It changes
         # the denominator only for the few members with an event, and
         # 92_cidadenom.sql handles those in per-cohort scopes rather
@@ -870,6 +899,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
                 "condto": r.condto, "codedays": r.codedays,
                 "condfromanchor": r.condfromanchor,
                 "condtoanchor": r.condtoanchor,
+                "dateonly": r.dateonly,
                 "mincumdose": r.mincumdose,
                 "minafdd": r.minafdd,
                 "maxafdd": r.maxafdd,
@@ -883,7 +913,7 @@ def register_config(eng: Engine, study: StudyConfig) -> None:
            subcond_inclusion BOOLEAN, condlevel INTEGER,
            criteria VARCHAR, codecat VARCHAR, condfrom INTEGER,
            condto INTEGER, codedays INTEGER, minrxdays INTEGER,
-           condfromanchor VARCHAR, condtoanchor VARCHAR,
+           condfromanchor VARCHAR, condtoanchor VARCHAR, dateonly BOOLEAN,
            mincumdose DOUBLE, minafdd DOUBLE, maxafdd DOUBLE,
            cond_name VARCHAR""",
     )
