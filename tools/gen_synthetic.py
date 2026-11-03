@@ -77,8 +77,10 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
                 'Y' AS medcov,
                 CASE WHEN random() < 0.93 THEN 'Y' ELSE 'N' END AS drugcov,
                 'Y' AS chart,
-                'MC' AS plantype,
-                'P'  AS payertype
+                -- PlanType P = PPO, PayerType MC = Medicare: each in its
+                -- own SCDM domain (the pair was swapped before).
+                'P'  AS plantype,
+                'MC' AS payertype
             FROM _pat p
             CROSS JOIN range(1, 4) s(n)
             WHERE random() < CASE s.n WHEN 1 THEN 1.0 WHEN 2 THEN 0.55 ELSE 0.25 END
@@ -113,24 +115,35 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
     con.execute(f"""
         COPY (
             SELECT
-                p.patid,
-                DATE '2010-01-01' + CAST(random() * 2100 AS INTEGER) AS adate,
-                CASE WHEN random() < 0.06
-                     THEN {_lit(EVENT_CODES)}[
-                            1 + CAST(random() * {len(EVENT_CODES) - 1} AS INTEGER)]
-                     ELSE {_lit(NOISE_DX_CODES)}[
-                            1 + CAST(random() * {len(NOISE_DX_CODES) - 1} AS INTEGER)]
-                END AS dx,
-                '09' AS dx_codetype,
-                CAST(p.patid * 13 % 99999 AS BIGINT) AS encounterid,
-                CAST(p.patid * 7 % 9999 AS BIGINT)   AS providerid,
-                CASE WHEN random() < 0.3 THEN 'P' ELSE 'S' END AS pdx,
-                CASE WHEN random() < 0.2 THEN 'IP' ELSE 'AV' END AS enctype,
+                patid, adate, dx, dx_codetype, encounterid, providerid,
+                -- SCDM populates Pdx only for IP and IS encounters and
+                -- blanks it for AV/ED/OA; deriving it from the aliased
+                -- enctype (not an independent draw) keeps the pair
+                -- consistent on every row.
+                CASE WHEN enctype IN ('IP', 'IS')
+                     THEN CASE WHEN random() < 0.3 THEN 'P' ELSE 'S' END
+                     ELSE '' END AS pdx,
+                enctype,
                 NULL AS origdx,
                 NULL AS padmit
-            FROM _pat p
-            CROSS JOIN range(1, 21) d(n)
-            WHERE random() < 0.95
+            FROM (
+                SELECT
+                    p.patid,
+                    DATE '2010-01-01' + CAST(random() * 2100 AS INTEGER) AS adate,
+                    CASE WHEN random() < 0.06
+                         THEN {_lit(EVENT_CODES)}[
+                                1 + CAST(random() * {len(EVENT_CODES) - 1} AS INTEGER)]
+                         ELSE {_lit(NOISE_DX_CODES)}[
+                                1 + CAST(random() * {len(NOISE_DX_CODES) - 1} AS INTEGER)]
+                    END AS dx,
+                    '09' AS dx_codetype,
+                    CAST(p.patid * 13 % 99999 AS BIGINT) AS encounterid,
+                    CAST(p.patid * 7 % 9999 AS BIGINT)   AS providerid,
+                    CASE WHEN random() < 0.2 THEN 'IP' ELSE 'AV' END AS enctype
+                FROM _pat p
+                CROSS JOIN range(1, 21) d(n)
+                WHERE random() < 0.95
+            )
         ) TO '{out / "diagnosis" / "data.parquet"}'
           (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
@@ -139,7 +152,9 @@ def generate(out: Path, n_patients: int, seed: int = 42) -> None:
         COPY (
             SELECT patid,
                    DATE '2011-01-01' + CAST(random() * 1800 AS INTEGER) AS deathdt,
-                   'N' AS dtimpute, 'D' AS source, 'E' AS confidence
+                   -- Source N = National Death Registry; 'D' is not in
+                   -- the SCDM Source domain (L, N, S, T, O, M).
+                   'N' AS dtimpute, 'N' AS source, 'E' AS confidence
             FROM _pat WHERE random() < 0.04
         ) TO '{out / "death" / "data.parquet"}'
           (FORMAT PARQUET, COMPRESSION ZSTD)
