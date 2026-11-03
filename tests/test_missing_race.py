@@ -1,19 +1,20 @@
 """
-A missing race excludes the member; it never becomes 'M'.
+A missing race excludes the member. It never becomes 'M'.
 
 SAS's enrollment-span join requires `upcase(Dem.Race) in (&DemogRace.)`
 (ms_create_enrollment_spans.sas:142) against the study's race list, or
-the default "0" "1" "2" "3" "4" "5" "M" (ms_create_enrollment_spans.sas:
-89-95). A missing or blank race matches no list, so the member keeps no
-spans and produces no POV1 rows (attrition marks MeetDemogs='N' the
-same way, ms_attrition_enrollment.sas:186-189); POV1 passes a surviving
+the default "0" "1" "2" "3" "4" "5" "M" built at
+ms_create_enrollment_spans.sas:89-95. A missing or blank race matches
+no list, so the member keeps no spans and produces no POV1 rows.
+Attrition marks MeetDemogs='N' the same way
+(ms_attrition_enrollment.sas:186-189). POV1 passes a surviving
 member's RACE through unchanged (ms_createpov1.sas:90).
 
-The port did `COALESCE(race, 'M')`: every NULL race — and every member
-of an extract whose demographic file has no race column at all, since
-the optional-column machinery resolves it to NULL — was evaluated as
-Multi-racial in the demographic-condition join and labeled Multi-racial
-in stratified outputs.
+The port ran `COALESCE(race, 'M')`: the demographic-condition join
+evaluated every NULL race as Multi-racial, and the stratified outputs
+labeled it Multi-racial. The same applied to every member of an extract
+whose demographic file has no race column at all, because the
+optional-column machinery resolves a missing column to NULL.
 
 Hand fixtures: the synthetic extract always carries a populated race,
 so none of these shapes occur there.
@@ -156,8 +157,8 @@ def raceless(tmp_path):
 
 
 def test_missing_race_collapses_to_empty(mixed):
-    """NULL and blank race normalize to '', not 'M'; real values are
-    untouched."""
+    """NULL and blank race normalize to '', not 'M'. Real values
+    keep their data value."""
     rows = dict(mixed.con.execute(
         "SELECT patid, race FROM demographics ORDER BY patid"
     ).fetchall())
@@ -165,7 +166,7 @@ def test_missing_race_collapses_to_empty(mixed):
 
 
 def test_missing_race_member_excluded_from_pov1(mixed):
-    """SAS excludes the member; it does not ride through as Multi-racial.
+    """SAS excludes the member. It never becomes Multi-racial.
     Unknown ('0') and a real 'M' data value stay, under the default
     conditioning."""
     kept = dict(mixed.con.execute(
@@ -175,9 +176,8 @@ def test_missing_race_member_excluded_from_pov1(mixed):
 
 
 def test_race_label_is_the_data_value(mixed):
-    """The stratified outputs label race from the member's own value:
-    the kept Multi-racial member is labeled 'M' by its data, not by a
-    defaulting rule."""
+    """The stratified outputs label race from the member's own data
+    value, not from a defaulting rule."""
     labeled = [r for r in mixed.con.execute(
         "SELECT patid, race FROM pov1 WHERE patid = 5"
     ).fetchall()]
@@ -185,11 +185,11 @@ def test_race_label_is_the_data_value(mixed):
 
 
 def test_absent_race_column_excludes_every_member(raceless):
-    """An extract with NO race column previously admitted every member
-    as 'M'; now it excludes every member. That IS the SAS-consistent
-    reading: SAS datasets always carry Race, so a race-less extract is
-    non-conformant, and SAS's blank-fails-the-in-list rule excludes
-    what a missing column resolves to. Pinned explicitly."""
+    """A race-less extract previously admitted every member as 'M'.
+    Now it excludes every member, and that is the SAS-consistent
+    reading: SAS datasets always carry Race, so a race-less extract
+    is non-conformant. The missing column resolves to NULL, which
+    fails the SAS in-list like a blank. Pinned explicitly."""
     rows = raceless.con.execute(
         "SELECT patid, race FROM demographics ORDER BY patid"
     ).fetchall()
@@ -200,9 +200,8 @@ def test_absent_race_column_excludes_every_member(raceless):
 
 def test_level1_ignores_race(mixed):
     """Attrition level 1 counts non-missing birth date/sex only
-    (ms_attrition.sas:184-185); race never enters it, before or after
-    the fix — pinned so the fix cannot leak into the funnel's first
-    level."""
+    (ms_attrition.sas:184-185). Race never enters it, so the fix
+    cannot leak into the funnel's first level."""
     row = mixed.con.execute(
         "SELECT remaining FROM attrition WHERE level = 1.0"
     ).fetchone()
