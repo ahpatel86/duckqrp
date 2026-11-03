@@ -20,23 +20,23 @@
 CREATE OR REPLACE TABLE dose_censor AS
 WITH in_window AS (
     SELECT
-        m.cohortgrp,
-        m.patid,
-        m.indexdt,
+        e.cohortgrp,
+        e.patid,
+        e.indexdt,
         d.adate,
         d.expiredt,
         d.cumdose,
         c.max_cum_dose
-    FROM ptsmasterlist m
+    FROM episode_criteria e
     JOIN cfg_cohort c
-      ON c.cohortgrp = m.cohortgrp
+      ON c.cohortgrp = e.cohortgrp
      AND c.max_cum_dose IS NOT NULL
      AND c.cum_dose_per IS NOT NULL
     JOIN claim_dose d
-      ON d.cohortgrp = m.cohortgrp
-     AND d.patid     = m.patid
+      ON d.cohortgrp = e.cohortgrp
+     AND d.patid     = e.patid
      -- SAS: (episodestartdt - cumdoseper) <= adate <= episodeenddt
-     AND d.adate BETWEEN m.indexdt - c.cum_dose_per AND m.episodeenddt
+     AND d.adate BETWEEN e.indexdt - c.cum_dose_per AND e.episodeenddt
 ),
 running AS (
     SELECT
@@ -62,17 +62,45 @@ GROUP BY 1, 2, 3;
 -- Apply, then re-check the criteria that depend on episode length.
 -- Truncating can push an episode below min_epis_dur or past the
 -- required observable days, exactly as it can in SAS.
+UPDATE episode_criteria AS ec SET
+    episodeenddt = least(ec.episodeenddt, x.censordate_maxdose),
+    episode_days = span_days(ec.indexdt,
+                             least(ec.episodeenddt, x.censordate_maxdose)),
+    min_enr_aft_met = (
+        ec.dataavail_dt >= ec.indexdt + greatest(0, c.req_days_aft_ind)
+        AND ec.dataavail_dt >= least(ec.episodeenddt, x.censordate_maxdose)
+                              + greatest(0, c.req_days_aft_epi)
+        AND (c.min_epis_dur <= 0
+             OR (ec.enr_start <= ec.indexdt
+                 AND ec.indexdt + (c.min_epis_dur - 1) <= ec.enr_end))
+    ),
+    min_epi_dur_met = span_days(ec.indexdt,
+                                least(ec.episodeenddt, x.censordate_maxdose))
+                      >= c.min_epis_dur,
+    post_blackout_met = (c.blackout_per <= 0
+                         OR date_diff('day', ec.indexdt,
+                              least(ec.episodeenddt, x.censordate_maxdose))
+                             - c.blackout_per >= 0)
+FROM dose_censor x
+JOIN cfg_cohort c ON c.cohortgrp = x.cohortgrp
+WHERE x.cohortgrp = ec.cohortgrp
+  AND x.patid     = ec.patid
+  AND x.indexdt   = ec.indexdt;
+
 CREATE OR REPLACE TABLE ptsmasterlist AS
-SELECT
-    m.* EXCLUDE (episodeenddt, episode_days),
-    least(m.episodeenddt,
-          COALESCE(x.censordate_maxdose, DATE '9999-12-31')) AS episodeenddt,
-    span_days(m.indexdt,
-              least(m.episodeenddt,
-                    COALESCE(x.censordate_maxdose, DATE '9999-12-31')))
-        AS episode_days
-FROM ptsmasterlist m
-LEFT JOIN dose_censor x
-  ON x.cohortgrp = m.cohortgrp
- AND x.patid     = m.patid
- AND x.indexdt   = m.indexdt;
+SELECT * EXCLUDE (episodeenddt, episode_days,
+                  min_enr_days_met, min_enr_aft_met, min_day_sup_met,
+                  min_epi_dur_met, post_blackout_met),
+       episodeenddt,
+       episode_days
+FROM episode_criteria ec
+WHERE min_enr_days_met AND min_enr_aft_met AND min_day_sup_met
+  AND min_epi_dur_met AND post_blackout_met
+  AND indexdt <= episodeenddt
+  AND NOT EXISTS (
+      SELECT 1
+      FROM {incl_rel} x
+      WHERE x.cohortgrp = ec.cohortgrp
+        AND x.patid     = ec.patid
+        AND x.indexdt   = ec.indexdt
+  );
