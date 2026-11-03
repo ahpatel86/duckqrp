@@ -144,14 +144,18 @@ def _tiny_extract(out: Path) -> Path:
                'ND' AS rx_codetype, 30 AS rxsup, 30 AS rxamt
         FROM _p, range(4)""")
     write("diagnosis", """
-        SELECT patid,
-               DATE '2011-01-01' + CAST(random()*1000 AS INTEGER) AS adate,
+        SELECT patid, adate, dx, dx_codetype, enctype,
+               CASE WHEN enctype = 'IP' THEN 'P' ELSE '' END AS pdx
+        FROM (
+            SELECT patid,
+                   DATE '2011-01-01' + CAST(random()*1000 AS INTEGER) AS adate,
                'X' || lpad((1 + CAST(random()*4 AS INTEGER))::VARCHAR, 5, '0')
                       AS dx,
                '09' AS dx_codetype,
-               ['IP','AV'][1 + CAST(random() AS INTEGER)] AS enctype,
-               'P' AS pdx
-        FROM _p, range(3)""")
+                   ['IP','AV'][1 + CAST(random() AS INTEGER)] AS enctype
+            FROM _p, range(3)
+        )""")
+    # SCDM 8.2.2 diagnosis.md populates Pdx only for IP and IS encounters.
     write("death", "SELECT patid, DATE '2016-01-01' AS deathdt FROM _p LIMIT 0")
     con.close()
     return out
