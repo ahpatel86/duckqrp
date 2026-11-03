@@ -527,26 +527,29 @@ def test_dose_proration_moves_the_qualifying_edges(tmp_path):
     assert rows == [("c1", 1, 24)]
 
 
-def test_dateonly_dose_crediting_ignores_the_supply_tail(tmp_path):
-    """A dateonly claim's crediting period is its dispensing date
-    alone — never the supply tail:
-    `(claim.dateonly='N' ... period2=claim.ADate claim.Expiredt) |
-     (claim.dateonly='Y' ... period2=claim.ADate)`
-    (ms_dose_denom.sas:148-151).
+def test_dateonly_dose_entry_uses_the_dispensing_date(tmp_path):
+    """dateonly='Y' changes the ENTRY test only: a claim enters a
+    day's lookback when its dispensing DATE falls inside it
+    (ms_dose_denom.sas:148-151, period2=claim.ADate; the single-value
+    default in ms_periodsoverlap.sas:53-60), while the proration of an
+    entered claim is its supply overlap with the lookback, split by
+    neither dateonly nor anything else (ms_dose_denom.sas:154-171).
 
     Rule code D, window [-30, -10], dateonly, mincumdose 15,
     strength 1:
       claim 1: D 2021-06-01, supply 10, rxamt 100
       claim 2: D 2021-06-11, supply 1,  rxamt 10
 
-    Each enumerated day d looks back over [d-30, d-10]. Claim 1
-    credits only when 06-01 falls in that lookback (d in
-    [06-11, 07-01]), worth 100 * 1/10 = 10; claim 2 only when 06-11
-    does (d in [06-21, 07-11]), worth 10 * 1/1 = 10. Only the 11 days
-    seeing BOTH dispensings ([06-21, 07-01]) reach cumdose 20 >= 15.
-    Crediting claim 1's supply tail 06-02..06-10 (overlap up to 10
-    days -> cumdose 100) instead would qualify every day in
-    [06-12, 07-10] and score 29 member-days.
+    Claim 1 enters the days whose lookback [d-30, d-10] contains
+    06-01, i.e. [06-11, 07-01], and on each is prorated by its
+    supply: od = 1..10 rising through 06-20, then 10, so cumdose =
+    100*od/10 = 10*od. Claim 2 (supply 1, Expiredt 06-11) enters
+    [06-21, 07-11] and is worth a flat 10. cumdose >= 15 holds
+    exactly on [06-12, 07-01] -> 20 member-days. A supply-span ENTRY
+    instead would let claim 1 enter through 07-10 (its tail
+    06-02..06-10 touches those lookbacks), qualifying
+    [06-12, 07-10] = 29 member-days — the date-only entry is what
+    this test pins.
     """
     _scdm(
         tmp_path,
@@ -575,7 +578,48 @@ def test_dateonly_dose_crediting_ignores_the_supply_tail(tmp_path):
             strength=[("D", 1.0)],
         ),
     )
-    assert rows == [("c1", 1, 11)]
+    assert rows == [("c1", 1, 20)]
+
+
+def test_dateonly_amount_prorates_the_supply_span(tmp_path):
+    """The dateonly split stops at the ENTRY test; the credited AMOUNT
+    of an entered claim is still its supply overlap with the day's
+    lookback, with no dateonly case in the proration step
+    (ms_dose_denom.sas:154-171).
+
+    Single dateonly RX claim 2021-06-01, supply 10 (Expiredt 06-10),
+    rxamt 100, strength 1; rule window [-30, -10], mincumdose 50.
+    Every enumerated day d in [06-11, 07-01] has 06-01 in its lookback
+    [d-30, d-10], so the claim enters all 30 days; its supply overlap
+    od(d) ramps 1 (06-11) .. 10 (06-20, holding through 07-01), and
+    cumdose = 100*od/10 = 10*od reaches 50 exactly when od >= 5, i.e.
+    on [06-15, 07-01] = 17 member-days. Flattening od to 1 (crediting
+    the dispensing date in the amount too) yields cumdose 10 on every
+    day and an empty denominator — this test discriminates the
+    amount.
+    """
+    _scdm(tmp_path, [(1, "2021-06-01", "D", 10, 100.0)])
+    rows = _denom(
+        tmp_path,
+        _study(
+            [
+                {
+                    "group": "c1",
+                    "indexcriteria": "INC",
+                    "codecat": "RX",
+                    "code": "D",
+                    "condlevel": "1",
+                    "subcondlevel": "1",
+                    "condfrom": -30,
+                    "condto": -10,
+                    "dateonly": "Y",
+                    "mincumdose": 50,
+                },
+            ],
+            strength=[("D", 1.0)],
+        ),
+    )
+    assert rows == [("c1", 1, 17)]
 
 
 def test_dose_afdd_bounds_qualify_without_mincumdose(tmp_path):
@@ -674,6 +718,41 @@ def test_inclusion_scoping_is_per_cohort_group_in_mixed_studies(tmp_path):
     )
     rows = _denom(tmp_path, study)
     assert sorted(rows) == [("c1", 1, 30), ("c2", 1, YEAR_DAYS)]
+
+
+def test_all_episodeenddt_anchored_condition_passes_through(tmp_path):
+    """A denominator config whose ONLY INC rules are EPISODEENDDT-
+    anchored produces no inclusion windows (the claim stage skips an
+    episode-end anchor, which has no meaning without an episode) and
+    no keys rows. The pass-through guard must therefore treat such a
+    config as INC-less — the same skip semantics every other stage of
+    this file applies to that anchor. Counting it as INC-having left
+    the cohort with no allowed spans and an empty denominator.
+
+    Single condition whose single subcond carries
+    condtoanchor='EPISODEENDDT': the enrolled member keeps the exact
+    365-day window.
+    """
+    _scdm(tmp_path, [(1, "2021-06-01", "A", 1, 1.0)])
+    rows = _denom(
+        tmp_path,
+        _study(
+            [
+                {
+                    "group": "c1",
+                    "indexcriteria": "INC",
+                    "codecat": "RX",
+                    "code": "A",
+                    "condlevel": "1",
+                    "subcondlevel": "1",
+                    "condfrom": -30,
+                    "condto": -10,
+                    "condtoanchor": "EPISODEENDDT",
+                },
+            ]
+        ),
+    )
+    assert rows == [("c1", 1, YEAR_DAYS)]
 
 
 def test_denominator_config_key_separates_inclusion_rules():

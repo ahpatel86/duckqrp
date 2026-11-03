@@ -265,8 +265,7 @@ days AS (
 -- dispensings (:173-182); SAS does not prorate it.
 rx AS (
     SELECT d.denom_cfg_id, d.criteria, d.cond, d.subcond, d.patid, d.day,
-           overlap_days(c.adate,
-                        CASE WHEN c.dateonly THEN c.adate ELSE c.expiredt END,
+           overlap_days(c.adate, c.expiredt,
                         d.day + c.condfrom, d.day + c.condto) AS od,
            c.rxsup, c.rxamt, s.strength,
            d.condfrom, d.condto, d.mincumdose, d.minafdd, d.maxafdd
@@ -607,7 +606,9 @@ WHERE a.span_start IS NOT NULL
         SELECT 1
         FROM cfg_inclusion i
         JOIN cfg_denom_map m ON m.cohortgrp = i.cohortgrp
-        WHERE i.criteria = 'INC' AND m.denom_cfg_id = w.denom_cfg_id);
+        WHERE i.criteria = 'INC' AND m.denom_cfg_id = w.denom_cfg_id
+          AND coalesce(i.condfromanchor, '') <> 'EPISODEENDDT'
+          AND coalesce(i.condtoanchor, '')   <> 'EPISODEENDDT');
 
 DROP TABLE _denom_windows;
 ALTER TABLE _denom_windows_incl RENAME TO _denom_windows;
