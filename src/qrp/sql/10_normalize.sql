@@ -40,7 +40,18 @@ SELECT
     upper(CAST(sex AS VARCHAR))      AS sex_raw,
     CASE WHEN upper(CAST(sex AS VARCHAR)) IN ('F','M')
          THEN upper(CAST(sex AS VARCHAR)) ELSE 'O' END AS sex,
-    upper(COALESCE(CAST({opt_race} AS VARCHAR), 'M'))     AS race,
+    -- SAS never remaps a missing race: the enrollment-span join requires
+    -- `upcase(Dem.Race) in (&DemogRace.)` (ms_create_enrollment_spans.sas:142;
+    -- default list "0" "1" "2" "3" "4" "5" "M" built at :89-95), and a blank
+    -- race matches no list, so the member keeps no spans and produces no
+    -- POV1 rows (ms_attrition_enrollment.sas:186-189, MeetDemogs='N').
+    -- Collapsing missing to '' makes the demographic-condition joins (the
+    -- cfg_demog join in the pov1 stage and the denominator) match nothing —
+    -- the same exclusion — instead of the old COALESCE that admitted every
+    -- missing-race member as 'M' = Multi-racial. POV1 passes a surviving
+    -- member's race through unchanged (ms_createpov1.sas:90).
+    CASE WHEN is_missing({opt_race}) THEN ''
+         ELSE upper(CAST({opt_race} AS VARCHAR)) END AS race,
     upper(COALESCE(CAST({opt_hispanic} AS VARCHAR), 'U')) AS hispanic,
     CAST({opt_postalcode} AS VARCHAR)      AS zip,
     CAST({opt_postalcode_date} AS DATE)    AS zip_date
