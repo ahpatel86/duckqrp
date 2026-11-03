@@ -145,19 +145,20 @@ SELECT
     CAST(adate AS DATE)    AS adate,
     CAST(dx AS VARCHAR)    AS code,
     CAST(dx_codetype AS VARCHAR) AS codetype,
-    -- SAS never blanket-normalizes a blank claim Pdx: PX claims are
-    -- stacked with PDX=" " (ms_cidanum.sas:664-679) and the ONLY
-    -- blank->'X' recode is the inpatient-stay enveloping in cdm_diagnosis
-    -- below (ms_envelope.sas:113-116). Blank stays blank through
-    -- matching: the care-setting join compares the claim's Pdx to blank
-    -- and wildcard tokens (ms_loopmeds.sas:56-59, blank encoded '_' by
-    -- ms_caresettingprincipal.sas:65-66), and the code distribution's
-    -- exact-key merge carries a blank member (ms_expand_enctype_pdx.sas:
-    -- 59-67, ms_codedistribution.sas:154-165). The old COALESCE(pdx,'X')
-    -- made every blank claim read as inpatient-principal, so the blank
-    -- token and the blank distribution member could never match a DX
-    -- claim. SAS character equality ignores trailing blanks, so NULL,
-    -- '' and ' ' all collapse to '' — the procedure view's pdx
+    -- SAS never blanket-normalizes a blank claim Pdx. PX claims are
+    -- stacked with PDX=" " (ms_cidanum.sas:664-679), and the only
+    -- blank->'X' recode is the inpatient-stay enveloping in
+    -- cdm_diagnosis below (ms_envelope.sas:113-116). Blank stays blank
+    -- through matching: the care-setting join compares the claim's Pdx
+    -- to blank and wildcard tokens (ms_loopmeds.sas:56-59, blank
+    -- encoded '_' by ms_caresettingprincipal.sas:65-66), and the code
+    -- distribution's exact-key merge carries a blank member
+    -- (ms_expand_enctype_pdx.sas:59-67,
+    -- ms_codedistribution.sas:154-165). A blanket COALESCE(pdx,'X')
+    -- makes every blank claim read as inpatient-principal, so the
+    -- blank token and the blank distribution member can never match a
+    -- DX claim. SAS character equality ignores trailing blanks, so
+    -- NULL, '' and ' ' all collapse to '' — the procedure view's pdx
     -- convention.
     CASE WHEN is_missing(pdx) THEN ''
          ELSE upper(CAST(pdx AS VARCHAR)) END AS pdx,

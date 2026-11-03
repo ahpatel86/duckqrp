@@ -9,7 +9,7 @@ branches leave the claim side unconstrained (ms_loopmeds.sas:56-59) —
 and the code distribution merges on the exact key, whose parameter side
 carries a blank member next to P, S and X
 (ms_expand_enctype_pdx.sas:59-67, ms_codedistribution.sas:154-165).
-The ONLY blank->'X' recode is the inpatient-stay enveloping
+The only blank->'X' recode is the inpatient-stay enveloping
 (ms_envelope.sas:113-116), which fires on non-IP claims inside a stay.
 
 The port did `COALESCE(pdx, 'X')` at normalization, before any consumer
@@ -20,7 +20,7 @@ match it. Every pdx consumer on this base already COALESCEs the
 normalized value to '' (event_claims' claim stack and care-setting
 join, covar_source for risk scores, the code distribution's claim
 stack), so removing the relabel at the source makes each consumer
-correct; none needed adapting.
+correct. None needed adapting.
 
 Hand fixtures: the synthetic extract gives every DX claim a real P/S,
 so blank-Pdx DX claims never occurred there.
@@ -44,7 +44,7 @@ DX_CLAIMS = [
     # patid, adate, pdx, enctype
     (1, "2013-07-01", None, "AV"),   # NULL Pdx: the fix's target shape
     (2, "2013-07-01", "", "AV"),     # blank-string Pdx: same treatment
-    (3, "2013-07-01", "X", "AV"),    # real data value: NOT blank
+    (3, "2013-07-01", "X", "AV"),    # real data value: not blank
     (4, "2013-06-20", "P", "IP"),    # real inpatient-principal claim
     (5, "2013-07-10", None, "AV"),   # inside the IP stay: enveloped
 ]
@@ -196,11 +196,10 @@ def test_enveloping_still_recodes_to_x_ip(token):
 
 
 def test_blank_pdx_matches_blank_care_setting_token(token):
-    """Under a study restricting the event code to AV with a MISSING
-    principal (token 'AV_'), the blank-Pdx claims match; the real-X
-    claim does not (SAS matches the claim's own value, and X is not
-    blank). Before the fix neither blank claim could match — both read
-    as 'X'."""
+    """Under a study restricting the event code to AV with a missing
+    principal (token 'AV_'), the blank-Pdx claims match and the real-X
+    claim does not, because SAS matches the claim's own value and X
+    is not blank."""
     fired = {r[0] for r in token.con.execute(
         "SELECT DISTINCT patid FROM event_claims").fetchall()}
     assert fired == {1, 2}
@@ -228,7 +227,7 @@ def test_no_token_study_unchanged(untokened):
     caresettingprincipal: every claim matches the wildcard, and a claim
     with a real Pdx value is attributed to its own entity exactly as
     before. (A blank-Pdx claim moves from the 'X' entity to the ''
-    entity — that reattribution IS the fix, matching SAS's blank
+    entity — that reattribution is the fix, matching SAS's blank
     expansion row.)"""
     fired = {r[0] for r in untokened.con.execute(
         "SELECT DISTINCT patid FROM event_claims").fetchall()}
