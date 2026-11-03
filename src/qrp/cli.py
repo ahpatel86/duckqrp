@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from . import inputfile as inputfile_mod
 from . import scdm
 from .config import load_study
 from .errors import explain
-from .events import console_sink, multi_sink
+from .events import RunFinished, console_sink, multi_sink
 from .engine import Engine
 from .parity import ParityDumper
 from .pipeline import run
@@ -250,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
         runlog = RunLog(a.log_dir, run_id="qrp",
                         write_jsonl=not a.no_jsonl).capture()
 
+    # Initialize the handle before construction so finally can close it after later failures.
+    eng: Engine | None = None
+    t0 = time.perf_counter()
     try:
         study = load_study(a.study)
         if runlog is not None:
@@ -290,7 +294,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  parity dump: {len(files)} file(s) under {a.parity_dump}")
         if runlog is not None:
             runlog.stage_summary(eng)
-        eng.close()
+    except KeyboardInterrupt:
+        # Record cancellation as its own state. Keep ok True and error empty, and do not emit an ERROR LogMessage.
+        # Keep the manifest-last rule: cancellation writes no manifest. Return 130 for 128+SIGINT, the shell convention for SIGINT.
+        if eng is not None:
+            eng.emit(RunFinished(cancelled=True,
+                                 seconds=time.perf_counter() - t0))
+        elif runlog is not None:
+            # Interrupted before the engine existed; the log's sink is
+            # the only event path left.
+            runlog.sink()(RunFinished(cancelled=True,
+                                      seconds=time.perf_counter() - t0))
+        print("\nCancelled: run interrupted before completion — no manifest "
+              "was written; re-run for a complete output set.",
+              file=sys.stderr)
+        return 130
     except Exception as exc:
         # The runbook promises actionable errors. That promise has to
         # hold on the CLI, not only in the UI.
@@ -300,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nFailed:\n  {message}", file=sys.stderr)
         return 1
     finally:
+        # Close the engine here so failures and cancellation also release its DuckDB connection.
+        if eng is not None:
+            eng.close()
         if runlog is not None:
             runlog.close()
             for pth in runlog.paths():
