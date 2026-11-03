@@ -139,19 +139,34 @@ FROM (
            adate AS expiredt, NULL::INTEGER AS rxsup, NULL::DOUBLE AS rxamt
     FROM cdm_diagnosis
      WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
-       AND code IN (SELECT code FROM cfg_inclusion_codes)
+       AND code IN (SELECT k.code FROM cfg_inclusion_codes k
+                    JOIN cfg_inclusion r
+                      ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
+                     AND r.cond = k.cond AND r.subcond = k.subcond
+                    WHERE r.criteria = 'INC' OR r.mincumdose IS NOT NULL
+                       OR r.minafdd IS NOT NULL OR r.maxafdd IS NOT NULL)
     UNION ALL
     SELECT patid, adate, code, 'PX',
            adate, NULL::INTEGER, NULL::DOUBLE
     FROM cdm_procedure
      WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
-       AND code IN (SELECT code FROM cfg_inclusion_codes)
+       AND code IN (SELECT k.code FROM cfg_inclusion_codes k
+                    JOIN cfg_inclusion r
+                      ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
+                     AND r.cond = k.cond AND r.subcond = k.subcond
+                    WHERE r.criteria = 'INC' OR r.mincumdose IS NOT NULL
+                       OR r.minafdd IS NOT NULL OR r.maxafdd IS NOT NULL)
     UNION ALL
     SELECT patid, adate, code, 'RX',
            adate + CAST(rxsup - 1 AS INTEGER), rxsup, rxamt
     FROM cdm_dispensing
      WHERE adate BETWEEN DATE '{claims_from}' AND DATE '{claims_to}'
-       AND code IN (SELECT code FROM cfg_inclusion_codes)
+       AND code IN (SELECT k.code FROM cfg_inclusion_codes k
+                    JOIN cfg_inclusion r
+                      ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
+                     AND r.cond = k.cond AND r.subcond = k.subcond
+                    WHERE r.criteria = 'INC' OR r.mincumdose IS NOT NULL
+                       OR r.minafdd IS NOT NULL OR r.maxafdd IS NOT NULL)
 ) s2
 JOIN cfg_inclusion_codes k
   ON k.code = s2.code AND k.codecat = s2.codecat
@@ -160,7 +175,12 @@ JOIN rep
 JOIN cfg_inclusion r
   ON r.cohortgrp = k.cohortgrp AND r.criteria = k.criteria
  AND r.cond = k.cond AND r.subcond = k.subcond AND r.codecat = k.codecat
-WHERE coalesce(r.condfromanchor, '') <> 'EPISODEENDDT'
+-- Only rules this path uses: inclusions, and exclusions carrying a dose
+-- threshold (their dose spans are shaved OUT, ms_cidadenom.sas:366-376).
+-- Plain exclusions have their own path (_denom_unelig).
+WHERE (r.criteria = 'INC' OR r.mincumdose IS NOT NULL
+       OR r.minafdd IS NOT NULL OR r.maxafdd IS NOT NULL)
+  AND coalesce(r.condfromanchor, '') <> 'EPISODEENDDT'
   AND coalesce(r.condtoanchor, '')   <> 'EPISODEENDDT';
 
 CREATE OR REPLACE TEMP TABLE _denom_dose_spans AS
