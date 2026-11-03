@@ -40,7 +40,8 @@ SELECT
     upper(CAST(sex AS VARCHAR))      AS sex_raw,
     CASE WHEN upper(CAST(sex AS VARCHAR)) IN ('F','M')
          THEN upper(CAST(sex AS VARCHAR)) ELSE 'O' END AS sex,
-    upper(COALESCE(CAST({opt_race} AS VARCHAR), 'M'))     AS race,
+    CASE WHEN is_missing({opt_race}) THEN ''
+         ELSE upper(CAST({opt_race} AS VARCHAR)) END AS race,
     upper(COALESCE(CAST({opt_hispanic} AS VARCHAR), 'U')) AS hispanic,
     CAST({opt_postalcode} AS VARCHAR)      AS zip,
     CAST({opt_postalcode_date} AS DATE)    AS zip_date
