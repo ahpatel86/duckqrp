@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from . import inputfile as inputfile_mod
 from . import scdm
 from .config import load_study
 from .errors import explain
-from .events import console_sink, multi_sink
+from .events import RunFinished, console_sink, multi_sink
 from .engine import Engine
 from .parity import ParityDumper
 from .pipeline import run
@@ -250,6 +251,11 @@ def main(argv: list[str] | None = None) -> int:
         runlog = RunLog(a.log_dir, run_id="qrp",
                         write_jsonl=not a.no_jsonl).capture()
 
+    # The engine handle exists the moment Engine() succeeds; failures can
+    # happen before it is ever bound (a bad study), so the finally below
+    # needs the name bound regardless.
+    eng: Engine | None = None
+    t0 = time.perf_counter()
     try:
         study = load_study(a.study)
         if runlog is not None:
@@ -290,7 +296,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  parity dump: {len(files)} file(s) under {a.parity_dump}")
         if runlog is not None:
             runlog.stage_summary(eng)
-        eng.close()
+    except KeyboardInterrupt:
+        # Ruling DB-3(b): a Ctrl-C is a cancelled run, not a crash — it
+        # gets the terminal record the UI path already has. cancelled is
+        # its own state: ok stays True, error stays empty, no ERROR
+        # LogMessage; and the manifest-last rule stands, so a cancelled
+        # run still writes no manifest. Exit 130 is the 128+SIGINT shell
+        # convention.
+        if eng is not None:
+            eng.emit(RunFinished(cancelled=True,
+                                 seconds=time.perf_counter() - t0))
+        elif runlog is not None:
+            # Interrupted before the engine existed; the log's sink is
+            # the only event path left.
+            runlog.sink()(RunFinished(cancelled=True,
+                                      seconds=time.perf_counter() - t0))
+        print("\nCancelled: run interrupted before completion — no manifest "
+              "was written; re-run for a complete output set.",
+              file=sys.stderr)
+        return 130
     except Exception as exc:
         # The runbook promises actionable errors. That promise has to
         # hold on the CLI, not only in the UI.
@@ -300,6 +324,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nFailed:\n  {message}", file=sys.stderr)
         return 1
     finally:
+        # Release the engine on the failure and cancellation paths too:
+        # close() used to live only at the end of the try, so a SIGINT
+        # or a failed stage returned with the DuckDB connection still
+        # open. The success path closed it anyway, so nothing moves for
+        # a completed run.
+        if eng is not None:
+            eng.close()
         if runlog is not None:
             runlog.close()
             for pth in runlog.paths():
