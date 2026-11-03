@@ -1728,22 +1728,8 @@ def test_dose_comparisons_round_like_sas():
 
 
 # ---------------------------------------------------------------------
-# DB-5 witness: the maxcumdose censor must precede the length re-check.
-#
-# SAS truncates EpisodeEndDt at the maxcumdose censor date BEFORE the
-# master-list flags are computed
-# (ms_createptsmasterlist.sas:124), so MinEnrolMet3 (:156) and
-# MinEpiDurMet (:165) see the POST-truncation end, and the subsetting IF
-# at :185 drops every episode failing any of them, followed by the
-# defensive `if IndexDt > EpisodeEndDt then delete` (:188). This port
-# filtered on the PRE-truncation end and let the dose censor truncate
-# afterwards without re-checking anything, so episodes the censor pushed
-# below minepisdur were kept here but deleted by SAS — and episodes
-# failing the observable-days requirement on the pre-truncation end were
-# deleted here but kept by SAS, because on the post-truncation end the
-# requirement is easier to satisfy.
-#
-# These tests assert the SAS-expected outcome on a deterministic study.
+# DB-5 witness: the maxcumdose censor must precede the length re-check
+# (ms_createptsmasterlist.sas:124 before :156/:165).
 # ---------------------------------------------------------------------
 
 
@@ -1808,10 +1794,10 @@ def test_db5_witness_dose_censor_recheck_min_episode_duration():
 
     maxcumdose=800 with cumdoseper=90 censors most episodes a few weeks
     after the index. With minepisdur=90 the stage-50 flags pass on the
-    UNCENSORED end, but SAS recomputes MinEpiDurMet on the POST-truncation
-    end (ms_createptsmasterlist.sas:124 before :165) and the subsetting IF
-    at :185 deletes every episode it fails. Truncating after the filter
-    kept 1,157 such episodes in this witness.
+    UNCENSORED end. SAS recomputes MinEpiDurMet on the POST-truncation
+    end (ms_createptsmasterlist.sas:124 before :165), and the subsetting
+    IF at :185 deletes every episode it fails. Truncating after the
+    filter kept 1,157 such episodes in this witness.
 
     SAS-expected outcome: NO master-list episode ends below minepisdur.
     """
@@ -1923,22 +1909,22 @@ def test_db5_witness_dose_censor_recheck_observable_days():
     """WITNESS (DB-5, case 2: required observable days after the episode).
 
     With reqdaysaftepi=180 the MinEnrolMet3 component of the post-index
-    data-availability flag fails on the long pre-truncation end for
-    episodes whose dose censor lands the end well before the data runs
-    out. SAS evaluates MinEnrolMet3 on the POST-truncation end
-    (ms_createptsmasterlist.sas:124 before :156), where the requirement
-    is satisfied, and KEEPS those episodes; filtering before truncating
+    data-availability flag fails on the long pre-truncation end. This
+    hits episodes whose dose censor lands the end well before the data
+    runs out. SAS evaluates MinEnrolMet3 on the POST-truncation end
+    (ms_createptsmasterlist.sas:124 before :156). The requirement passes
+    there, so SAS keeps those episodes. Filtering before truncating
     deleted them here. 208 such episodes exist in this witness.
 
     SAS-expected outcome: every episode whose ONLY stage-50 failure is
     the observable-days component, and which passes it on the truncated
     end, is present in the master list.
 
-    The expectation is built from the PRE-truncation end, reconstructed
-    from columns the dose stage never rewrites, and stays non-empty
-    after stage 55 truncates episode_criteria in place — reading the
-    post-update end made the two observable-days predicates exact
-    complements and this witness a vacuous 0 == 0 pass.
+    This test builds the expected set from the PRE-truncation end and
+    reconstructs that end from columns the dose stage never rewrites.
+    The set stays non-empty after stage 55 truncates episode_criteria
+    in place. Reading the post-update end made the two observable-days
+    predicates exact complements and this witness a vacuous 0 == 0 pass.
     """
     from qrp import Engine
 
@@ -1982,13 +1968,13 @@ def test_db5_dose_censor_sas_ordering_pins():
     """Structural pins for the DB-5 ordering rules.
 
     The behavioral witness above pins :124-before-:156/:165. These pin
-    the two remaining orderings from the ruling:
+    the two remaining orderings:
 
     - :188 — the `IndexDt > EpisodeEndDt` delete must run against the
-      POST-truncation end, i.e. it must appear in the master-list
-      rebuild's WHERE, after the UPDATE applied the censor date.
+      POST-truncation end, in the master-list rebuild's WHERE, after
+      the UPDATE applied the censor date.
     - :168 — the maximum-episode-duration truncation runs AFTER the
-      flags and is not fed back into them: the dose stage must not
+      flags and is not fed back into them. The dose stage must not
       re-apply the cap or re-evaluate flags after it. In this port the
       cap lives upstream in 50_episodes.sql's censor chain, so the dose
       stage must contain no max_epis_dur reference at all.
